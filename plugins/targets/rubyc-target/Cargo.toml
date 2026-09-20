@@ -1,0 +1,11 @@
+[package]
+name = "rubyc-target"
+version.workspace = true
+edition.workspace = true
+autotests = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rubyc-core = { path = "../../.." }

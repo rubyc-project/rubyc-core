@@ -1,0 +1,9 @@
+[submodule "plugins/targets/rubyc-target-linux-x86_64"]
+	path = plugins/targets/rubyc-target-linux-x86_64
+	url = https://github.com/rubyc-project/rubyc-target-linux-x86_64.git
+[submodule "plugins/targets/rubyc-target-windows-x64"]
+	path = plugins/targets/rubyc-target-windows-x64
+	url = https://github.com/rubyc-project/rubyc-target-windows-x64.git
+[submodule "plugins/targets/rubyc-target-windows-x86_64"]
+	path = plugins/targets/rubyc-target-windows-x86_64
+	url = https://github.com/rubyc-project/rubyc-target-windows-x86_64.git

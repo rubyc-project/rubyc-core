@@ -1,0 +1,21 @@
+[package]
+name = "rubyc-core"
+version.workspace = true
+edition.workspace = true
+autotests = false
+
+[lib]
+name = "rubyc"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+libloading = "0.8"
+goblin = "0.9"

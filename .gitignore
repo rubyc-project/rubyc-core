@@ -1,0 +1,98 @@
+# ---------- Rust / Cargo ----------
+/target/
+**/*.rs.bk
+**/*.rs.bk.*
+**/Cargo.lock.bak
+
+# Generated artifacts from rubyc itself (compiled output during testing)
+*.rbc
+!tests/fixtures/*.rbc
+
+# ---------- Compiled C/C++ / binaries ----------
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+a.out
+*.out
+!tests/fixtures/*.out
+benches/bin/
+perf-out/
+
+# ---------- Build / tooling caches ----------
+**/target/
+dist/
+out/
+**/.cargo/
+**/.rustup/
+
+# ---------- Coverage / profiling ----------
+*.profraw
+*.profdata
+*.d
+coverage/
+tarpaulin-report.html
+lcov.info
+
+# ---------- Local scratch / test outputs ----------
+/tmp/
+*.log
+*.tmp
+core
+core.*
+
+# ---------- IDEs / editors ----------
+.idea
+.idea/
+.vscode
+.vscode/
+.devcontainer
+.devcontainer/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.iml
+*.code-workspace
+*.sublime-workspace
+*.sublime-project
+
+# ---------- OS junk ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.pyc
+__pycache__/
+
+# ---------- Agent / AI tooling state ----------
+TODO.md
+AGENTS.md
+.kilo
+.opencode
+.sisyphus
+.cursor
+.cursor/
+.claude
+.claude/
+.aider*
+.rules
+.rules/
+CODEX.md
+CLAUDE.md
+
+# ---------- Secrets / env ----------
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+credentials.json
+
+# ---------- Misc local state ----------
+*.pid
+*.sock
+nohup.out
+scratch/
