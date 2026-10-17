@@ -33,6 +33,11 @@ pub enum Kind {
     /// A shared library (ELF ET_DYN on Linux); preamble sits at offset 64,
     /// right after the ELF header, since ELF owns offset 0.
     SharedLibrary,
+    /// A shared library carrying its type fragment inline: after the
+    /// 13-byte preamble comes a u64 LE table length, then the fragment
+    /// bytes, then the payload. Old readers reject the kind byte
+    /// instead of misparsing, so no format-version bump was needed.
+    SharedLibraryWithTypes,
     /// Lowered IR (`Program`) — the plugin ABI boundary (decision D3).
     Ir,
 }
@@ -43,6 +48,7 @@ impl Kind {
             Kind::Bytecode => 0x01,
             Kind::NativeExecutable => 0x02,
             Kind::SharedLibrary => 0x03,
+            Kind::SharedLibraryWithTypes => 0x05,
             Kind::Ir => 0x04,
         }
     }
@@ -52,13 +58,14 @@ impl Kind {
             0x01 => Some(Kind::Bytecode),
             0x02 => Some(Kind::NativeExecutable),
             0x03 => Some(Kind::SharedLibrary),
+            0x05 => Some(Kind::SharedLibraryWithTypes),
             0x04 => Some(Kind::Ir),
             _ => None,
         }
     }
 }
 
-/// Serialize the 11-byte header: jump, magic, kind byte, LE version.
+/// Serialize the 13-byte header: jump, magic, kind byte, LE version.
 pub fn build(kind: Kind, version: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(PREAMBLE_LEN + 3);
     out.extend_from_slice(&JUMP_OVER_MAGIC);
@@ -73,7 +80,8 @@ pub fn build(kind: Kind, version: u16) -> Vec<u8> {
 pub struct Parsed {
     pub kind: Kind,
     pub version: u16,
-    /// Offset of the first payload byte (13).
+    /// Offset of the first payload byte: 13, or 13 + 8 + table length
+    /// for [`Kind::SharedLibraryWithTypes`].
     pub payload_start: usize,
 }
 
@@ -93,6 +101,25 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
     }
     let kind = Kind::from_byte(bytes[10]).ok_or("unknown payload kind")?;
     let version = u16::from_le_bytes([bytes[11], bytes[12]]);
+    if kind == Kind::SharedLibraryWithTypes {
+        if bytes.len() < PREAMBLE_LEN + 3 + 8 {
+            return Err("file too short for embedded type table length".into());
+        }
+        let len = u64::from_le_bytes(
+            bytes[PREAMBLE_LEN + 3..PREAMBLE_LEN + 3 + 8]
+                .try_into()
+                .map_err(|_| "file too short for embedded type table length")?,
+        ) as usize;
+        let payload_start = PREAMBLE_LEN + 3 + 8 + len;
+        if payload_start > bytes.len() {
+            return Err("embedded type table overruns the file".into());
+        }
+        return Ok(Parsed {
+            kind,
+            version,
+            payload_start,
+        });
+    }
     Ok(Parsed {
         kind,
         version,

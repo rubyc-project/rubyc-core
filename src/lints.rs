@@ -199,6 +199,14 @@ fn collect_reads_block(block: &crate::models::Block, out: &mut Vec<String>) {
             }
             Stmt::Expression(e) => collect_reads_expr(e, out),
             Stmt::Block { body, .. } => collect_reads_block(body, out),
+            Stmt::Fixed { declarators, body, .. } => {
+                for (_, _, init) in declarators {
+                    if let Some(e) = init {
+                        collect_reads_expr(e, out);
+                    }
+                }
+                collect_reads_block(body, out);
+            }
             Stmt::Return { value: Some(e), .. } => collect_reads_expr(e, out),
             Stmt::Return { value: None, .. } => {}
             Stmt::If {
@@ -272,7 +280,15 @@ fn collect_reads_block(block: &crate::models::Block, out: &mut Vec<String>) {
                     collect_reads_expr(e, out);
                 }
             }
-            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+            Stmt::LocalFunction { params, body, .. } => {
+                for p in params {
+                    if let Some(d) = &p.default_value {
+                        collect_reads_expr(d, out);
+                    }
+                }
+                collect_reads_block(body, out);
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Label { .. } => {}
             Stmt::Goto { case_expr, .. } => {
                 if let Some(e) = case_expr {
                     collect_reads_expr(e, out);
@@ -445,6 +461,14 @@ fn collect_name_refs_block(block: &crate::models::Block, out: &mut Vec<String>) 
             }
             Stmt::Expression(e) => collect_name_refs_expr(e, out),
             Stmt::Block { body, .. } => collect_name_refs_block(body, out),
+            Stmt::Fixed { declarators, body, .. } => {
+                for (_, _, init) in declarators {
+                    if let Some(e) = init {
+                        collect_name_refs_expr(e, out);
+                    }
+                }
+                collect_name_refs_block(body, out);
+            }
             Stmt::Return { value: Some(e), .. } => collect_name_refs_expr(e, out),
             Stmt::Return { value: None, .. } => {}
             Stmt::If {
@@ -521,7 +545,16 @@ fn collect_name_refs_block(block: &crate::models::Block, out: &mut Vec<String>) 
                     collect_name_refs_expr(e, out);
                 }
             }
-            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+            Stmt::LocalFunction { name, params, body, .. } => {
+                out.push(name.clone());
+                for p in params {
+                    if let Some(d) = &p.default_value {
+                        collect_name_refs_expr(d, out);
+                    }
+                }
+                collect_name_refs_block(body, out);
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Label { .. } => {}
             Stmt::Goto { case_expr, .. } => {
                 if let Some(e) = case_expr {
                     collect_name_refs_expr(e, out);

@@ -130,6 +130,8 @@ pub enum TargetError {
     NoStaticArchive,
     /// An archive member failed to decode.
     BadObject(String),
+    /// Type embedding is not implemented for this target.
+    NoTypeEmbed,
 }
 
 impl std::fmt::Display for TargetError {
@@ -169,6 +171,13 @@ impl std::fmt::Display for TargetError {
                     )
                 )
             }
+            TargetError::NoTypeEmbed => {
+                write!(
+                    f,
+                    "{}",
+                    crate::t!("rubyc.native.target.TargetError.no_type_embed")
+                )
+            }
         }
     }
 }
@@ -204,6 +213,21 @@ pub trait ImageWriter: Sync {
     /// header sits at offset 64, right after the ELF header.
     fn write_shared_library(&self, _mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
         Err(TargetError::NoSharedLibrary)
+    }
+
+    /// Emit a shared object with the library's type fragment embedded
+    /// (`--embed-types`): same image plus a non-loaded `.rubyc_types`
+    /// section carrying the `.rci` bytes, so consumers read types from
+    /// the binary instead of a sidecar file. Defaults to a loud error;
+    /// targets without an ELF section table override it. (The loaded
+    /// `.so`-plugin ABI has no slot for the fragment — embedding works
+    /// through the in-process backend only.)
+    fn write_shared_library_embedded(
+        &self,
+        _mc: &MachineCode,
+        _types: &[u8],
+    ) -> Result<Vec<u8>, TargetError> {
+        Err(TargetError::NoTypeEmbed)
     }
 }
 
@@ -403,6 +427,11 @@ pub struct MachineCode {
     pub relocs: Vec<Reloc>,
     /// Object-heap bytes required at runtime.
     pub heap_size: u64,
+    /// Drop `.symtab`/`.strtab` at image-write time (`--strip`).
+    /// Data-only hint for writers; never affects relocations, the
+    /// dynamic symbol table (required for linking), or behavior.
+    /// Serialized as a trailing codec flag (absent = false).
+    pub strip_symbols: bool,
 }
 
 impl MachineCode {

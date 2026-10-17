@@ -418,6 +418,9 @@ impl Reader<'_> {
             is_partial: false,
             // Not carried by the v1 AST contract (same as `is_partial`).
             is_struct: false,
+            // Cross-assembly unions never cross a bytecode boundary
+            // (linking merges sources, not images).
+            union_cross_assembly: false,
         })
     }
 
@@ -434,6 +437,7 @@ impl Reader<'_> {
                 };
                 let is_const = self.byte()? != 0;
                 let is_static = self.byte()? != 0;
+                let is_byref = self.byte()? != 0;
                 let attrs = self.attrs()?;
                 let type_name = self.string()?;
                 let name = self.string()?;
@@ -454,6 +458,7 @@ impl Reader<'_> {
                     init_pre,
                     is_const,
                     is_static,
+                    is_byref,
                     span: Span::default(),
                 }))
             }
@@ -470,6 +475,7 @@ impl Reader<'_> {
                 let is_settable = flags & 0b01 != 0;
                 let is_init = flags & 0b10 != 0;
                 let is_static = flags & 0b100 != 0;
+                let is_abstract = flags & 0b1000 != 0;
                 let attrs = self.attrs()?;
                 let type_name = self.string()?;
                 let name = self.string()?;
@@ -501,6 +507,7 @@ impl Reader<'_> {
                     is_init,
                     is_settable,
                     is_static,
+                    is_abstract,
                     span: Span::default(),
                 }))
             }
@@ -709,6 +716,12 @@ impl Reader<'_> {
             format::tag::ABSENT => false,
             tag => return Err(DecodeError::UnknownNodeTag(tag)),
         };
+        // By-reference marker (see encode).
+        let is_byref = match self.byte()? {
+            format::tag::PRESENT => true,
+            format::tag::ABSENT => false,
+            tag => return Err(DecodeError::UnknownNodeTag(tag)),
+        };
         Ok(Param {
             type_name,
             name,
@@ -717,6 +730,7 @@ impl Reader<'_> {
             is_this,
             // Not carried by the v1 AST contract (same as `is_struct`).
             is_params: false,
+            is_byref,
         })
     }
 
@@ -757,12 +771,18 @@ impl Reader<'_> {
                     4 => Access::Internal,
                     _ => Access::Default,
                 };
+                let is_byref = match self.byte()? {
+                    format::tag::PRESENT => true,
+                    format::tag::ABSENT => false,
+                    tag => return Err(DecodeError::UnknownNodeTag(tag)),
+                };
                 let init = self.expr()?;
                 Ok(Stmt::Let {
                     type_name,
                     name,
                     init,
                     access,
+                    is_byref,
                     span: Span::default(),
                 })
             }
@@ -896,6 +916,36 @@ impl Reader<'_> {
                     span: Span::default(),
                 })
             }
+            format::tag::stmt::LABEL => {
+                self.byte()?;
+                let name = self.string()?;
+                Ok(Stmt::Label {
+                    name,
+                    span: Span::default(),
+                })
+            }
+            format::tag::stmt::FIXED => {
+                self.byte()?;
+                let n = self.u32()? as usize;
+                self.count(n)?;
+                let mut declarators = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let ty = self.string()?;
+                    let name = self.string()?;
+                    let init = if self.byte()? == format::tag::PRESENT {
+                        Some(self.expr()?)
+                    } else {
+                        None
+                    };
+                    declarators.push((ty, name, init));
+                }
+                let body = self.block()?;
+                Ok(Stmt::Fixed {
+                    declarators,
+                    body,
+                    span: Span::default(),
+                })
+            }
             format::tag::stmt::GOTO => {
                 self.byte()?;
                 let label = if self.byte()? == format::tag::PRESENT {
@@ -959,6 +1009,26 @@ impl Reader<'_> {
                 };
                 Ok(Stmt::Throw {
                     expr,
+                    span: Span::default(),
+                })
+            }
+            format::tag::stmt::LOCAL_FUNCTION => {
+                self.byte()?;
+                let name = self.string()?;
+                let mut params = Vec::new();
+                let count = self.u32()?;
+                for _ in 0..count {
+                    params.push(self.param()?);
+                }
+                let ret_type = self.string()?;
+                let body = self.block()?;
+                let is_static = self.byte()? != 0;
+                Ok(Stmt::LocalFunction {
+                    name,
+                    params,
+                    ret_type,
+                    body,
+                    is_static,
                     span: Span::default(),
                 })
             }
@@ -1063,9 +1133,21 @@ impl Reader<'_> {
                 for _ in 0..n {
                     args.push(self.expr()?);
                 }
+                let m = self.u32()?;
+                let mut init = Vec::with_capacity(m);
+                for _ in 0..m {
+                    let name = self.string()?;
+                    let value = self.expr()?;
+                    init.push(crate::models::ast::MemberInit {
+                        name,
+                        value,
+                        span: Span::default(),
+                    });
+                }
                 Ok(Expr::New {
                     class_name,
                     args,
+                    init,
                     span: Span::default(),
                 })
             }
@@ -1081,7 +1163,16 @@ impl Reader<'_> {
             format::tag::NEW_ARRAY => {
                 let elem_type = self.string()?;
                 let size = Box::new(self.expr()?);
-                Ok(Expr::NewArray { elem_type, size, span: Span::default() })
+                // v3: collection-expression initializers follow the
+                // size (absent in v2 payloads — but the version gate
+                // rejects those before decode, so unguarded read is
+                // exact).
+                let n = self.u32()?;
+                let mut init = Vec::with_capacity(n);
+                for _ in 0..n {
+                    init.push(self.expr()?);
+                }
+                Ok(Expr::NewArray { elem_type, size, init, span: Span::default() })
             }
             format::tag::INDEX => {
                 let object = Box::new(self.expr()?);

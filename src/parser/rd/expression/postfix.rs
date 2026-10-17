@@ -1,8 +1,30 @@
 //! Expressions: precedence climbing, unary, postfix chains, primaries.
 
-use crate::models::{Expr, Literal, Span, TokenKind, UnOp};
+use crate::models::{BinOp, Expr, Literal, Span, TokenKind, UnOp};
 
 use super::super::{Parser, expr_span};
+
+/// Null-conditional guard: `recv?.Next` desugars to
+/// `recv == null ? null : Next` (the receiver evaluates twice —
+/// same pre-existing double evaluation as receivers elsewhere;
+/// side-effecting receivers repeat, values stay exact).
+/// Mixed chains (`a?.B.C`) guard only the `?.` segment; the outer
+/// plain tail keeps legacy behavior on the null placeholder
+/// (documented gap, no worse than the old collapse-everything).
+fn null_conditional(recv: Expr, node: Expr) -> Expr {
+    let s = expr_span(&node);
+    Expr::Ternary {
+        cond: Box::new(Expr::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(recv),
+            rhs: Box::new(Expr::Literal(Literal::Null)),
+            span: s.clone(),
+        }),
+        then_expr: Box::new(Expr::Literal(Literal::Null)),
+        else_expr: Box::new(node),
+        span: s,
+    }
+}
 impl Parser {
     fn dot_name_tail(
         &mut self,
@@ -227,13 +249,14 @@ impl Parser {
                 // Null-conditional member access: `expr?.Member` — the
                 // token must be exactly `?.` (a spaced `? .` starts a
                 // ternary). Shares the name+generics+call tail with `.`
-                // above (so `?.M<T>(...)` works); the AST collapses it
-                // into a regular member access since the runtime does
-                // not yet distinguish null-conditional semantics.
+                // above (so `?.M<T>(...)` works); the result is
+                // null-guarded (see `null_conditional`).
                 self.bump(); // '?.'
                 let name = self.expect_identifier("after '?.'")?;
                 let start = expr_span(&expr);
-                expr = self.dot_name_tail(expr, start, name)?;
+                let recv = expr;
+                let node = self.dot_name_tail(recv.clone(), start, name)?;
+                expr = null_conditional(recv, node);
             } else if self.peek().kind == TokenKind::Question
                 && self.peek_at(1).kind == TokenKind::Dot
                 && matches!(self.peek_at(2).kind, TokenKind::Identifier(_))
@@ -242,13 +265,15 @@ impl Parser {
                 // (fluent chains like `.Value?\n.ToString()`). A ternary
                 // branch can never start with `.Identifier` (only a
                 // numeric literal like `.5` can, and that is not an
-                // identifier), so this is unambiguous. Same collapse
-                // as adjacent `?.` above.
+                // identifier), so this is unambiguous. Null-guarded
+                // like adjacent `?.` above.
                 self.bump(); // '?'
                 self.bump(); // '.'
                 let name = self.expect_identifier("after '? .'")?;
                 let start = expr_span(&expr);
-                expr = self.dot_name_tail(expr, start, name)?;
+                let recv = expr;
+                let node = self.dot_name_tail(recv.clone(), start, name)?;
+                expr = null_conditional(recv, node);
             } else if self.peek().kind == TokenKind::Arrow {
                 // Pointer member access: `p->Field` ≡ `(*p).Field`.
                 self.bump(); // '->'
@@ -333,35 +358,37 @@ impl Parser {
             {
                 // Null-conditional member access: `expr?.Member` — the
                 // token must be exactly `?.` (a spaced `? .` starts a
-                // ternary, as for `? [` below). Bump the `?.` and the
-                // following identifier; the AST collapses it into a
-                // regular member access since the runtime does not yet
-                // distinguish null-conditional semantics.
+                // ternary, as for `? [` below). Null-guarded (see
+                // `null_conditional`).
                 self.bump(); // '?.'
                 let name = self.expect_identifier("after '?.'")?;
                 let s = expr_span(&expr);
-                expr = Expr::Member {
-                    object: Box::new(expr),
+                let recv = expr;
+                let node = Expr::Member {
+                    object: Box::new(recv.clone()),
                     name,
                     span: s.to(self.peek_at(0).span),
                 };
+                expr = null_conditional(recv, node);
             } else if self.peek().kind == TokenKind::Question
                 && self.peek_at(1).kind == TokenKind::Dot
                 && matches!(self.peek_at(2).kind, TokenKind::Identifier(_))
             {
                 // Split null-conditional: `expr?` newline `.Member`
                 // (same rule as the other postfix loop — a ternary
-                // branch can never start with `.Identifier`). Collapses
-                // like adjacent `?.` above.
+                // branch can never start with `.Identifier`).
+                // Null-guarded like adjacent `?.` above.
                 self.bump(); // '?'
                 self.bump(); // '.'
                 let name = self.expect_identifier("after '? .'")?;
                 let s = expr_span(&expr);
-                expr = Expr::Member {
-                    object: Box::new(expr),
+                let recv = expr;
+                let node = Expr::Member {
+                    object: Box::new(recv.clone()),
                     name,
                     span: s.to(self.peek_at(0).span),
                 };
+                expr = null_conditional(recv, node);
             } else if self.peek().kind == TokenKind::Question
                 && self.peek_at(1).kind == TokenKind::LeftBracket
                 && self.peek().span.end == self.peek_at(1).span.start
@@ -382,12 +409,14 @@ impl Parser {
                 let close = self
                     .expect(&TokenKind::RightBracket, "to close null-conditional index");
                 let s = expr_span(&expr);
-                expr = Expr::Index {
-                    object: Box::new(expr),
+                let recv = expr;
+                let node = Expr::Index {
+                    object: Box::new(recv.clone()),
                     index: Box::new(index.unwrap_or(Expr::Literal(Literal::Int(0)))),
                     is_range: false,
                     span: s.to(close.map_or(self.peek().span, |t| t.span)),
                 };
+                expr = null_conditional(recv, node);
             } else if self.peek().kind == TokenKind::Bang {
                 // Null-forgiving operator: `expr!`
                 self.bump();

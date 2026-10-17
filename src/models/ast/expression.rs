@@ -3,6 +3,23 @@
 use crate::models::Span;
 use crate::models::compare::StructuralEq;
 
+/// One `Name = value` element of an object-initializer (`new C {
+/// Name = value, ... }`): the member write runs after construction,
+/// through the same member-assign path as a standalone `obj.Name =
+/// value` (field store or setter dispatch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberInit {
+    pub name: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+impl StructuralEq for MemberInit {
+    fn structural_eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.value.structural_eq(&other.value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -107,10 +124,14 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
-    /// `new ClassName(args...)`
+    /// `new ClassName(args...)` with optional object-initializer
+    /// member writes (`{ Prop = value, ... }`). Index- and
+    /// collection-initializer elements have no member name to write
+    /// through and are still dropped at parse (documented gap).
     New {
         class_name: String,
         args: Vec<Expr>,
+        init: Vec<MemberInit>,
         span: Span,
     },
     /// `object.member` — field read or method call receiver.
@@ -134,8 +155,12 @@ pub enum Expr {
         inner: Box<Expr>,
         span: Span,
     },
-    /// `new T[n]` — single-dim array allocation.
-    NewArray { elem_type: String, size: Box<Expr>, span: Span },
+    /// `new T[n]` — single-dim array allocation. `init` carries
+    /// collection-expression / array-initializer elements
+    /// (`[e1, e2]`, `{ e1, e2 }`): stored at base+8+i*8 on
+    /// allocation, in order (side effects in order). Empty for
+    /// plain sized allocation (`new T[n]`).
+    NewArray { elem_type: String, size: Box<Expr>, init: Vec<Expr>, span: Span },
     /// `arr[i]` indexing. `is_range` marks C# 8 range slices
     /// (`a[..n]`, `a[i..j]`): a slice has the CONTAINER's type
     /// (`Span<T>`/`T[]`), not the element type — without the flag the
@@ -299,17 +324,21 @@ impl StructuralEq for Expr {
                 Expr::New {
                     class_name: a,
                     args: aa,
+                    init: ai,
                     ..
                 },
                 Expr::New {
                     class_name: b,
                     args: bb,
+                    init: bi,
                     ..
                 },
             ) => {
                 a == b
                     && aa.len() == bb.len()
                     && aa.iter().zip(bb.iter()).all(|(x, y)| x.structural_eq(y))
+                    && ai.len() == bi.len()
+                    && ai.iter().zip(bi.iter()).all(|(x, y)| x.structural_eq(y))
             }
             (Expr::Literal(a), Expr::Literal(b)) => a == b,
             (Expr::Ident { name: a, .. }, Expr::Ident { name: b, .. }) => a == b,
@@ -391,14 +420,21 @@ impl StructuralEq for Expr {
                 Expr::NewArray {
                     elem_type: a,
                     size: as_,
+                    init: ai,
                     ..
                 },
                 Expr::NewArray {
                     elem_type: b,
                     size: bs,
+                    init: bi,
                     ..
                 },
-            ) => a == b && as_.structural_eq(bs),
+            ) => {
+                a == b
+                    && as_.structural_eq(bs)
+                    && ai.len() == bi.len()
+                    && ai.iter().zip(bi.iter()).all(|(x, y)| x.structural_eq(y))
+            }
             (
                 Expr::Index {
                     object: ao,

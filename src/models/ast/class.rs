@@ -28,6 +28,13 @@ pub struct FieldDecl {
     /// the object layout. It is accessed through the type name and is
     /// initialized once at program start.
     pub is_static: bool,
+    /// `ref` modifier (`ref T _field` in a ref struct): the slot
+    /// holds an address, not a value. Address-taking (`ref field`)
+    /// collapses to the target (no extra indirection); value reads
+    /// see the address. Without this, byref field addresses resolve
+    /// to the slot instead of the target (e.g. `Span._reference`
+    /// copies slot bytes instead of buffer data in `Memmove`).
+    pub is_byref: bool,
     pub span: Span,
 }
 
@@ -59,6 +66,13 @@ pub struct PropertyDecl {
     /// `static` modifier: the property lives in per-class static storage
     /// (accessed through the type name), mirroring FieldDecl.
     pub is_static: bool,
+    /// `abstract` modifier: body-less accessors declare no storage —
+    /// without this flag an abstract property is indistinguishable
+    /// from an auto-property and wrongly gains a backing field
+    /// (shifting every later instance offset; e.g. Stream's
+    /// `CanRead`/`CanWrite` pushed MemoryStream's `_buffer` out of
+    /// reach and faulted `WriteByte`).
+    pub is_abstract: bool,
     pub span: Span,
 }
 
@@ -120,6 +134,15 @@ pub struct ClassDecl {
     /// their implicit parameterless constructor even with explicit
     /// ctors; classes do not. Parsed uniformly as classes otherwise.
     pub is_struct: bool,
+    /// Cross-assembly union provenance (set by the driver's dep-member
+    /// union, never by the parser): this declaration absorbed members
+    /// from another assembly's same-path class. Same-assembly partial
+    /// parts never carry it. Semantic uses it to tell a genuine
+    /// multi-part partial (merge silently) from a cross-assembly
+    /// collision (merge, but preserve each side's constructibility).
+    /// Excluded from structural equality and the v1 AST byte contract
+    /// like `is_partial`.
+    pub union_cross_assembly: bool,
 }
 
 impl StructuralEq for ClassDecl {

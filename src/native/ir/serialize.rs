@@ -85,6 +85,9 @@ pub mod tag {
     // Process argv as `string[]` (startup-saved stack slot; empty
     // array where no slot exists, e.g. JIT).
     pub const BUILD_ARGV: u8 = 0x3d;
+    // Float↔integral conversions (`cvttsd2si` / `cvtsi2sd`).
+    pub const F2I: u8 = 0x3e;
+    pub const I2F: u8 = 0x3f;
 
     // Terminator tags.
     pub const T_RET: u8 = 0x30;
@@ -350,6 +353,16 @@ impl<'a> Writer<'a> {
                 self.byte(tag::FNEG);
                 self.vreg(*dst);
                 self.vreg(*a);
+            }
+            Instr::F2I { dst, src } => {
+                self.byte(tag::F2I);
+                self.vreg(*dst);
+                self.vreg(*src);
+            }
+            Instr::I2F { dst, src } => {
+                self.byte(tag::I2F);
+                self.vreg(*dst);
+                self.vreg(*src);
             }
             Instr::CallFn { dst, fidx, args } => {
                 self.byte(tag::CALL_FN);
@@ -891,6 +904,16 @@ impl<'a> Reader<'a> {
                 let dst = self.vreg()?;
                 let a = self.vreg()?;
                 Ok(Instr::FNeg { dst, a })
+            }
+            tag::F2I => {
+                let dst = self.vreg()?;
+                let src = self.vreg()?;
+                Ok(Instr::F2I { dst, src })
+            }
+            tag::I2F => {
+                let dst = self.vreg()?;
+                let src = self.vreg()?;
+                Ok(Instr::I2F { dst, src })
             }
             tag::CALL_FN => {
                 let dst = self.vreg()?;

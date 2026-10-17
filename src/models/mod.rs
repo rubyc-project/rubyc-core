@@ -14,7 +14,7 @@ pub mod visitor;
 pub use ast::{
     Access, Attribute, AttributeArg, AttributeValue, BinOp, Block, CatchClause, ClassDecl,
     ClassMember, CompilationUnit, DelegateDecl, Expr, FieldDecl, InterfaceDecl, Literal, Member,
-    MethodDecl, MethodSig, NamespaceDecl, Param, PropertyDecl, Stmt, EnumDecl, InterpPart,
+    MemberInit, MethodDecl, MethodSig, NamespaceDecl, Param, PropertyDecl, Stmt, EnumDecl, InterpPart,
     SwitchArm, SwitchExprArm, UnOp, EventDecl, IndexerDecl, UsingAlias,
 };
 pub use diagnostic::{DecodeError, Diagnostic, ScopeContext, Severity, SyntaxError};

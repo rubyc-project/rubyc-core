@@ -31,6 +31,7 @@
 #[path = "native/rci_roundtrip.rs"] mod native_rci_roundtrip;
 #[path = "native/async_smoke.rs"] mod native_async_smoke;
 #[path = "native/ir_chained_field.rs"] mod native_ir_chained_field;
+#[path = "native/virtual_property_dispatch.rs"] mod native_virtual_property_dispatch;
 #[path = "native/float_lowering.rs"] mod native_float_lowering;
 #[path = "native/postfix_incdec.rs"] mod native_postfix_incdec;
 #[path = "native/string_lowering.rs"] mod native_string_lowering;
@@ -43,6 +44,7 @@
 #[path = "native/nested_resolution.rs"] mod native_nested_resolution;
 #[path = "native/out_vars.rs"] mod native_out_vars;
 #[path = "native/overload_access.rs"] mod native_overload_access;
+#[path = "native/import_marshal.rs"] mod native_import_marshal;
 
 // preprocessor/
 #[path = "preprocessor/directives.rs"] mod preprocessor_directives;

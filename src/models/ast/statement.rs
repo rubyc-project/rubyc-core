@@ -25,6 +25,9 @@ pub enum Stmt {
         name: String,
         init: Expr,
         access: Access,
+        /// `ref`/`out`/`in` local (`ref char x = ref y`): the home
+        /// holds the aliased address, not a value copy.
+        is_byref: bool,
         span: Span,
     },
     /// `x = expr;`
@@ -98,6 +101,21 @@ pub enum Stmt {
         case_expr: Option<Expr>,
         span: Span,
     },
+    /// `Name:` — a goto target labelling the following statement.
+    /// (The parser wraps `[Label, stmt]` in a `Block` since it
+    /// returns one statement at a time.)
+    Label { name: String, span: Span },
+    /// `fixed (T* p = expr, ...) body` — pin and expose data
+    /// addresses. Lowering binds each name to the pinned address
+    /// (string/array data at +16) and runs the body (no GC moves
+    /// here, so pinning is just address-taking).
+    Fixed {
+        /// `(declared type, name, initializer)` per declarator.
+        /// Initializer is `None` when absent (binds zero).
+        declarators: Vec<(String, String, Option<Expr>)>,
+        body: crate::models::Block,
+        span: Span,
+    },
     /// `try { … } catch (T e) { … } … finally { … }`.
     /// At least one of `catches` or `finally_block` is present.
     Try {
@@ -110,6 +128,18 @@ pub enum Stmt {
     Throw {
         /// `None` for a bare rethrow.
         expr: Option<Expr>,
+        span: Span,
+    },
+    /// A local function declaration (`static int Ensure() { … }`).
+    /// Lowered to a real (mangled) function when static and
+    /// non-capturing; otherwise a legacy zero placeholder. Body
+    /// statements execute only via calls, never inline.
+    LocalFunction {
+        name: String,
+        params: Vec<super::method::Param>,
+        ret_type: String,
+        body: crate::models::Block,
+        is_static: bool,
         span: Span,
     },
 }
@@ -272,6 +302,33 @@ impl StructuralEq for Stmt {
             }
             (Stmt::Break { .. }, Stmt::Break { .. })
             | (Stmt::Continue { .. }, Stmt::Continue { .. }) => true,
+            (Stmt::Label { name: a, .. }, Stmt::Label { name: b, .. }) => a == b,
+            (
+                Stmt::Fixed {
+                    declarators: ad,
+                    body: ab,
+                    ..
+                },
+                Stmt::Fixed {
+                    declarators: bd,
+                    body: bb,
+                    ..
+                },
+            ) => {
+                ad.len() == bd.len()
+                    && ad.iter().zip(bd.iter()).all(
+                        |((at, an, ai), (bt, bn, bi))| {
+                            at == bt
+                                && an == bn
+                                && match (ai, bi) {
+                                    (Some(a), Some(b)) => a.structural_eq(b),
+                                    (None, None) => true,
+                                    _ => false,
+                                }
+                        },
+                    )
+                    && ab.structural_eq(bb)
+            }
             (
                 Stmt::Goto {
                     label: al,
@@ -326,6 +383,44 @@ impl StructuralEq for Stmt {
                 (None, None) => true,
                 _ => false,
             },
+            (
+                Stmt::LocalFunction {
+                    name: an,
+                    params: ap,
+                    ret_type: at,
+                    body: ab,
+                    is_static: astatic,
+                    ..
+                },
+                Stmt::LocalFunction {
+                    name: bn,
+                    params: bp,
+                    ret_type: bt,
+                    body: bb,
+                    is_static: bstatic,
+                    ..
+                },
+            ) => {
+                an == bn
+                    && at == bt
+                    && astatic == bstatic
+                    && ap.len() == bp.len()
+                    && ap.iter().zip(bp.iter()).all(|(a, b)| {
+                        a.name == b.name
+                            && a.type_name == b.type_name
+                            && match (&a.default_value, &b.default_value) {
+                                (Some(x), Some(y)) => x.structural_eq(y),
+                                (None, None) => true,
+                                _ => false,
+                            }
+                    })
+                    && ab.stmts.len() == bb.stmts.len()
+                    && ab
+                        .stmts
+                        .iter()
+                        .zip(bb.stmts.iter())
+                        .all(|(a, b)| a.structural_eq(b))
+            }
             _ => false,
         }
     }

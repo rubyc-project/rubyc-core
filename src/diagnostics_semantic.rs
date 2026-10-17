@@ -639,7 +639,28 @@ fn walk_stmt(
             walk_expr(value, scope, candidates, out, guard);
         }
         Stmt::Expression(e) => walk_expr(e, scope, candidates, out, guard),
-        Stmt::Block { body, .. } => walk_block(body, scope, candidates, out, guard),
+        Stmt::Block { body, .. } => {
+            // Label-led blocks (`L: stmt`, which the parser wraps so
+            // both survive single-statement returns) share the
+            // enclosing scope: C# labels introduce none, so a labeled
+            // declaration (`L: int x = ...`) is visible after the
+            // block. Anything else gets its own scope as usual.
+            let label_led = body.stmts.first().is_some_and(|s| {
+                matches!(s, crate::models::Stmt::Label { .. })
+            });
+            if label_led {
+                for stmt in &body.stmts {
+                    if let crate::models::Stmt::Let { name, .. } = stmt {
+                        scope.declare(name);
+                    }
+                }
+                for stmt in &body.stmts {
+                    walk_stmt(stmt, scope, candidates, out, guard);
+                }
+            } else {
+                walk_block(body, scope, candidates, out, guard)
+            }
+        }
         Stmt::Return { value: Some(e), .. } => walk_expr(e, scope, candidates, out, guard),
         Stmt::If {
             cond,
@@ -682,6 +703,17 @@ fn walk_stmt(
             walk_block(body, &loop_scope, candidates, out, guard);
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Fixed { declarators, body, .. } => {
+            // Pinned names scope over the body (like a block).
+            let mut inner = scope.clone();
+            for (_, name, init) in declarators {
+                if let Some(e) = init {
+                    walk_expr(e, &mut inner, candidates, out, guard);
+                }
+                inner.declare(name);
+            }
+            walk_block(body, &inner, candidates, out, guard);
+        }
         _ => {}
     }
 }

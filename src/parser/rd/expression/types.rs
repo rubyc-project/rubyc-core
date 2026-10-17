@@ -28,7 +28,15 @@ impl Parser {
             // variable name. Expose it to the semantic scan as a zero-init
             // `Let` so references to it resolve.
             // Declared `out` args also rewrite the slot (below).
-            let mut out_default: Option<(String, Span)> = None;
+            let mut out_default: Option<(String, String, Span)> = None;
+            // Call-site `ref`/`in` marker (see below): the slot wraps
+            // in `&` (address-of) so overload ranking can require a
+            // byref parameter — erased markers self-elected a
+            // same-name value twin (`WriteAtOffset(handle, buf, ref
+            // off)` recursed into itself forever). `out` keeps legacy
+            // Ident slots (its declaration/writeback machinery owns
+            // those paths).
+            let mut ref_mark: Option<Span> = None;
             if matches!(
                 self.peek().kind,
                 TokenKind::Keyword(Keyword::Out_)
@@ -38,6 +46,9 @@ impl Parser {
                 let is_out = matches!(self.peek().kind, TokenKind::Keyword(Keyword::Out_));
                 let mod_span = self.peek().span;
                 self.bump();
+                if !is_out {
+                    ref_mark = Some(mod_span);
+                }
                 // Optionally skip a full type (`out T x`, `out T[]? x`,
                 // `out Ns.T? x`, `out (long, long) f`) before the value
                 // identifier. A member or index expression
@@ -93,14 +104,9 @@ impl Parser {
                 // contextual keyword (`out T record`) — read source text.
                 // Queued pre-statement: the variable is in scope for the
                 // call itself and everything after it. The argument slot
-                // carries `default(T)` (not a bare read of the name): the
-                // slot is write-only (the callee overwrites; our model
-                // has no writeback) and a bare read fails when the
-                // declaration has not lowered yet — notably in
-                // `: base(...)` position, where the call precedes the
-                // body holding the queued `Let`. `default(T)` types
-                // identically for ranking and evaluates to zero without
-                // a scope lookup.
+                // carries the declared name (rewritten below): the slot
+                // is write-only (the callee overwrites), and the `Let`
+                // types the name identically for ranking.
                 if is_out && declared && self.peek_is_name(0) {
                     let name_span = self.peek().span;
                     let bytes =
@@ -109,25 +115,55 @@ impl Parser {
                         std::str::from_utf8(bytes).unwrap_or("").to_owned();
                     let ty = declared_ty.unwrap_or_else(|| String::from("var"));
                     self.pre_pending.push(Stmt::Let {
+                        is_byref: false,
                         type_name: ty.clone(),
-                        name: var_name,
+                        name: var_name.clone(),
                         init: Expr::Literal(Literal::Int(0)),
                         access: Access::Default,
                         span: mod_span.to(name_span),
                     });
-                    out_default = Some((ty, mod_span.to(name_span)));
+                    out_default = Some((ty, var_name, mod_span.to(name_span)));
                 }
             }
             match out_default {
-                Some((ty, span)) => {
+                Some((_ty, var_name, span)) => {
                     self.bump(); // consume the out-var name
-                    args.push(Expr::Default {
-                        type_name: ty,
-                        span,
-                    });
+                    // Slot carries the declared name (not `default(T)`):
+                    // `box_byref_args` boxes `Ident` locals WITH a
+                    // writeback, so the callee's value flows back into
+                    // the variable (inline `out` previously boxed a
+                    // nameless default and the write was lost — every
+                    // `Try*`/`Fast` out-param read back zero). The
+                    // `Let` types the name identically for ranking.
+                    // Base-init position keeps the old nameless default
+                    // (see `in_base_init`): the name is genuinely
+                    // undeclared at the call and an `Ident` would fail
+                    // to lower there.
+                    if self.in_base_init {
+                        args.push(Expr::Default {
+                            type_name: _ty,
+                            span,
+                        });
+                    } else {
+                        args.push(Expr::Ident {
+                            name: var_name,
+                            span,
+                        });
+                    }
                 }
                 None => match self.expression() {
-                    Some(arg) => args.push(arg),
+                    Some(arg) => {
+                        if let Some(mspan) = ref_mark {
+                            let end = self.peek().span;
+                            args.push(Expr::Unary {
+                                op: crate::models::ast::expression::UnOp::AddrOf,
+                                inner: Box::new(arg),
+                                span: mspan.to(end),
+                            });
+                        } else {
+                            args.push(arg);
+                        }
+                    }
                     None => return args,
                 },
             }
@@ -768,6 +804,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_byref: false,
                             type_name: String::from("var"),
                             name: binding,
                             init: Expr::Literal(Literal::Int(0)),
@@ -877,6 +914,7 @@ impl Parser {
             // (`is (...) record`).
             if let Some((binding, span)) = self.take_pattern_binding() {
                 self.pre_pending.push(Stmt::Let {
+                    is_byref: false,
                     type_name: String::from("var"),
                     name: binding,
                     init: Expr::Literal(Literal::Int(0)),
@@ -943,6 +981,7 @@ impl Parser {
                 if matches!(self.peek().kind, TokenKind::Identifier(_)) || matches!(self.peek().kind, TokenKind::Keyword(_)) {
                     if let Some((binding, span)) = self.take_pattern_binding() {
                         self.pre_pending.push(Stmt::Let {
+                            is_byref: false,
                             type_name: full,
                             name: binding,
                             init: Expr::Literal(Literal::Int(0)),
@@ -989,6 +1028,7 @@ impl Parser {
             // (`is T record`).
             if let Some((binding, span)) = self.take_pattern_binding() {
                 self.pre_pending.push(Stmt::Let {
+                    is_byref: false,
                     type_name: type_name.clone(),
                     name: binding,
                     init: Expr::Literal(Literal::Int(0)),
@@ -998,8 +1038,14 @@ impl Parser {
             }
             return Some(Expr::Literal(Literal::Int(0)));
         }
-        // Fallback: a constant pattern (literal, identifier, string, etc.).
-        self.expression()
+        // Fallback: a constant pattern (`null`, `5`, `"x"`,
+        // `SomeEnum.Value`, `-1`). Parsed at unary level — NEVER a
+        // full expression: boolean/assignment/closure operators
+        // (`||`, `&&`, `??`, `=>`, …) terminate the pattern in C#.
+        // The old full-expression fallback swallowed trailing
+        // operators (`v is null || v.Length == 0` became
+        // `v is (null || …)`), silently inverting guards.
+        self.unary()
     }
 
     /// True if the `?` at the cursor is a nullable-type suffix (not a

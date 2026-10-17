@@ -16,7 +16,11 @@
 /// `static` modifier), delegates, properties, indexers, events, enums,
 /// attributes, and source assembly blocks.
 /// Pre-release: mismatched payloads fail closed rather than misreading.
-pub const FORMAT_VERSION: u16 = 6;
+/// v9: `NEW` carries the object-initializer member list.
+/// v10: `PROPERTY` flags carry `is_abstract` (no storage for abstract
+/// accessors — previously indistinguishable from auto-properties).
+/// v11: `FIELD` carries `is_byref` (`ref T` slots hold addresses).
+pub const FORMAT_VERSION: u16 = 11;
 
 /// Node tags. One byte per node, children follow recursively.
 ///
@@ -167,5 +171,13 @@ pub mod tag {
         pub const THROW: u8 = 0x39;
         /// Standalone `{ ... }` block — block(block).
         pub const BLOCK: u8 = 0x3A;
+        /// Local function declaration — string(name), u32(params) +
+        /// param() each, string(ret_type), block(body), byte(is_static).
+        pub const LOCAL_FUNCTION: u8 = 0x3B;
+        /// Goto label definition — string(name).
+        pub const LABEL: u8 = 0x3C;
+        /// `fixed` statement — u32(n) + (string(type), string(name),
+        /// byte(has-init) + expr?) each, then block(body).
+        pub const FIXED: u8 = 0x3D;
     }
 }

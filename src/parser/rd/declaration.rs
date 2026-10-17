@@ -659,6 +659,7 @@ impl Parser {
                 span: start,
                 is_partial,
                 is_struct,
+                union_cross_assembly: false,
             });
         }
         if self
@@ -693,6 +694,7 @@ impl Parser {
             span: start.to(end.map_or(self.peek().span, |t| t.span)),
             is_partial,
             is_struct,
+            union_cross_assembly: false,
         })
     }
 
@@ -888,6 +890,7 @@ impl Parser {
         }
         let recv_text_start = self.peek().span.end as usize;
         let mut depth = 0i32;
+        let mut angles = 0i32;
         let mut inner_tokens = 0u32;
         let mut ok = true;
         while self.peek().kind != TokenKind::Eof {
@@ -899,8 +902,17 @@ impl Parser {
                         break;
                     }
                 }
+                // Generic commas (`Dictionary<TKey, TValue>`) are not
+                // separators — only a top-level comma disqualifies.
+                // `<<`/`>>` lex as Shl/Shr; comparisons inside a
+                // receiver type are vanishingly rare, and a missed
+                // close just fails recognition (never misparses).
+                TokenKind::Less => angles += 1,
+                TokenKind::Greater => angles -= 1,
+                TokenKind::Shl => angles += 2,
+                TokenKind::Shr => angles -= 2,
                 TokenKind::Assign | TokenKind::Semicolon | TokenKind::Comma
-                    if depth == 1 =>
+                    if depth == 1 && angles == 0 =>
                 {
                     ok = false;
                     break;
@@ -986,6 +998,7 @@ impl Parser {
                         init_pre: Vec::new(),
                         is_const: false,
                         is_static: false,
+                        is_byref: false,
                         span: start.to(self.peek_at(0).span),
                     }),
                 );
@@ -1001,6 +1014,7 @@ impl Parser {
             is_partial: false,
             // Synthetic extension holder: reference semantics.
             is_struct: false,
+            union_cross_assembly: false,
         })
     }
 
@@ -1031,6 +1045,11 @@ impl Parser {
         let mut is_partial = false;
         let mut is_async = false;
         let mut is_extern = false;
+        // `ref` modifier (`ref T x` — ref fields, ref returns): the
+        // modifiers loop below consumes it with the ignored
+        // modifiers; capture it here so field declarations can
+        // record address-holding slots.
+        let mut is_byref = false;
         loop {
             match self.peek().kind {
                 TokenKind::Keyword(Keyword::Override) => {
@@ -1066,7 +1085,6 @@ impl Parser {
                 TokenKind::Keyword(Keyword::Virtual)
                 | TokenKind::Keyword(Keyword::Sealed)
                 | TokenKind::Keyword(Keyword::Readonly)
-                | TokenKind::Keyword(Keyword::Ref_)
                 | TokenKind::Keyword(Keyword::Out_)
                 | TokenKind::Keyword(Keyword::In_)
                 | TokenKind::Keyword(Keyword::New)
@@ -1075,6 +1093,13 @@ impl Parser {
                 | TokenKind::Keyword(Keyword::File)
                 | TokenKind::Keyword(Keyword::Fixed)
                 |                 TokenKind::Keyword(Keyword::Volatile) => {
+                    self.bump();
+                }
+                // `ref` modifier is meaningful (ref fields hold
+                // addresses; ref returns are addresses) — record it
+                // instead of discarding with the ignored modifiers.
+                TokenKind::Keyword(Keyword::Ref_) => {
+                    is_byref = true;
                     self.bump();
                 }
                 TokenKind::Keyword(Keyword::Extern) => {
@@ -1512,6 +1537,7 @@ impl Parser {
                 init_pre: Vec::new(),
                 is_const,
                 is_static,
+                is_byref: false,
                 span: start.to(self.peek_at(0).span),
             }));
         }
@@ -1565,6 +1591,7 @@ impl Parser {
                         init_pre: extra_pre,
                         is_const,
                         is_static,
+                        is_byref,
                         span: start.to(self.peek_at(0).span),
                     }));
                 }
@@ -1581,6 +1608,7 @@ impl Parser {
                     init_pre,
                     is_const,
                     is_static,
+                    is_byref,
                     span: start.to(self.peek_at(0).span),
                 }));
             }
@@ -1638,6 +1666,7 @@ impl Parser {
                 is_init,
                 is_settable,
                 is_static,
+                is_abstract,
                 span: start.to(end),
             }));
             }
@@ -1929,6 +1958,50 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 Some((value, token.span))
+            }
+            TokenKind::Keyword(Keyword::New) => {
+                // Object/array creation (`new[] {...}`, `new int[] {...}`,
+                // `new Foo(...)`): attribute values are inert metadata, so
+                // consume an optional dotted type with generics, then every
+                // balanced bracket group that follows. Without this, `new`
+                // falls into the name arm below and the trailing `[`
+                // breaks argument parsing.
+                self.bump(); // 'new'
+                // Optional type: a leading identifier (`new int[]`, `new
+                // Foo`) plus dotted continuations (`new A.B.C(...)`).
+                // `new[]` / `new(...)` skip straight to the groups below.
+                if matches!(self.peek().kind, TokenKind::Identifier(_)) {
+                    self.bump();
+                    while self.peek().kind == TokenKind::Dot {
+                        self.bump();
+                        if !matches!(self.peek().kind, TokenKind::Identifier(_)) {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
+                if self.peek().kind == TokenKind::Less {
+                    self.skip_generic_parameter_list();
+                }
+                loop {
+                    let (open, close) = match self.peek().kind {
+                        TokenKind::LeftBrace => (TokenKind::LeftBrace, TokenKind::RightBrace),
+                        TokenKind::LeftParen => (TokenKind::LeftParen, TokenKind::RightParen),
+                        TokenKind::LeftBracket => (TokenKind::LeftBracket, TokenKind::RightBracket),
+                        _ => break,
+                    };
+                    self.bump();
+                    let mut depth = 1usize;
+                    while depth > 0 && self.peek().kind != TokenKind::Eof {
+                        if self.peek().kind == open {
+                            depth += 1;
+                        } else if self.peek().kind == close {
+                            depth -= 1;
+                        }
+                        self.bump();
+                    }
+                }
+                Some((AttributeValue::Str("".to_owned()), token.span))
             }
             TokenKind::Identifier(_) | TokenKind::Keyword(_) => {
                 // Consume a (possibly dot-qualified) name, optional generic
@@ -2798,7 +2871,9 @@ impl Parser {
             let is_this = matches!(self.peek().kind, TokenKind::Keyword(Keyword::This));
             self.bump(); // 'this' or 'base'
             self.expect(&TokenKind::LeftParen, "to open chained ctor args")?;
+            self.in_base_init = true;
             let args = self.argument_list();
+            self.in_base_init = false;
             self.expect(&TokenKind::RightParen, "to close chained ctor args")?;
             base_call = Some((if is_this { "this".to_owned() } else { "base".to_owned() }, args));
         }
@@ -2967,6 +3042,7 @@ impl Parser {
             default_value,
             is_this,
             is_params,
+            is_byref: saw_ref_like,
         })
     }
     /// `{ get; set; }` / `{ get { … } set { … } }` accessor list.

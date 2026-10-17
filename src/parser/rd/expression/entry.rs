@@ -258,6 +258,7 @@ impl Parser {
         Some(Expr::New {
             class_name: "with".to_owned(),
             args: Vec::new(),
+            init: Vec::new(),
             span: start.to(self.peek_at(0).span),
         })
     }
@@ -525,6 +526,7 @@ impl Parser {
             // name may be a contextual keyword (`{ ... } record`).
             if let Some((binding, span)) = self.take_pattern_binding() {
                 self.pre_pending.push(Stmt::Let {
+                    is_byref: false,
                     type_name: String::from("var"),
                     name: binding,
                     init: Expr::Literal(Literal::Int(0)),
@@ -604,6 +606,7 @@ impl Parser {
                 label.push(' ');
                 if binding != "_" {
                     self.pre_pending.push(Stmt::Let {
+                        is_byref: false,
                         type_name: String::from("var"),
                         name: binding,
                         init: Expr::Literal(Literal::Int(0)),
@@ -797,19 +800,24 @@ impl Parser {
                     }
                 }
                 let span = is_span.to(expr_span_last(&self.tokens[..self.pos]));
+                // Negation wraps the whole test (`x is not null` is
+                // `!(x is null)` — the subject belongs inside, not
+                // dropped (the old form yielded `!(pattern)`, always
+                // true for `is not null`).
+                let test = Expr::Binary {
+                    op: BinOp::Is,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(pattern),
+                    span,
+                };
                 lhs = if negated {
                     Expr::Unary {
                         op: UnOp::Not,
-                        inner: Box::new(pattern),
+                        inner: Box::new(test),
                         span,
                     }
                 } else {
-                    Expr::Binary {
-                        op: BinOp::Is,
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(pattern),
-                        span,
-                    }
+                    test
                 };
                 continue;
             }
@@ -861,10 +869,65 @@ impl Parser {
         Some(lhs)
     }
 
+    /// Lookahead: balanced `[...]` at the cursor followed by a lambda
+    /// shape (`async`/`static` optional, then `(params) =>` or `name =>`).
+    /// Pure lookahead — consumes nothing on any outcome.
+    fn lambda_shape_after_attrs(&self) -> bool {
+        let mut depth = 0i32;
+        let mut k = 0usize;
+        loop {
+            match self.peek_at(k).kind {
+                TokenKind::LeftBracket => depth += 1,
+                TokenKind::RightBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        k += 1;
+                        break;
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            k += 1;
+        }
+        // Optional `async` / `static` prefixes (either order, both optional).
+        for _ in 0..2 {
+            if matches!(
+                self.peek_at(k).kind,
+                TokenKind::Keyword(Keyword::Async) | TokenKind::Keyword(Keyword::Static)
+            ) {
+                k += 1;
+            }
+        }
+        if self.peek_at(k).kind == TokenKind::LeftParen {
+            // Balanced parens then `=>`?
+            let mut d = 1i32;
+            let mut j = k + 1;
+            while d > 0 && self.peek_at(j).kind != TokenKind::Eof {
+                match self.peek_at(j).kind {
+                    TokenKind::LeftParen => d += 1,
+                    TokenKind::RightParen => d -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            self.peek_at(j).kind == TokenKind::FatArrow
+        } else {
+            self.peek_is_name(k) && self.peek_at(k + 1).kind == TokenKind::FatArrow
+        }
+    }
+
     /// Parse a lambda expression: `(params) => body`, `name => body`, or
     /// `static (params) => body`, `static name => body`. Returns `Some(expr)`
     /// if the current position looks like a lambda, otherwise `None`.
     pub(in crate::parser::rd) fn try_lambda(&mut self) -> Option<Expr> {
+        // Attributes on lambdas (C# 10+): `[Attr(...)] (params) => body`.
+        // Consume the list only when a lambda shape follows the closing
+        // bracket (a bare `[` otherwise starts a collection/indexer).
+        // Attributes carry no lowering meaning and are dropped.
+        if self.peek().kind == TokenKind::LeftBracket && self.lambda_shape_after_attrs() {
+            let _ = self.attribute_lists();
+        }
         // Async modifier: `async (params) =>`, `async name =>`,
         // `async static ...` (either order). `async` alone as a param
         // name (`async =>`) is handled as a name-lambda below.

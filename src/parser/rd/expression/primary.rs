@@ -25,18 +25,20 @@ impl Parser {
                         self.bump();
                     }
                     let mark = self.pos;
-                    if self.expression().is_none() {
-                        if self.pos == mark {
-                            self.bump();
+                    match self.expression() {
+                        None => {
+                            if self.pos == mark {
+                                self.bump();
+                            }
                         }
-                    } else {
-                        elements.push(Expr::Literal(Literal::Int(0)));
+                        Some(e) => elements.push(e),
                     }
                 }
                 self.expect(&TokenKind::RightBracket, "to close collection expression")?;
                 return Some(Expr::NewArray {
                     elem_type: String::new(),
                     size: Box::new(Expr::Literal(Literal::Int(elements.len() as i64))),
+                    init: elements,
                     span: token.span.to(self.peek_at(0).span),
                 });
             }
@@ -53,18 +55,20 @@ impl Parser {
                         continue;
                     }
                     let mark = self.pos;
-                    if self.expression().is_none() {
-                        if self.pos == mark {
-                            self.bump();
+                    match self.expression() {
+                        None => {
+                            if self.pos == mark {
+                                self.bump();
+                            }
                         }
-                    } else {
-                        elements.push(Expr::Literal(Literal::Int(0)));
+                        Some(e) => elements.push(e),
                     }
                 }
                 self.expect(&TokenKind::RightBrace, "to close array literal")?;
                 return Some(Expr::NewArray {
                     elem_type: String::new(),
                     size: Box::new(Expr::Literal(Literal::Int(elements.len() as i64))),
+                    init: elements,
                     span: token.span.to(self.peek_at(0).span),
                 });
             }
@@ -423,11 +427,12 @@ impl Parser {
                             self.bump(); // ':'
                         }
                         let mark = self.pos;
-                        if self.expression().is_none() {
+                        if let Some(e) = self.expression() {
+                            elements.push(e);
+                        } else {
                             if self.pos == mark {
                                 self.bump();
                             }
-                        } else {
                             elements.push(Expr::Literal(Literal::Int(0)));
                         }
                         if self.eat(&TokenKind::Comma).is_none() {
@@ -435,10 +440,18 @@ impl Parser {
                         }
                     }
                     self.expect(&TokenKind::RightParen, "to close tuple literal")?;
+                    // Tuple literal keeps its elements: it lowers as a
+                    // dense `tuple[]` array (8-byte slots, matching the
+                    // element-read path and deconstruction below). The
+                    // old code discarded values into an empty array, so
+                    // every deconstructed name read back zero (the
+                    // `CompareStringIgnoreCase` infinite loop that OOMed
+                    // init: `index += 0` forever).
                     return Some(Expr::NewArray {
                         elem_type: "tuple".to_owned(),
                         size: Box::new(Expr::Literal(Literal::Int(elements.len() as i64))),
                         span: token.span.to(self.peek_at(0).span),
+                        init: elements,
                     });
                 }
                 self.bump();
@@ -451,7 +464,7 @@ impl Parser {
                 // `default` (no type) or `default(T)` (with type)
                 if self.peek().kind == TokenKind::LeftParen {
                     self.bump();
-                    let type_name = self.type_name()?;
+                    let type_name = self.type_name_full()?;
                     self.expect(&TokenKind::RightParen, "to close default type")?;
                     let end = expr_span_last(&self.tokens[..self.pos]);
                     Some(Expr::Default {
@@ -540,6 +553,7 @@ impl Parser {
                             elem_type: "tuple".to_owned(),
                             size: Box::new(size),
                             span: token.span.to(end),
+                            init: Vec::new(),
                         });
                     }
                     // Initializer `{ ... }`: count top-level elements.
@@ -567,6 +581,7 @@ impl Parser {
                         elem_type: "tuple".to_owned(),
                         size: Box::new(Expr::Literal(Literal::Int(count))),
                         span: token.span.to(end),
+                        init: Vec::new(),
                     });
                 }
                 // Target-typed `new(...)` — C# 9. The type is inferred
@@ -606,6 +621,7 @@ impl Parser {
                     return Some(Expr::New {
                         class_name: String::new(),
                         args,
+                        init: Vec::new(),
                         span: token.span.to(self.peek_at(0).span),
                     });
                 }
@@ -631,6 +647,7 @@ impl Parser {
                     return Some(Expr::New {
                         class_name: "anonymous".to_owned(),
                         args: Vec::new(),
+                        init: Vec::new(),
                         span: token.span.to(self.peek_at(0).span),
                     });
                 }
@@ -666,6 +683,7 @@ impl Parser {
                         elem_type: String::new(),
                         size: Box::new(Expr::Literal(Literal::Int(count))),
                         span: token.span.to(end),
+                        init: Vec::new(),
                     });
                 }
                 // `new T[size1, size2, ...]` followed optionally by
@@ -677,6 +695,13 @@ impl Parser {
                 // dotted (`new Ns.Inner[n]`, `new Interop.Sys.IPAddress[c]`);
                 // a single-identifier fast path would misread those as a
                 // type name with a rank suffix, swallowing the size.
+                // Rank (`[]`), nullable (`?`), and pointer (`*`)
+                // suffixes may sit between the element name and the
+                // SIZED bracket (`new ushort[]?[n]`, `new int?[n]`):
+                // without this scan the size is swallowed as an empty
+                // rank suffix and the whole thing degrades to an
+                // unresolvable `New` (null array, faults downstream).
+                // Pure lookahead — nothing is consumed here.
                 let mut name_len = 0usize;
                 if matches!(self.peek().kind, TokenKind::Identifier(_)) {
                     name_len = 1;
@@ -689,10 +714,28 @@ impl Parser {
                         name_len += 2;
                     }
                 }
+                let mut suffix_end = name_len;
+                let mut suffix = String::new();
+                loop {
+                    if self.peek_at(suffix_end).kind == TokenKind::LeftBracket
+                        && self.peek_at(suffix_end + 1).kind == TokenKind::RightBracket
+                    {
+                        suffix.push_str("[]");
+                        suffix_end += 2;
+                    } else if self.peek_at(suffix_end).kind == TokenKind::Question {
+                        suffix.push('?');
+                        suffix_end += 1;
+                    } else if self.peek_at(suffix_end).kind == TokenKind::Star {
+                        suffix.push('*');
+                        suffix_end += 1;
+                    } else {
+                        break;
+                    }
+                }
                 if name_len > 0
-                    && self.peek_at(name_len).kind == TokenKind::LeftBracket
-                    && self.peek_at(name_len + 1).kind != TokenKind::RightBracket
-                    && self.peek_at(name_len + 1).kind != TokenKind::Comma
+                    && self.peek_at(suffix_end).kind == TokenKind::LeftBracket
+                    && self.peek_at(suffix_end + 1).kind != TokenKind::RightBracket
+                    && self.peek_at(suffix_end + 1).kind != TokenKind::Comma
                 {
                     let mut elem_type = self.expect_identifier("as element type")?;
                     while self.peek().kind == TokenKind::Dot
@@ -702,6 +745,25 @@ impl Parser {
                         elem_type.push('.');
                         elem_type.push_str(&self.expect_identifier("as element type")?);
                     }
+                    // Consume the scanned suffix run in the exact
+                    // lookahead order (`suffix` already holds the text —
+                    // just bump past the tokens here).
+                    loop {
+                        if self.peek().kind == TokenKind::LeftBracket
+                            && self.peek_at(1).kind == TokenKind::RightBracket
+                        {
+                            self.bump(); // '['
+                            self.bump(); // ']'
+                        } else if matches!(
+                            self.peek().kind,
+                            TokenKind::Question | TokenKind::Star
+                        ) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                    elem_type.push_str(&suffix);
                     self.bump(); // '['
                     // One or more comma-separated sizes. The first size is
                     // the element count; multi-dimensional sizes are parsed
@@ -739,13 +801,100 @@ impl Parser {
                         elem_type,
                         size: Box::new(size),
                         span: token.span.to(end),
+                        init: Vec::new(),
                     });
+                }
+                // Generic array creation (`new Box<int>[n]`): the
+                // non-generic fast path above only fires for bare
+                // `Identifier[`, and `type_name()` below swallows the
+                // sized brackets as an empty `[]` rank suffix (losing
+                // the size). Detect `Ident (<...>)? [` here via
+                // lookahead and parse manually, slicing the element
+                // spelling from source.
+                if matches!(self.peek().kind, TokenKind::Identifier(_)) {
+                    let mut j = 1usize;
+                    while self.peek_at(j).kind == TokenKind::Dot
+                        && matches!(
+                            self.peek_at(j + 1).kind,
+                            TokenKind::Identifier(_)
+                        )
+                    {
+                        j += 2;
+                    }
+                    if matches!(
+                        self.peek_at(j).kind,
+                        TokenKind::Less | TokenKind::Shl
+                    ) {
+                        // Skip balanced `<...>`.
+                        let mut depth = 0i32;
+                        loop {
+                            match self.peek_at(j).kind {
+                                TokenKind::Less | TokenKind::Shl => depth += 1,
+                                TokenKind::Greater | TokenKind::Shr | TokenKind::ShrShr => {
+                                    depth -= 1;
+                                }
+                                TokenKind::Eof => break,
+                                _ => {}
+                            }
+                            j += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    if self.peek_at(j).kind == TokenKind::LeftBracket
+                        && self.peek_at(j + 1).kind != TokenKind::RightBracket
+                        && self.peek_at(j + 1).kind != TokenKind::Comma
+                    {
+                        // Element spelling = source slice from `new`
+                        // through the end of the type (before `[`).
+                        let elem_end = self.peek_at(j).span.start as usize;
+                        let elem_start = token.span.start as usize;
+                        // `token` is the `new` keyword; element starts
+                        // after `new ` — find the first Identifier.
+                        let mut s = elem_start;
+                        while s < elem_end
+                            && !self.source[s].is_ascii_alphabetic()
+                            && self.source[s] != b'_'
+                        {
+                            s += 1;
+                        }
+                        let elem_type =
+                            String::from_utf8_lossy(&self.source[s..elem_end])
+                                .trim()
+                                .to_owned();
+                        // Consume through `[size]`.
+                        while self.pos < self.tokens.len()
+                            && self.peek().kind != TokenKind::LeftBracket
+                        {
+                            self.bump();
+                        }
+                        self.bump(); // '['
+                        let size = self.expression()?;
+                        while self.eat(&TokenKind::Comma).is_some() {
+                            let _ = self.expression()?;
+                        }
+                        self.expect(&TokenKind::RightBracket, "to close array size")?;
+                        let end = expr_span_last(&self.tokens[..self.pos]);
+                        return Some(Expr::NewArray {
+                            elem_type,
+                            size: Box::new(size),
+                            span: token.span.to(end),
+                            init: Vec::new(),
+                        });
+                    }
                 }
                 // Use the full type-name parser so `new` accepts qualified
                 // (`System.Collections.Hashtable`) and global-namespace
-                // (`global::Ns`) class names, and any combination of
-                // array / nullable suffixes (`T[]`, `T[][]`, `T[,]`, `T?[]`).
-                let class_name = self.type_name()?;
+                // (`global::Ns`) class names, generic instantiations
+                // (`new Task<VoidTaskResult>(...)` must resolve the
+                // generic entry's own ctors — stripping the arguments
+                // misconstructs, e.g. a fresh Task whose
+                // `IsCompleted` is false trips `CheckAsyncTaskInProgress`
+                // or a throwing ctor leaves singletons null), and any
+                // combination of array / nullable suffixes
+                // (`T[]`, `T[][]`, `T[,]`, `T?[]`).
+                let class_name = self.type_name_full()?;
                 let full_name = class_name.clone();
                 // Detect whether the type ended in `[]` (array type) — in
                 // that case, a following `{` is an array initializer, not
@@ -784,9 +933,13 @@ impl Parser {
                 } else if self.peek().kind == TokenKind::LeftBrace {
                     // Object or collection initializer: `{ e1, e2, ... }` or
                     // `{ Key = Value, ... }` or `{ [idx] = Value, ... }`.
-                    // The compact AST collapses all of these into a single
-                    // shape; the structural round-trip is stable because
-                    // both encode/decode sides synthesize the same shape.
+                    // `Key = Value` elements are captured as member
+                    // writes that run after construction (see
+                    // `Expr::New.init`); index- and
+                    // collection-initializer elements have no member
+                    // name to write through and are still parsed only
+                    // (documented gap).
+                    let mut init = Vec::new();
                     self.bump();
                     while self.peek().kind != TokenKind::RightBrace
                         && self.peek().kind != TokenKind::Eof
@@ -813,11 +966,27 @@ impl Parser {
                         else if matches!(self.peek().kind, TokenKind::Identifier(_))
                             && self.peek_at(1).kind == TokenKind::Assign
                         {
-                            self.bump();
+                            let key_span = self.peek().span;
+                            let Some(key) = self.expect_identifier("as initializer member name") else {
+                                self.bump(); // '='
+                                let mark = self.pos;
+                                if self.expression().is_none() && self.pos == mark {
+                                    self.bump();
+                                }
+                                continue;
+                            };
                             self.bump(); // '='
                             let mark = self.pos;
-                            if self.expression().is_none() && self.pos == mark {
-                                self.bump();
+                            match self.expression() {
+                                Some(value) => init.push(crate::models::ast::MemberInit {
+                                    name: key,
+                                    value,
+                                    span: key_span,
+                                }),
+                                None if self.pos == mark => {
+                                    self.bump();
+                                }
+                                None => {}
                             }
                         }
                         // Collection initializer: just a value.
@@ -831,11 +1000,19 @@ impl Parser {
                         }
                     }
                     self.expect(&TokenKind::RightBrace, "to close initializer")?;
+                    let end = expr_span_last(&self.tokens[..self.pos]);
+                    return Some(Expr::New {
+                        class_name: full_name,
+                        args,
+                        init,
+                        span: token.span.to(end),
+                    });
                 }
                 let end = expr_span_last(&self.tokens[..self.pos]);
                 Some(Expr::New {
                     class_name: full_name,
                     args,
+                    init: Vec::new(),
                     span: token.span.to(end),
                 })
             }
@@ -856,8 +1033,28 @@ impl Parser {
             }
             TokenKind::Keyword(Keyword::Ref_) => {
                 // `ref expr` — take a reference (parse-only, semantics later).
+                // Exception: `ref *p` (deref) keeps the address
+                // (`&*p == p`): dropping `ref` reads the pointee value,
+                // faulting ByReference stores (`Span._reference = ref
+                // *(T*)pointer` stored byte 0 as null) and mis-passing
+                // interop byref args (`Memmove(ref *dst, ...)`).
+                // Every other `ref X` keeps legacy value behavior.
                 self.bump();
-                self.expression()
+                let start = self.peek().span;
+                match self.expression() {
+                    Some(deref @ Expr::Unary {
+                        op: crate::models::ast::expression::UnOp::Deref,
+                        ..
+                    }) => {
+                        let end = self.peek().span;
+                        Some(Expr::Unary {
+                            op: crate::models::ast::expression::UnOp::AddrOf,
+                            inner: Box::new(deref),
+                            span: start.to(end),
+                        })
+                    }
+                    other => other,
+                }
             }
             TokenKind::Keyword(Keyword::True) => {
                 self.bump();
@@ -950,6 +1147,7 @@ impl Parser {
                     elem_type: "anonymous_method".to_owned(),
                     size: Box::new(Expr::Literal(Literal::Int(0))),
                     span: token.span.to(self.peek_at(0).span),
+                    init: Vec::new(),
                 })
             }
             TokenKind::Keyword(Keyword::From) if matches!(self.peek_at(1).kind, TokenKind::Identifier(_)) => {
@@ -1050,6 +1248,7 @@ impl Parser {
                                 elem_type,
                                 size: Box::new(Expr::Literal(Literal::Int(count))),
                                 span: token.span.to(self.peek_at(0).span),
+                                init: Vec::new(),
                             });
                         }
                         let size = self.expression()?;
@@ -1072,6 +1271,7 @@ impl Parser {
                             elem_type,
                             size: Box::new(size),
                             span: token.span.to(self.peek_at(0).span),
+                            init: Vec::new(),
                         });
                     }
                 }

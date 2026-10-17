@@ -88,6 +88,11 @@ pub struct Param {
     /// call supplies zero or more trailing args of the element type
     /// (C# expanded form). Always last by language rules.
     pub is_params: bool,
+    /// By-reference parameter (`ref`/`out`/`in`): lowered by address
+    /// (callers box the value, callees dereference) so writes flow
+    /// back. Without this, `out` results (TryParse, GetBytesFast's
+    /// `charsConsumed`, …) are silently lost.
+    pub is_byref: bool,
 }
 
 impl StructuralEq for Param {
@@ -96,6 +101,7 @@ impl StructuralEq for Param {
             && self.name == other.name
             && self.is_this == other.is_this
             && self.is_params == other.is_params
+            && self.is_byref == other.is_byref
             && match (&self.default_value, &other.default_value) {
                 (Some(a), Some(b)) => a.structural_eq(b),
                 (None, None) => true,

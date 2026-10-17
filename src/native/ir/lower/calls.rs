@@ -3,8 +3,10 @@
 use super::super::{Block, Instr, IrFunction, LowerError, Terminator, VReg};
 use crate::models::{ClassMember, Expr, Literal};
 use crate::native::ir::Ctx;
-use crate::native::semantic::{ClassInfo, FieldInfo, MethodInfo, TypeTable};
+use crate::native::semantic::{ClassInfo, FieldInfo, MethodInfo, PropertyInfo, TypeTable};
 use super::{body::*, select::*, types::*};
+use super::eval::eval;
+use super::span::{placeholder_row, vtable_row_for};
 
 // Direct-call function index, cached per lowering run: building it
 // scans every class and method, so rebuilding per call site is
@@ -14,7 +16,10 @@ use super::{body::*, select::*, types::*};
 // sequential builds and parallel test threads never share entries.
 thread_local! {
     static FN_INDEX_CACHE: std::cell::RefCell<
-        Option<(usize, std::rc::Rc<std::collections::BTreeMap<String, usize>>)>,
+        Option<(
+            usize,
+            std::rc::Rc<std::collections::BTreeMap<String, Vec<usize>>>,
+        )>,
     > = std::cell::RefCell::new(None);
 }
 
@@ -22,9 +27,118 @@ thread_local! {
 /// call site resolves.
 pub(crate) fn clear_fn_index_cache() {
     FN_INDEX_CACHE.with(|c| *c.borrow_mut() = None);
-}pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg, LowerError> {
+}/// Resolve a bare call against static local functions visible in
+/// `ctx`'s scope: `(enclosing class, enclosing method-or-property,
+/// name, arity)` with class matched by simple name (spellings
+/// arrive short and qualified alike). Returns the function index,
+/// or `None` (method lookup / legacy placeholder path).
+fn resolve_local_fn(ctx: &Ctx<'_>, callee: &str, arity: usize) -> Option<usize> {
+    // TEMP-LOCALDBG.
+    if std::env::var("RUBYC_LOCALDBG").is_ok() {
+        eprintln!(
+            "[rubyc] TEMP-LOCALDBG call={callee} class={} method={:?} table={}",
+            ctx.current_class,
+            ctx.current_method,
+            ctx.local_fns.len()
+        );
+    }
+    let current_method = ctx.current_method.as_deref()?;
+    let simple_class = ctx.current_class.rsplit('.').next().unwrap_or(ctx.current_class);
+    ctx.local_fns.iter().find_map(|e| {
+        let class_ok = e.0 == ctx.current_class || e.0 == simple_class;
+        if class_ok && e.1 == current_method && e.2 == callee && e.3 == arity && e.4 != usize::MAX {
+            Some(e.4)
+        } else {
+            None
+        }
+    })
+}
+
+/// Return type for a resolved local call (`None` = fall through).
+pub(super) fn resolve_local_ret(ctx: &Ctx<'_>, callee: &str, arity: usize) -> Option<String> {
+    let current_method = ctx.current_method.as_deref()?;
+    let simple_class = ctx.current_class.rsplit('.').next().unwrap_or(ctx.current_class);
+    ctx.local_fns.iter().find_map(|e| {
+        let class_ok = e.0 == ctx.current_class || e.0 == simple_class;
+        if class_ok && e.1 == current_method && e.2 == callee && e.3 == arity && e.4 != usize::MAX {
+            Some(e.5.clone())
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether a STRICT subclass of the receiver entry overrides this
+/// exact method signature (`is_override`, not a `new` hide): a bare
+/// `this` call inside a base body must then dispatch virtually
+/// (Template Method), not run the base body directly (which threw
+/// `NotImplementedException` from `Encoding.GetBytesFast` instead
+/// of reaching `UTF8Encoding`'s override). `new`-hides never
+/// trigger (only `is_override` counts), so non-virtual hides keep
+/// C# direct-call semantics. Transitive (grandchild overrides
+/// count); self excluded.
+fn subclass_overrides(
+    ctx: &Ctx<'_>,
+    info: &ClassInfo,
+    name: &str,
+    param_types: &[String],
+) -> bool {
+    fn norm_ty(s: &str) -> String {
+        let mut t = s.to_lowercase();
+        for w in ["out ", "ref ", "in "] {
+            if let Some(rest) = t.strip_prefix(w) {
+                t = rest.to_string();
+                break;
+            }
+        }
+        t.retain(|c| !c.is_whitespace());
+        t.trim_end_matches('?').trim_end_matches('&').to_string()
+    }
+    let want: Vec<String> = param_types.iter().map(|p| norm_ty(p)).collect();
+    for sub in super::eval::virtual_subclasses(ctx, info) {
+        if sub == info.name || sub == info.key.path {
+            continue;
+        }
+        for class in ctx.classes.iter().filter(|c| c.name == sub) {
+            for m in &class.members {
+                if let ClassMember::Method(md) = m {
+                    if md.name == name
+                        && md.body.is_some()
+                        && md.is_override
+                        && md.params.len() == want.len()
+                        && md
+                            .params
+                            .iter()
+                            .zip(want.iter())
+                            .all(|(p, t)| norm_ty(&p.type_name) == *t)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg, LowerError> {
     if callee == "printf" || callee == "print" || callee == "put_str" {
         return printf(args, Fd::Stdout, b, ctx);
+    }
+    // Static local functions of the enclosing scope resolve first
+    // (C# scoping prefers locals). Scope is (class, method); arity
+    // must match exactly; anything else falls through to method
+    // lookup (legacy). `usize::MAX` marks locals whose lowering
+    // failed — also legacy.
+    if let Some(fidx) = resolve_local_fn(ctx, callee, args.len()) {
+        let argv = eval_args(args, b, ctx)?;
+        let dst = b.fresh();
+        b.push_raw(Instr::CallFn {
+            dst,
+            fidx: fidx as u32,
+            args: argv,
+        });
+        return Ok(dst);
     }
     if callee == "eprintf" {
         return printf(args, Fd::Stderr, b, ctx);
@@ -39,15 +153,165 @@ pub(crate) fn clear_fn_index_cache() {
         b.push_raw(Instr::ScanInt { dst });
         return Ok(dst);
     }
-    if callee == "sizeof" {
-        // Return a placeholder size (8 bytes for a pointer/word). The
-        // argument is always a TYPE, never a value — no evaluation
-        // (a type name like `int[]` is undeclared as a variable).
+    // Bare same-class calls reaching `&local`+native random seeds
+    // (`GenerateSeed()`, `GenerateGlobalSeed()`): the MethodCall-arm
+    // intercepts only fire on qualified spellings, but initializers
+    // call them bare (`DefaultSeed = GenerateSeed()`), which lands
+    // here and would run the real body (`&seed` erases to null →
+    // native write to address zero). Same fixed seeds, same
+    // determinism rationale; see the MethodCall-arm notes.
+    // Bare `InitializeCurrentThread()` inside `Thread` (called when
+    // `t_currentThread` is null): the real body calls the
+    // `ThreadNative` QCalls (`GetCurrentThread`, `Initialize`), which
+    // smoke shims cannot provide (no managed thread objects exist yet
+    // to hand out). Emit a hollow `Thread` instead (vtable + live tag
+    // + zeroed fields, mirroring construction without running the ctor
+    // body) and publish it to `t_currentThread`: enough for
+    // `ExecutionContext`/`AsyncLocal`/culture paths that only need a
+    // non-null thread whose fields read null/zero (e.g. file open via
+    // `AppContext` switches). Bail (normal lowering) if anything is
+    // missing — never half-build.
+    if args.is_empty()
+        && callee == "InitializeCurrentThread"
+        && (ctx.current_class == "Thread" || ctx.current_class.ends_with(".Thread"))
+    {
+        if let Some(entry) = ctx.table.class("Thread") {
+            if let Some(tfield) = entry.field("t_currentThread").cloned() {
+                if tfield.is_static {
+                    if let Some(sbase) = static_addr(&tfield, b, ctx) {
+                        let row = vtable_row_for(ctx, &entry.name, &entry.key.path);
+                        let obj = b.fresh();
+                        b.alloc(obj, (entry.fields.len() + 2) as u64 * 8);
+                        let vaddr = b.fresh();
+                        b.push_raw(Instr::VTableAddr { dst: vaddr, row });
+                        b.push_raw(Instr::StoreField { base: obj, off: 0, src: vaddr });
+                        let one = b.const_i64(1);
+                        b.push_raw(Instr::StoreField { base: obj, off: 8, src: one });
+                        let zero = b.const_i64(0);
+                        for i in 2..(entry.fields.len() + 2) {
+                            b.push_raw(Instr::StoreField {
+                                base: obj,
+                                off: (i * 8) as u32,
+                                src: zero,
+                            });
+                        }
+                        b.push_raw(Instr::StoreField { base: sbase, off: 0, src: obj });
+                        return Ok(obj);
+                    }
+                }
+            }
+        }
+    }
+    if args.is_empty() && (callee == "GenerateSeed" || callee == "GenerateGlobalSeed") {
+        let cur = base_type_name(ctx.current_class);
+        if (callee == "GenerateSeed" && cur == "Marvin")
+            || (callee == "GenerateGlobalSeed" && cur == "HashCode")
+        {
+            return Ok(b.const_i64(if callee == "GenerateSeed" {
+                0x9E3779B97F4A7C15u64 as i64
+            } else {
+                0x9E37_79B9
+            }));
+        }
+    }
+    // Bare same-class `[Intrinsic]` atomics (`ExchangeAdd(...)` inside
+    // `Interlocked.Add`, and the self-recursive placeholder bodies
+    // themselves): the MethodCall-arm emulation only fires on
+    // qualified spellings, but these land here and would run the real
+    // self-recursive body forever. Same emulation, same rationale;
+    // see the MethodCall-arm notes.
+    if base_type_name(ctx.current_class) == "Interlocked"
+        && let Some(r) = super::eval::interlocked_atomic(callee, args, b, ctx)
+    {
+        return r;
+    }
+    // Bare same-class thin-lock primitives (mirrors the `Interlocked`
+    // twin above): bodies that call back into `ObjectHeader` land here
+    // instead of the qualified path. Family-gated the same way.
+    if base_type_name(ctx.current_class).contains("ObjectHeader")
+        && let Some(r) = super::eval::monitor_atomic(callee, args, b, ctx)
+    {
+        return r;
+    }
+    if callee == "sizeof" {        // C# unmanaged sizes (the argument is always a TYPE, never
+        // a value — no evaluation). Correct sizes matter for
+        // byte↔element conversions (`Latin1Utility` divides byte
+        // counts by `sizeof(char)` = 2; the old flat 8 truncated
+        // every 3-char scan to 0). Unknowns keep the word placeholder.
+        if let Some(spelled) = args.first().and_then(dotted_spelling) {
+            let simple = spelled.rsplit('.').next().unwrap_or(&spelled);
+            let canon = canonical_primitive(simple.trim_end_matches(['?', '*']));
+            let size: Option<i64> = match canon.as_str() {
+                "Boolean" | "Byte" | "SByte" => Some(1),
+                "Char" | "Int16" | "UInt16" => Some(2),
+                "Int32" | "UInt32" | "Single" => Some(4),
+                "Int64" | "UInt64" | "Double" | "IntPtr" | "UIntPtr" => Some(8),
+                "Decimal" => Some(16),
+                _ if simple.starts_with("Vector128<") => Some(16),
+                _ if simple.starts_with("Vector256<") => Some(32),
+                _ if simple.starts_with("Vector512<") => Some(64),
+                _ if simple.starts_with("Vector<") => {
+                    // Generic vector width is unknown without
+                    // hardware acceleration details; callers guard
+                    // on `IsHardwareAccelerated` (false here) before
+                    // using it, so any consistent value works.
+                    Some(16)
+                }
+                _ => None,
+            };
+            if let Some(s) = size {
+                return Ok(b.const_i64(s));
+            }
+        }
+        // Unknown/generic: word placeholder (a type name like
+        // `int[]` is undeclared as a variable — no evaluation).
         return Ok(b.const_i64(8));
     }
     if callee == "typeof" {
-        // `typeof` is a C# operator; return 0 as a placeholder (same:
-        // type argument, no evaluation).
+        // `typeof` is a C# operator (type argument, no evaluation).
+        // Return a vtable'd placeholder box for the named type — NOT
+        // null: framework code assumes `typeof(X)` is non-null
+        // (attribute tables, `VerifyPseudoCustomAttribute`, …) and
+        // dereferences it. The box carries the synthetic placeholder
+        // row (all zero stubs), never the named type's own: virtual
+        // calls on placeholders have no implementation, and
+        // dispatching X's row executes foreign slots or faults past
+        // short rows (`CreateDefaultEqualityComparer` faulted calling
+        // Type virtuals on a `typeof(object)` box). Every such call
+        // now answers the C# default (zero/false/null) crash-free.
+        // Storage still sizes by the named type's field count, so
+        // field reads stay in bounds; identity comparisons between
+        // two `typeof(X)` boxes stay false; reflection over it yields
+        // defaults. Unresolvable names fall back to a small
+        // `System.Object` box (same guarantee).
+        if let Some(spelled) = args.first().and_then(dotted_spelling) {
+            let simple = spelled.rsplit('.').next().unwrap_or(&spelled);
+            let row = placeholder_row(ctx);
+            // Storage: the type's field count (+vtable+refcount), so
+            // field reads stay in bounds; default when unknown.
+            let nfields = ctx
+                .table
+                .class(&spelled)
+                .or_else(|| ctx.table.class(simple))
+                .map(|e| e.fields.len())
+                .unwrap_or(2);
+            let obj = b.fresh();
+            b.alloc(obj, (nfields + 2) as u64 * 8);
+            let rv = b.fresh();
+            b.push_raw(Instr::VTableAddr { dst: rv, row });
+            b.push_raw(Instr::StoreField { base: obj, off: 0, src: rv });
+            let z = b.const_i64(0);
+            let one = b.const_i64(1);
+            b.push_raw(Instr::StoreField { base: obj, off: 8, src: one });
+            for i in 0..nfields {
+                b.push_raw(Instr::StoreField {
+                    base: obj,
+                    off: (16 + i * 8) as u32,
+                    src: z,
+                });
+            }
+            return Ok(obj);
+        }
         return Ok(b.const_i64(0));
     }
     if callee == "__reftype" || callee == "__makeref" || callee == "__refvalue" {
@@ -56,6 +320,132 @@ pub(crate) fn clear_fn_index_cache() {
         // (mirrors the scan's known-list; real typing is future work).
         let _ = eval_args(args, b, ctx)?;
         return Ok(b.const_i64(0));
+    }
+    // Bare same-class ref-model intrinsics (mirror the qualified
+    // interceptions in `eval.rs`): field initializers and method
+    // bodies call `GenerateGlobalSeed()`, `As`/`AsRef`,
+    // `Read`/`Write` unqualified, so they land here instead of the
+    // `Unsafe.As(...)` path. Gated on the enclosing class's base
+    // name, so unrelated same-named user methods are untouched.
+    // (Generic suffixes stripped: `As<TFrom, TTo>` selects `As`.)
+    {
+        let bare = match callee.find('<') {
+            Some(pos) => &callee[..pos],
+            None => callee,
+        };
+        let current_base = ctx
+            .current_class
+            .rsplit('.')
+            .next()
+            .unwrap_or(ctx.current_class)
+            .split('<')
+            .next()
+            .unwrap_or(ctx.current_class);
+        // Deterministic hash seed (see `eval.rs`): address-of-local
+        // erases to a value, so the native random fill would corrupt
+        // arbitrary memory.
+        if current_base == "HashCode" && bare == "GenerateGlobalSeed" && args.is_empty() {
+            return Ok(b.const_i64(0x9E37_79B9));
+        }
+        // JIT-identity intrinsics (managed bodies throw
+        // `PlatformNotSupportedException`; real `ldarg.0 / ret`
+        // lives in the JIT): erased refs are values, so both are
+        // the identity.
+        if current_base == "Unsafe" && matches!(bare, "As" | "AsRef" | "AsPointer" | "BitCast") && args.len() == 1 {
+            let argv = eval_args(args, b, ctx)?;
+            return Ok(argv[0]);
+        }
+        // `RuntimeHelpers.GetMethodTable(obj)` (see `eval.rs`): the
+        // intrinsic's own body calls itself bare, so the qualified
+        // interception never fires for it — catch the bare form here
+        // too (our vtable pointer at object+0). Arrays carry no
+        // vtable word (length at +0): hand them the shared
+        // `System.Array` row token (mirrors `eval.rs`), or
+        // downstream `MethodTable*` dereferences load `[length]`
+        // and fault.
+        if current_base == "RuntimeHelpers" && bare == "GetMethodTable" && args.len() == 1 {
+            let t0 = static_type_of(&args[0], b, ctx).unwrap_or_else(|_| "object".to_owned());
+            let tr = t0.trim();
+            if super::select::array_elem_ty(tr).is_some() || base_type_name(tr) == "Array" {
+                let dst = b.fresh();
+                b.push_raw(Instr::VTableAddr {
+                    dst,
+                    row: vtable_row_for(ctx, "Array", "System.Array"),
+                });
+                return Ok(dst);
+            }
+            let argv = eval_args(args, b, ctx)?;
+            let dst = b.fresh();
+            b.push_raw(Instr::LoadField {
+                dst,
+                base: argv[0],
+                off: 0,
+            });
+            return Ok(dst);
+        }
+        // `RuntimeHelpers.IsReferenceOrContainsReferences<T>()` bare
+        // (see `eval.rs`): the intrinsic's own body calls itself
+        // bare, so the qualified interception never fires for it —
+        // fold the same way from the explicit type argument (open
+        // variables fold false — see `eval.rs`).
+        if current_base == "RuntimeHelpers" && bare == "IsReferenceOrContainsReferences" && args.is_empty() {
+            let t = explicit_type_args(callee).first().cloned().unwrap_or_else(|| "object".to_owned());
+            let r = !ctx.is_type_var(&t) && type_contains_refs(ctx.table, &t);
+            return Ok(b.const_i64(r as i64));
+        }
+        // `MemoryMarshal.GetArrayDataReference` bare (see `eval.rs`):
+        // the generic forwarder calls the overload bare, which
+        // overload resolution maps back to itself (exact `T[]`
+        // match beats the `Array` conversion) — infinite recursion.
+        // Array data starts at +16 in our layout.
+        if current_base == "MemoryMarshal" && bare == "GetArrayDataReference" && args.len() == 1 {
+            let argv = eval_args(args, b, ctx)?;
+            let sixteen = b.const_i64(16);
+            return Ok(b.emit(Instr::Bin {
+                dst: VReg(0),
+                op: crate::native::ir::BinOp::Add,
+                a: argv[0],
+                b: sixteen,
+            }));
+        }
+        // `Thread.FastPollGC()` bare (see `eval.rs`): the
+        // intrinsic's own body calls itself bare — erase to no-op.
+        if current_base == "Thread" && bare == "FastPollGC" && args.is_empty() {
+            return Ok(b.const_i64(0));
+        }
+        // `Interlocked.MemoryBarrier()` bare (see `eval.rs`): the
+        // intrinsic's own body calls itself bare — erase to no-op.
+        if current_base == "Interlocked" && bare == "MemoryBarrier" && args.is_empty() {
+            return Ok(b.const_i64(0));
+        }
+        // `Unsafe.IsNullRef(ref x)` (see `eval.rs`): a ref to any
+        // variable is never a null pointer — yield false constantly.
+        if current_base == "Unsafe" && bare == "IsNullRef" && args.len() == 1 {
+            let _ = eval_args(args, b, ctx)?;
+            return Ok(b.const_i64(0));
+        }
+        // `GenericCache.CreateCacheTable` (see `eval.rs`): instance
+        // bare call from the cache ctor — same bypass (raw memory
+        // reinterpretation unimplementable, cache unusable anyway).
+        if current_base == "GenericCache" && bare == "CreateCacheTable" {
+            let _ = eval_args(args, b, ctx)?;
+            return Ok(b.const_i64(0));
+        }
+        // Volatile wrappers over `Unsafe.As` (see `eval.rs`): a
+        // volatile read is the value, a volatile write is an
+        // assignment.
+        if current_base == "Volatile" && bare == "Read" && args.len() == 1 {
+            let argv = eval_args(args, b, ctx)?;
+            return Ok(argv[0]);
+        }
+        if current_base == "Volatile" && bare == "Write" && args.len() == 2 {
+            let assign = Expr::Assign {
+                target: Box::new(args[0].clone()),
+                value: Box::new(args[1].clone()),
+                span: crate::models::Span::new(0, 0),
+            };
+            return eval(&assign, b, ctx);
+        }
     }
 
     // Strip explicit generic type arguments for name-based lookups
@@ -87,16 +477,53 @@ pub(crate) fn clear_fn_index_cache() {
             .is_some_and(|imp| imp.param_types.len() == args.len())
     {
         check_import(ctx, index, args)?;
-        let argv = eval_args(args, b, ctx)?;
+        let mut argv = eval_args(args, b, ctx)?;
+        // Native C ABI (see `marshal_string_utf8_args` /
+        // `wrap_safehandle_import_return`): strings transcode,
+        // SafeHandle returns wrap. Bare-name args typing mirrors the
+        // member-call path (`object` fallback degrades to untouched).
+        let arg_types: Vec<String> = args
+            .iter()
+            .map(|a| static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned()))
+            .collect();
+        super::eval::marshal_string_utf8_args(b, &mut argv, &arg_types);
+        let ret_ty = ctx
+            .table
+            .imports
+            .get(index)
+            .map(|imp| imp.ret_type.clone())
+            .unwrap_or_default();
         let dst = b.fresh();
         b.push_raw(Instr::CallImport {
             dst,
             import: index as u32,
             args: argv,
         });
-        return Ok(dst);
+        return Ok(super::eval::wrap_safehandle_import_return(
+            b, ctx, dst, &ret_ty,
+        ));
     }
 
+    // Search-optimization predicates (see `span.rs`): safe-false
+    // bypass BEFORE selection, so generic/inferred calls (which may
+    // not resolve to a `selected` overload) are still neutralized.
+    // Bare same-class calls (`TryGetSingleRange` inside `Create`)
+    // arrive here; qualified ones are handled in `eval.rs`.
+    // Generic suffixes stripped (`TryGetSingleRange<T>` matches).
+    let bare_name = match name.find('<') {
+        Some(pos) => &name[..pos],
+        None => name,
+    };
+    if matches!(
+        bare_name,
+        "TryGetSingleRange"
+            | "CanUseUniqueLowNibbleSearch"
+            | "CanUsePackedIndexOf"
+            | "ShouldUseProbabilisticMap"
+    ) {
+        let _ = eval_args(args, b, ctx)?;
+        return Ok(b.const_i64(0));
+    }
     // Typed overload selection (see `pick_overload`): arg types are
     // pure to compute (no IR emitted), so selection precedes eval.
     let arg_types: Vec<String> = args
@@ -128,6 +555,59 @@ pub(crate) fn clear_fn_index_cache() {
         explicit_arity,
     );
     if let Some(mi) = selected {
+        // TEMP-CALLDIAG: audit bare-call selection.
+        // Removed before close.
+        if std::env::var("RUBYC_CALLDIAG").is_ok()
+            && (name == "InitializeUserDefaultUICulture" || name == "InitializeUserDefaultCulture")
+        {
+            eprintln!(
+                "[rubyc] TEMP-CALLDIAG {name} static={} declaring={} in {}.{}",
+                mi.is_static,
+                mi.declaring_class,
+                ctx.current_class,
+                ctx.current_method.clone().unwrap_or_default()
+            );
+        }
+        // TEMP-CALLDIAG2: audit GetBytesWithFallback bare-call choice.
+        // Removed before close.
+        if std::env::var("RUBYC_SELDIAG").is_ok() && name == "GetBytesWithFallback" {
+            eprintln!(
+                "[rubyc] TEMP-CALLDIAG2 args={arg_types:?} selected={}.{}({:?}) in {}.{}",
+                mi.declaring_class,
+                mi.name,
+                mi.param_types,
+                ctx.current_class,
+                ctx.current_method.clone().unwrap_or_default()
+            );
+        }
+        // TEMP-GBDIAG: audit GetBytes overload choice (encoder path
+        // misroutes to an array overload, reading Length off a
+        // pointer). Removed before close.
+        if std::env::var("RUBYC_GBDIAG").is_ok() && name == "GetBytes" {
+            eprintln!(
+                "[rubyc] TEMP-GBDIAG args={arg_types:?} selected={}.{}({:?}) in {}.{}",
+                mi.declaring_class,
+                mi.name,
+                mi.param_types,
+                ctx.current_class,
+                ctx.current_method.clone().unwrap_or_default()
+            );
+        }
+        // `[Conditional("SYM")]` (e.g. `Debug.Assert`,
+        // `VerifyPseudoCustomAttribute`): the call — including
+        // argument evaluation — vanishes unless SYM is defined.
+        // Mirrors the qualified path (which checks both the set and
+        // the winner); bare same-class calls are the common shape
+        // for these helpers, so omitting it here executes
+        // debug-only code in release (e.g. reflection over
+        // `typeof(...)` placeholders that are null at runtime).
+        if mi
+            .conditional_symbol
+            .as_ref()
+            .is_some_and(|s| !ctx.defines.contains(s))
+        {
+            return Ok(b.const_i64(0));
+        }
         // Argument count mismatch is tolerated — generic methods and
         // overloads may not match exactly; omitted optional params are
         // filled from the selected overload's folded defaults.
@@ -138,17 +618,54 @@ pub(crate) fn clear_fn_index_cache() {
 
         let this = VReg(0);
         // Fill omitted optionals on the EXPLICIT args (`this` is not a
-        // declared param), then prepend the receiver.
+        // declared param), then prepend the receiver — but only for
+        // instance callees. A static callee takes no receiver (its
+        // vreg 0 is the first param, not a phantom `this`): prepending
+        // one shifts every arg into garbage (the first param reads
+        // zero, so guards like `x == null` spuriously fire and cold
+        // throws go off). Static-to-static same-class calls hit this
+        // path (`Get(n)` inside `Try`), so the receiver must be
+        // conditional here, not unconditional.
         let mut explicit = eval_args(args, b, ctx)?;
         let full_arity = mi.param_types.len();
         fill_default_args(&mut explicit, mi, b);
-        let mut argv = vec![this];
-        argv.extend(explicit);
+        // Box by-reference arguments BEFORE prepending the receiver
+        // (flags align with explicit params). See `box_byref_args`.
+        let wbs = super::eval::box_byref_args(b, ctx, args, &mut explicit, &mi.param_is_byref)?;
+        // Span-typed parameters pack array/string arguments into
+        // views (see `span.rs`); anything else passes through
+        // untouched. Missing here faulted
+        // `StreamWriter.WriteLine(string?)`: the bare-call path
+        // passed the string object as a span, whose chars then read
+        // as a data pointer in `Buffer.MemoryCopy`.
+        super::span::coerce_span_args(b, ctx, &mut explicit, &arg_types, &mi.param_types)?;
+        super::eval::marshal_safehandle_args(b, ctx, &mut explicit, &arg_types, &mi.param_types, !mi.has_body)?;
+        // `CallFn` bodies take `this` as their first parameter, so
+        // instance calls prepend it; `CallVirt` carries the receiver
+        // separately and takes explicit args only (prepending there
+        // shifts every parameter into garbage — e.g. a bool landing
+        // in an object slot and faulting as a null receiver).
+        let mut argv = if mi.is_static {
+            explicit.clone()
+        } else {
+            let mut v = vec![this];
+            v.extend(explicit.iter().copied());
+            v
+        };
 
         let own = ctx
             .classes
             .iter()
-            .find(|c| c.name == ctx.current_class)
+            .find(|c| {
+                // Qualification-tolerant: method contexts carry the
+                // AST decl name while inlined property contexts carry
+                // the qualified key path — both denote the same class.
+                // A strict compare missed own methods from inlined
+                // getters (falling through to virtual dispatch below).
+                c.name == ctx.current_class
+                    || c.name
+                        == ctx.current_class.rsplit('.').next().unwrap_or(ctx.current_class)
+            })
             .map(|c| {
                 c.members
                     .iter()
@@ -157,23 +674,112 @@ pub(crate) fn clear_fn_index_cache() {
             .unwrap_or(false);
 
         let dst = b.fresh();
-        let map = functions_index(ctx);
-        // Bodyless own method (`extern`/partial-no-impl declared here):
-        // no function exists — yield zero rather than mis-calling the
-        // first overload or `@start` via the fallbacks below.
-        if own && !mi.has_body {
-            return Ok(b.const_i64(0));
+        // Bodyless own method (`abstract`, `extern`, partial-no-impl
+        // declared here): no body exists to call directly. INSTANCE
+        // abstract methods dispatch virtually so overrides serve
+        // (e.g. abstract base `GetByteCount(char[],int,int)` must
+        // reach Latin1's override; yielding zero broke every base
+        // count path). Static bodyless methods (`extern`, QCalls)
+        // are never virtual — they fall through to the static path
+        // below (direct, else import, else zero).
+        // The slot is signature-aware: name-only `canonical_slot`
+        // lands on the wrong overload's slot.
+        if own && !mi.has_body && !mi.is_static {
+            let slot = ctx
+                .table
+                .classes
+                .iter()
+                .find(|c| {
+                    c.name == mi.declaring_class || c.key.path == mi.declaring_class
+                })
+                .and_then(|e| {
+                    e.methods.iter().find(|m| {
+                        m.name == mi.name && m.param_types == mi.param_types
+                    })
+                })
+                .map(|m| m.vtable_slot)
+                .unwrap_or_else(|| {
+                    canonical_slot(ctx.table, ctx.current_info, ctx.current_class, name)
+                });
+            b.push_raw(Instr::CallVirt {
+                dst,
+                slot: slot as u32,
+                recv: this,
+                args: explicit,
+            });
+            super::eval::emit_writebacks(b, &wbs);
+            return Ok(dst);
         }
-        if own {
+        if own && mi.has_body {
+            // Template-method dispatch: a bare `this` call inside a
+            // base body must reach subclass overrides (C# virtual
+            // dispatch). When a strict subclass overrides this exact
+            // signature, dispatch virtually through the
+            // signature-aware slot (same lookup as the abstract-own
+            // path); otherwise the direct call below stays exact.
+            // `new`-hides never trigger (only `is_override` counts).
+            if !mi.is_static
+                && ctx.current_info.is_some_and(|info| {
+                    subclass_overrides(ctx, info, name, &mi.param_types)
+                })
+            {
+                let vslot = ctx
+                    .table
+                    .classes
+                    .iter()
+                    .find(|c| {
+                        c.name == mi.declaring_class || c.key.path == mi.declaring_class
+                    })
+                    .and_then(|e| {
+                        e.methods.iter().find(|m| {
+                            m.name == mi.name && m.param_types == mi.param_types
+                        })
+                    })
+                    .map(|m| m.vtable_slot)
+                    .unwrap_or_else(|| {
+                        canonical_slot(ctx.table, ctx.current_info, ctx.current_class, name)
+                    });
+                b.push_raw(Instr::CallVirt {
+                    dst,
+                    slot: vslot as u32,
+                    recv: this,
+                    args: explicit,
+                });
+                super::eval::emit_writebacks(b, &wbs);
+                return Ok(dst);
+            }
             // Function indices mirror declaration order with @start at 0.
             // The selected overload's full arity keys the lookup (omitted
-            // optionals were filled above); a miss falls back to the
+            // optionals were filled above); its position among
+            // same-name+arity overloads picks the slot, so overloads
+            // stop collapsing onto one body. A miss falls back to the
             // first declared overload.
-            let prefix = format!("{}::{name}#", ctx.current_class);
-            let idx = map
-                .get(&format!("{prefix}{full_arity}"))
-                .copied()
-                .or_else(|| map.range(prefix..).next().map(|(_, &i)| i))
+            // Key on the SELECTED overload's declaring class, not the
+            // current class: inlined contexts carry the qualified key
+            // path while function keys use the AST decl name — keying
+            // on the current class missed and the range fallback below
+            // elected an alphabetically-adjacent WRONG function (e.g.
+            // `InitializeUserDefaultUICulture` calling
+            // `SystemException#0`).
+            let prefix = format!("{}::{name}#", mi.declaring_class);
+            // (Key folded into the Nth lookup below.)
+            let n = overload_position(
+                ctx,
+                &mi.declaring_class,
+                name,
+                full_arity,
+                &mi.param_types,
+                &mi.param_is_byref,
+            );
+            let idx = function_index_nth(ctx, &mi.declaring_class, name, full_arity, n)
+                .or_else(|| {
+                    functions_index(ctx)
+                        .range(prefix..)
+                        .next()
+                        .and_then(|(_, v)| v.last())
+                        .copied()
+                        .map(|i| i as u32)
+                })
                 .unwrap_or(0);
             b.push_raw(Instr::CallFn {
                 dst,
@@ -181,18 +787,75 @@ pub(crate) fn clear_fn_index_cache() {
                 args: argv,
             });
         } else {
+            // TEMP-CALLDIAG2: audit bare-to-virtual fallback.
+            // Removed before close.
+            if std::env::var("RUBYC_CALLDIAG").is_ok() {
+                eprintln!(
+                    "[rubyc] TEMP-CALLDIAG2 bare-virt {name} declaring={} static={} params={:?} in {}.{}",
+                    mi.declaring_class,
+                    mi.is_static,
+                    mi.param_types,
+                    ctx.current_class,
+                    ctx.current_method.clone().unwrap_or_default()
+                );
+            }
+            // Static callees are never virtual, even when the
+            // `own` check below fails (it compares the current
+            // class by bare name, but inlined contexts carry the
+            // qualified path — so own-method statics like
+            // `InitializeUserDefaultUICulture` fell through to a
+            // virtual call on the garbage `VReg(0)` receiver).
+            // Resolve direct via the declaring class instead.
+            if mi.is_static {
+                match static_function_index_for(
+                    ctx,
+                    &mi.declaring_class,
+                    name,
+                    full_arity,
+                    &mi.param_types,
+                    &mi.param_is_byref,
+                ) {
+                    Some(fidx) => {
+                        b.push_raw(Instr::CallStatic {
+                            dst,
+                            fidx,
+                            args: argv,
+                        });
+                        super::eval::emit_writebacks(b, &wbs);
+                        return Ok(dst);
+                    }
+                    None => {
+                        return Ok(b.const_i64(0));
+                    }
+                }
+            }
+            // Instance: virtual dispatch with a signature-aware slot
+            // (same lookup as the abstract-own path above — the
+            // name-only fallback lands on the wrong overload).
+            let vslot = ctx
+                .table
+                .classes
+                .iter()
+                .find(|c| {
+                    c.name == mi.declaring_class || c.key.path == mi.declaring_class
+                })
+                .and_then(|e| {
+                    e.methods.iter().find(|m| {
+                        m.name == mi.name && m.param_types == mi.param_types
+                    })
+                })
+                .map(|m| m.vtable_slot)
+                .unwrap_or_else(|| {
+                    canonical_slot(ctx.table, ctx.current_info, ctx.current_class, name)
+                });
             b.push_raw(Instr::CallVirt {
                 dst,
-                slot: canonical_slot(
-                    ctx.table,
-                    ctx.current_info,
-                    ctx.current_class,
-                    name,
-                ) as u32,
+                slot: vslot as u32,
                 recv: this,
-                args: argv,
+                args: explicit,
             });
         }
+        super::eval::emit_writebacks(b, &wbs);
         return Ok(dst);
     }
 
@@ -225,7 +888,7 @@ pub(crate) fn clear_fn_index_cache() {
         }
         let full = mi.param_types.len();
         let dst = b.fresh();
-        match static_function_index_for(ctx, &mi.declaring_class, name, full) {
+        match static_function_index_for(ctx, &mi.declaring_class, name, full, &mi.param_types, &mi.param_is_byref) {
             Some(fidx) => {
                 b.push_raw(Instr::CallStatic {
                     dst,
@@ -265,7 +928,7 @@ pub(crate) fn clear_fn_index_cache() {
         }
         let full = mi.param_types.len();
         let dst = b.fresh();
-        match static_function_index_for(ctx, &mi.declaring_class, name, full) {
+        match static_function_index_for(ctx, &mi.declaring_class, name, full, &mi.param_types, &mi.param_is_byref) {
             Some(fidx) => {
                 b.push_raw(Instr::CallStatic {
                     dst,
@@ -406,6 +1069,55 @@ pub(super) fn outer_static_field<'t>(
     }
     None
 }
+
+/// Enclosing-scope static property lookup for unqualified reads
+/// from nested code (`HighCharTable` inside `IcuSearchValues`,
+/// declared on the outer `CompareInfo`). The missing case: fields,
+/// consts (above), and methods (`outer_static` below) each have an
+/// outward walk, but properties did not — so the read fell past to
+/// the uppercase placeholder (const 0) and downstream span code
+/// faulted on null. Instance properties need an instance and are
+/// never candidates, mirroring fields.
+pub(super) fn outer_static_property<'t>(
+    ctx: &'t Ctx<'_>,
+    name: &str,
+) -> Option<(&'t ClassInfo, &'t PropertyInfo)> {
+    // Enclosing paths, innermost first, deduped (same walk as
+    // `outer_static_field`, plus a qualified-`current_class` match:
+    // method contexts sometimes carry the full path).
+    let mut outers: Vec<String> = Vec::new();
+    for c in ctx
+        .table
+        .classes
+        .iter()
+        .filter(|c| c.name == ctx.current_class || c.key.path == ctx.current_class)
+    {
+        let mut prefix = c.key.path.clone();
+        while let Some(i) = prefix.rfind('.') {
+            prefix.truncate(i);
+            if !outers.iter().any(|o| *o == prefix) {
+                outers.push(prefix.clone());
+            }
+        }
+    }
+    for outer in &outers {
+        for c in ctx
+            .table
+            .classes
+            .iter()
+            .filter(|c| c.key.path == *outer)
+        {
+            if let Some(p) = c
+                .properties
+                .iter()
+                .find(|p| p.name == name && p.is_static)
+            {
+                return Some((c, p));
+            }
+        }
+    }
+    None
+}
 /// code: every table class whose qualified path is a proper prefix of
 /// a same-named current-class entry's path is an enclosing scope
 /// (innermost first); its STATIC methods participate (instance
@@ -457,22 +1169,26 @@ pub(super) fn outer_static<'a>(
 }
 pub(super) fn functions_index(
     ctx: &Ctx<'_>,
-) -> std::rc::Rc<std::collections::BTreeMap<String, usize>> {
+) -> std::rc::Rc<std::collections::BTreeMap<String, Vec<usize>>> {
     // Index MUST mirror the emission loop below (same classes, same
     // skips, same order, same +1): direct-call lookups resolve to
-    // positions in the final functions vector. In particular, entries
-    // overwrite (last-wins) so same-arity overloads (`Task#2` vs
-    // `bool#2`) don't desync the map from the vector — `or_insert`
-    // (first-wins on distinct count) silently misroutes every call
-    // after the first collision.
+    // positions in the final functions vector. Same-name+arity
+    // overloads append in declaration order (NOT last-wins):
+    // overload-aware call sites pick their selected overload's slot
+    // instead of every same-arity call collapsing onto one body.
     let key = ctx.table as *const TypeTable as usize;
     if let Some((cached_key, map)) = FN_INDEX_CACHE.with(|c| c.borrow().clone()) {
         if cached_key == key {
             return map;
         }
     }
-    let mut built = std::collections::BTreeMap::new();
-    let mut next = 1usize; // +1 skips @start, like the emission loop.
+    let mut built: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    // Static local functions emit first (indices 1..=L); methods
+    // follow. Offset by the same shared count the emitter uses, so
+    // positions agree (see `collect_static_locals`).
+    let mut next =
+        1usize + crate::native::ir::collect_static_locals(ctx.classes).len();
     for class in ctx.classes {
         if ctx.table.class(&class.name).is_none() {
             continue;
@@ -486,7 +1202,7 @@ pub(super) fn functions_index(
                     continue;
                 }
                 let fname = format!("{}::{}#{}", class.name, m.name, m.params.len());
-                built.insert(fname, next);
+                built.entry(fname).or_default().push(next);
                 next += 1;
             }
         }
@@ -496,7 +1212,126 @@ pub(super) fn functions_index(
     map
 }
 
-/// Index of the direct function for `class.name#arity`, if it exists.
+/// Position of the selected overload among its declaring entry's
+/// same-name+arity methods (declaration order), for indexing into
+/// the per-key function list. Falls back to the last slot (legacy
+/// last-wins) when the overload is not found there (inherited or
+/// synthesized entries).
+pub(super) fn overload_position(
+    ctx: &Ctx<'_>,
+    declaring_class: &str,
+    name: &str,
+    arity: usize,
+    param_types: &[String],
+    byref: &[bool],
+) -> usize {
+    // Declaration order (ClassDecl members), NOT table order: this
+    // must mirror `functions_index` (same classes, same skips, same
+    // order), or same-arity overloads misroute (Unicode
+    // `GetByteCount#3`: table lists the `char*` overload first, but
+    // lowering emits the `char[]` one first — the old table-order
+    // position elected the wrong body for every direct call).
+    // Declaration spellings drift from table spellings (`String`
+    // vs `string`), so compare canonicalized; fall back to the
+    // legacy last-wins when nothing matches.
+    fn canon_sig_ty(s: &str) -> String {
+        s.to_lowercase().split_whitespace().collect::<String>()
+    }
+    let query: Vec<String> = param_types.iter().map(|t| canon_sig_ty(t)).collect();
+    let short = declaring_class
+        .rsplit('.')
+        .next()
+        .unwrap_or(declaring_class);
+    let mut positions: usize = 0;
+    let mut matched: Option<usize> = None;
+    let mut found_class = false;
+    for class in ctx.classes {
+        if class.name != declaring_class && class.name != short {
+            continue;
+        }
+        // Same skip as `functions_index` (entry-less classes emit
+        // no functions).
+        if ctx.table.class(&class.name).is_none() {
+            continue;
+        }
+        found_class = true;
+        for m in &class.members {
+            let crate::models::ClassMember::Method(md) = m else {
+                continue;
+            };
+            if md.name != name || md.params.len() != arity {
+                continue;
+            }
+            // Same skips as `functions_index` (bodyless, dtors,
+            // >64 params never become functions).
+            if md.body.is_none() || md.name.starts_with('~') || md.params.len() > 64 {
+                continue;
+            }
+            if matched.is_none() {
+                let decl_sig: Vec<String> = md
+                    .params
+                    .iter()
+                    .map(|p| canon_sig_ty(&p.type_name))
+                    .collect();
+                // Table spellings may carry `?`/`[]`/qualifiers the
+                // decl spells loosely — compare both raw-normalized
+                // and with pointer/array markers intact (they
+                // distinguish `char*` from `char[]`). Byref-ness joins
+                // the signature: value-vs-`ref` twins (e.g.
+                // `WriteAtOffset` 3/3) otherwise collapse to the
+                // first-declared body and the forwarder recurses into
+                // itself. Missing query flags (synthetic call sites)
+                // behave legacy (first exact match).
+                let decl_byref: Vec<bool> = md.params.iter().map(|p| p.is_byref).collect();
+                let byref_ok = decl_sig.len() == query.len()
+                    && decl_byref
+                        .iter()
+                        .enumerate()
+                        .all(|(i, b)| *b == byref.get(i).copied().unwrap_or(false));
+                // (Table spellings may carry `?`/`[]`/qualifiers the
+                // decl spells loosely; pointer/array markers stay
+                // intact — they distinguish `char*` from `char[]`.)
+                if byref_ok && decl_sig == query {
+                    matched = Some(positions);
+                }
+            }
+            positions += 1;
+        }
+    }
+    if found_class {
+        return matched.unwrap_or_else(|| positions.saturating_sub(1));
+    }
+    // No ClassDecl (synthesized/inherited entry): legacy
+    // table-order behavior, plus the byref signature (value-vs-`ref`
+    // twins share erased param types — see above).
+    let mut tpositions: Vec<usize> = Vec::new();
+    let mut tmatched: Option<usize> = None;
+    if let Some(entry) = ctx.table.class(declaring_class) {
+        for m in &entry.methods {
+            if m.name != name || m.param_types.len() != arity {
+                continue;
+            }
+            let byref_ok = m.param_types.len() == param_types.len()
+                && m
+                    .param_is_byref
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| *b == byref.get(i).copied().unwrap_or(false));
+            if tmatched.is_none() && byref_ok && m.param_types == param_types {
+                tmatched = Some(tpositions.len());
+            }
+            tpositions.push(0);
+        }
+    }
+    match tmatched {
+        Some(n) => n,
+        None => tpositions.len().saturating_sub(1),
+    }
+}
+
+/// Index of the direct function for `class.name#arity`, if it
+/// exists: the LAST same-arity overload (legacy last-wins, kept
+/// for arity-only callers like base-ctor chains).
 /// Used for static-style calls (`C.M(...)`) which are lowered as a direct
 /// `CallFn` (no vtable, no receiver).
 pub(super) fn function_index_for(
@@ -506,17 +1341,42 @@ pub(super) fn function_index_for(
     arity: usize,
 ) -> Option<u32> {
     let fname = format!("{class_name}::{method}#{arity}");
-    functions_index(ctx).get(&fname).copied().map(|i| i as u32)
+    functions_index(ctx)
+        .get(&fname)
+        .and_then(|v| v.last())
+        .copied()
+        .map(|i| i as u32)
+}
+
+/// Index of the Nth same-name+arity overload's function (declaration
+/// order), falling back to the last slot. Call sites that ran
+/// overload selection pass their winner's position here instead of
+/// collapsing onto one body.
+pub(super) fn function_index_nth(
+    ctx: &Ctx<'_>,
+    class_name: &str,
+    method: &str,
+    arity: usize,
+    n: usize,
+) -> Option<u32> {
+    let fname = format!("{class_name}::{method}#{arity}");
+    functions_index(ctx).get(&fname).map(|v| {
+        v.get(n).copied().unwrap_or_else(|| {
+            v.last().copied().unwrap_or(0)
+        }) as u32
+    })
 }
 
 /// Like `function_index_for`, but also walks the base-class chain: static
 /// methods are inherited, so `Derived.M(...)` resolves to the function
-/// declared on the base that defines it.
+/// declared on the base that defines it. Overload-aware (Nth slot).
 pub(super) fn static_function_index_for(
     ctx: &Ctx<'_>,
     class_name: &str,
     method: &str,
     arity: usize,
+    param_types: &[String],
+    byref: &[bool],
 ) -> Option<u32> {
     let mut seen: std::collections::BTreeSet<String> = Default::default();
     let mut stack = vec![class_name.to_string()];
@@ -524,7 +1384,8 @@ pub(super) fn static_function_index_for(
         if !seen.insert(name.clone()) {
             continue;
         }
-        if let Some(fidx) = function_index_for(ctx, &name, method, arity) {
+        let n = overload_position(ctx, &name, method, arity, param_types, byref);
+        if let Some(fidx) = function_index_nth(ctx, &name, method, arity, n) {
             return Some(fidx);
         }
         if let Some(info) = ctx.table.class(&name) {
@@ -555,12 +1416,19 @@ pub(super) fn canonical_slot(
     recv_type: &str,
     method: &str,
 ) -> usize {
+    // TEMP-SLOTDIAG: audit slot selection for a named method.
+    // Removed before close.
+    let diag = std::env::var("RUBYC_SLOTDIAG").unwrap_or_default();
+    let want = !diag.is_empty() && method == diag;
     if let Some(info) = recv {
         if let Some(m) = info.methods.iter().find(|m| m.name == method) {
+            if want {
+                eprintln!("[rubyc] TEMP-SLOTDIAG recv-entry {} slot={}", info.key.path, m.vtable_slot);
+            }
             return m.vtable_slot;
         }
     }
-    table
+    let r = table
         .classes
         .iter()
         .filter(|c| c.name == recv_type || c.key.path == recv_type)
@@ -575,7 +1443,11 @@ pub(super) fn canonical_slot(
                 .map(|m| m.vtable_slot)
                 .next()
         })
-        .unwrap_or(0)
+        .unwrap_or(0);
+    if want {
+        eprintln!("[rubyc] TEMP-SLOTDIAG recv_type={recv_type} slot={r}");
+    }
+    r
 }
 
 #[derive(Clone, Copy)]

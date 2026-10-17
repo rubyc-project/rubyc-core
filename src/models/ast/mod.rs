@@ -13,7 +13,7 @@ pub mod unit;
 pub use attribute::{Attribute, AttributeArg, AttributeValue};
 pub use class::{ClassDecl, ClassMember, EventDecl, FieldDecl, IndexerDecl, PropertyDecl};
 pub use delegate::DelegateDecl;
-pub use expression::{BinOp, Expr, InterpPart, Literal, SwitchExprArm, UnOp};
+pub use expression::{BinOp, Expr, InterpPart, Literal, MemberInit, SwitchExprArm, UnOp};
 pub use interface::{InterfaceDecl, MethodSig};
 pub use method::{Block, MethodDecl, Param, SwitchArm};
 pub use namespace::{EnumDecl, Member, NamespaceDecl};

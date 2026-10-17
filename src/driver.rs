@@ -189,7 +189,7 @@ fn dispatch(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()> {
             | Command::Add
     ) {
         return match invocation.command {
-            Command::Install => cmd_install(invocation),
+            Command::Install => cmd_install(invocation, pipeline),
             Command::Remove => cmd_remove(invocation),
             Command::Update => cmd_update(invocation),
             Command::Download => cmd_download(invocation),
@@ -417,6 +417,7 @@ fn build_asm_file(
         init_fn: None,
         relocs: vec![],
         heap_size: 4096,
+        strip_symbols: false,
     };
 
     let elf = pipeline
@@ -603,6 +604,59 @@ pub(crate) fn union_into(
     None
 }
 
+/// Preserve a lost implicit parameterless ctor after merging two
+/// same-path class declarations from different assemblies (at least
+/// one side is a cross-assembly union — see `union_cross_assembly`).
+/// When exactly one side declares instance ctors, the other side
+/// relied on the implicit parameterless one, which exists only as
+/// absence and would otherwise be lost, breaking that side's `new
+/// X()` with a loud `ctor_arity` (MLC vs CoreLib
+/// `System.DefaultBinder`). Synthesizes an explicit empty-body ctor
+/// (indistinguishable from a source-written `X() { }`). No-op when
+/// neither side declares ctors (natural implicit path), when both
+/// do, or when a 0-arg ctor already survived the merge. Callers pass
+/// the pre-merge ctor states; the entry is mutated in place.
+fn preserve_union_implicit_ctor(
+    existing_had_ctors: bool,
+    incoming_had_ctors: bool,
+    e: &mut crate::models::ClassDecl,
+) {
+    if existing_had_ctors == incoming_had_ctors {
+        return;
+    }
+    let has_zero_arg = e.members.iter().any(|m| match m {
+        crate::models::ClassMember::Method(x) => {
+            x.name == e.name && x.params.is_empty() && !x.is_static
+        }
+        _ => false,
+    });
+    if has_zero_arg {
+        return;
+    }
+    e.members.push(crate::models::ClassMember::Method(
+        crate::models::MethodDecl {
+            access: crate::models::ast::statement::Access::Internal,
+            attrs: Vec::new(),
+            generic_params: Vec::new(),
+            ret_type: String::new(),
+            name: e.name.clone(),
+            params: Vec::new(),
+            body: Some(crate::models::Block {
+                stmts: Vec::new(),
+                span: crate::models::Span::new(0, 0),
+            }),
+            span: crate::models::Span::new(0, 0),
+            is_override: false,
+            is_static: false,
+            is_abstract: false,
+            is_partial: false,
+            is_extern: false,
+            is_async: false,
+            base_call: None,
+        },
+    ));
+}
+
 /// Merge a dependency top-level declaration into the main project's
 /// same-key entry (cross-assembly union): per-member main-wins, so
 /// shared sources (compiled into several assemblies) and
@@ -614,6 +668,12 @@ pub(crate) fn merge_dep_member(existing: &mut crate::models::Member, incoming: c
     use crate::models::Member;
     match (existing, incoming) {
         (Member::Class(e), Member::Class(i)) => {
+            // Cross-assembly provenance: this entry absorbed another
+            // assembly's same-path class. Same-assembly partial parts
+            // never pass through here (main files append directly), so
+            // the flag precisely marks collision unions for semantic's
+            // partial-merge rule below.
+            e.union_cross_assembly = true;
             for b in i.bases {
                 if !e.bases.contains(&b) {
                     e.bases.push(b);
@@ -622,11 +682,27 @@ pub(crate) fn merge_dep_member(existing: &mut crate::models::Member, incoming: c
             // Same strictness as `merge_project_types` below: partial
             // parts agree on struct/class upstream.
             e.is_struct = e.is_struct && i.is_struct;
+            let has_instance_ctor = |ms: &[crate::models::ClassMember], n: &str| {
+                ms.iter().any(|m| match m {
+                    crate::models::ClassMember::Method(x) => {
+                        x.name == n && !x.is_static
+                    }
+                    _ => false,
+                })
+            };
+            let e_had_ctors = has_instance_ctor(&e.members, &e.name);
+            let i_had_ctors = has_instance_ctor(&i.members, &e.name);
             for m in i.members {
                 if !class_member_is_dup(&e.members, &m) {
                     e.members.push(m);
                 }
             }
+            // Cross-assembly same-path siblings: preserve a lost
+            // implicit ctor (see `preserve_union_implicit_ctor`).
+            // Ctors arriving later via semantic partial-merge or final
+            // coalescing are covered by the sibling rules there (keyed
+            // off `union_cross_assembly`, set above).
+            preserve_union_implicit_ctor(e_had_ctors, i_had_ctors, e);
         }
         (Member::Interface(e), Member::Interface(i)) => {
             for b in i.bases {
@@ -662,11 +738,14 @@ pub(crate) fn merge_dep_member(existing: &mut crate::models::Member, incoming: c
 }
 
 /// Exact-duplicate class member (same kind+name+arity+types+generic
-/// arity): the main project's copy wins, the dependency's is dropped.
-/// Generic arity joins the key — `M<T>(IServiceCollection)` vs
+/// arity+byref): the main project's copy wins, the dependency's is
+/// dropped. Generic arity joins the key — `M<T>(IServiceCollection)` vs
 /// `M<T,U>(IServiceCollection)` share erased params but are distinct
 /// overloads (dropping one breaks explicit-args calls); mirrors the
-/// semantic table's dedup key.
+/// semantic table's dedup key. Byref-ness joins it too — value-vs-`ref`
+/// twins (e.g. `WriteAtOffset` 3/3) share erased params; dropping the
+/// second stranded every `ref`-marked call (self-election → infinite
+/// recursion on identical args).
 pub(crate) fn class_member_is_dup(existing: &[crate::models::ClassMember], incoming: &crate::models::ClassMember) -> bool {
     use crate::models::ClassMember;
     match incoming {
@@ -678,7 +757,7 @@ pub(crate) fn class_member_is_dup(existing: &[crate::models::ClassMember], incom
                         .params
                         .iter()
                         .zip(m.params.iter())
-                        .all(|(a, b)| a.type_name == b.type_name)
+                        .all(|(a, b)| a.type_name == b.type_name && a.is_byref == b.is_byref)
                     && x.generic_params.len() == m.generic_params.len()
             }
             _ => false,
@@ -944,6 +1023,13 @@ pub(crate) fn load_project_unit_with_deps(
     // and member-union below, so no owner loses its view.
     let mut seen_content: std::collections::HashSet<(u64, Vec<String>)> =
         std::collections::HashSet::new();
+    // Deps whose prebuild was already re-run for a vanished file: one
+    // re-stage per dep per build. Verdicts are deterministic (same
+    // csproj + env), so a second vanish in the same dep is prune churn
+    // from the other build, not a deleted file needing restoration —
+    // re-running prebuild every time feeds a cross-build restage loop.
+    let mut prebuild_retried: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // Dependency top-level declarations union into the combined unit's
     // same-key entries (per-member main-wins via `merge_dep_member`);
     // genuinely new types append normally below.
@@ -960,11 +1046,64 @@ pub(crate) fn load_project_unit_with_deps(
                          deferred: &mut Vec<DeferredIface>,
                          file_defines: &[String],
                          owner_name: &str,
-                         type_owners: &mut std::collections::HashMap<TypeKey, String>|
+                         owner_dep: Option<&crate::project::Project>,
+                         target: Option<&str>,
+                         type_owners: &mut std::collections::HashMap<TypeKey, String>,
+                         prebuild_retried: &mut std::collections::HashSet<String>|
      -> Result<()> {
-        let source = std::fs::read_to_string(source_path).map_err(|e| {
-            DriverError::from_msg(format!("cannot read {}: {e}", source_path.display()))
-        })?;
+        let source = match std::fs::read_to_string(source_path) {
+            Ok(source) => source,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Concurrent-build race: another process re-staged then
+                // pruned (or vice versa) between our glob and this read.
+                // At most ONE prebuild re-run per dep per build: verdicts
+                // are deterministic (same csproj + env), so the first
+                // re-run restores anything the other build's cleanup
+                // deleted, and any later vanish in the same dep is the
+                // other build's prune churn — re-running prebuild for
+                // those feeds a cross-build restage loop. A file still
+                // absent was deliberately excluded — solo runs never
+                // list it either — so skip it with a note rather than
+                // failing the whole build.
+                // other build's prune churn — re-running prebuild for
+                // those feeds a cross-build restage loop. A file still
+                // absent after the re-run gets a short backoff window:
+                // the other build may be mid-restage and about to bring
+                // it back (its own prebuild re-copies unconditionally).
+                // Past the window it was deliberately excluded — solo
+                // runs never list it either — so skip it with a note
+                // rather than failing the whole build.
+                if let Some(dep) = owner_dep {
+                    if prebuild_retried.insert(dep.name.clone()) {
+                        let _ = dep.run_hook("pre-build", target);
+                    }
+                }
+                let mut source = std::fs::read_to_string(source_path).ok();
+                for _ in 0..10 {
+                    if source.is_some() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    source = std::fs::read_to_string(source_path).ok();
+                }
+                match source {
+                    Some(source) => source,
+                    None => {
+                        eprintln!(
+                            "[rubyc] note: {} vanished mid-load (concurrent prune); skipping",
+                            source_path.display()
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(DriverError::from_msg(format!(
+                    "cannot read {}: {e}",
+                    source_path.display()
+                )));
+            }
+        };
         {
             // Dedup key = (content, defines): identical bytes under
             // different symbols are DIFFERENT inputs (the main project
@@ -1103,7 +1242,10 @@ pub(crate) fn load_project_unit_with_deps(
             &mut deferred,
             &main_defines,
             &project.name,
+            Some(&project),
+            invocation.io.target.as_deref(),
             &mut type_owners,
+            &mut prebuild_retried,
         )?;
     }
     // Snapshot the main project's keys: a same-key main entry keeps its
@@ -1147,6 +1289,11 @@ pub(crate) fn load_project_unit_with_deps(
             .and_then(|oi| deps.get(*oi))
             .map(|d| d.name.as_str())
             .unwrap_or("");
+        let owner_dep = owners
+            .iter()
+            .find(|oi| !consumed.contains(oi))
+            .or_else(|| owners.first())
+            .and_then(|oi| deps.get(*oi));
         load_file(
             source_path,
             false,
@@ -1156,7 +1303,10 @@ pub(crate) fn load_project_unit_with_deps(
             &mut deferred,
             &file_defines,
             owner_name,
+            owner_dep,
+            invocation.io.target.as_deref(),
             &mut type_owners,
+            &mut prebuild_retried,
         )?;
     }
     resolve_deferred_ifaces(&mut combined, &deferred);
@@ -1196,12 +1346,14 @@ pub(crate) fn load_project_unit_with_deps(
     result.map(|(unit, type_owners, fragments)| (unit, deps, type_owners, fragments))
 }
 
-/// Installed `.rci` fragment for a dependency, when fresh: the `.rci`
-/// and `.so` must both exist under the install dir, the fragment's
-/// lib name must match, and its source hash must equal a fresh hash
-/// of the dep's current own sources. ANY mismatch (or unreadable
-/// file) falls back to compiling from sources — stale fragments are
-/// never trusted. Returns `None` for "compile from sources".
+/// Installed fragment for a dependency, when fresh: the image (`.so`)
+/// must exist under the install dir, the fragment's lib name must
+/// match, and its source hash must equal a fresh hash of the dep's
+/// current own sources. ANY mismatch (or unreadable file) falls back
+/// to compiling from sources — stale fragments are never trusted.
+/// Returns `None` for "compile from sources". Fragment bytes come
+/// from the image's post-magic table first, then its legacy
+/// `.rubyc_types` section, then the `.rci` sidecar file.
 fn dep_fragment(
     dep: &crate::project::Project,
     dyn_dir: &std::path::Path,
@@ -1210,6 +1362,17 @@ fn dep_fragment(
     let rci_path = dyn_dir.join(format!("{}.rci", dep.name));
     if !so_path.is_file() {
         return None;
+    }
+    if let Ok(image) = std::fs::read(&so_path) {
+        let embedded = crate::native::embedded::table_bytes(&image)
+            .or_else(|| crate::native::embedded::section_bytes(&image));
+        if let Some(bytes) = embedded
+            && let Ok(frag) = crate::native::rci::decode(bytes)
+            && frag.lib_name == dep.name
+            && frag.source_hash == rci_source_hash(dep)
+        {
+            return Some(frag);
+        }
     }
     let bytes = std::fs::read(&rci_path).ok()?;
     let frag = crate::native::rci::decode(&bytes).ok()?;
@@ -1224,18 +1387,47 @@ fn dep_fragment(
 
 /// Fragment for a `using`-discovered library: same shape as
 /// [`dep_fragment`], but there is no local project (no sources to hash
-/// against), so the installed `.rci` is trusted as-written — the
-/// post-build hook installs it next to its image, and a missing image
-/// (`.so` or `.a`) vetoes the fragment. Name mismatch also vetoes.
+/// against), so installed fragments are trusted as-written — the
+/// post-build hook installs them next to their image, and a missing
+/// image (`.so` or `.a`) vetoes the fragment. Post-magic table wins
+/// over the legacy section over the sidecar file; name mismatch vetoes
+/// either way.
 fn installed_fragment(lib: &str, lib_dir: &std::path::Path) -> Option<crate::native::rci::Fragment> {
-    if !lib_dir.join(format!("{lib}.so")).is_file()
-        && !lib_dir.join(format!("{lib}.a")).is_file()
-    {
+    let check = |frag: crate::native::rci::Fragment| (frag.lib_name == lib).then_some(frag);
+    let mut image_seen = false;
+    for ext in ["so", "a"] {
+        let image_path = lib_dir.join(format!("{lib}.{ext}"));
+        if !image_path.is_file() {
+            continue;
+        }
+        image_seen = true;
+        let Ok(image) = std::fs::read(&image_path) else {
+            continue;
+        };
+        let embedded = if ext == "a" {
+            crate::native::arlib::read(&image)
+                .ok()
+                .and_then(|members| {
+                    crate::native::embedded::archive_member(&members).map(|b| b.to_vec())
+                })
+        } else {
+            crate::native::embedded::table_bytes(&image)
+                .or_else(|| crate::native::embedded::section_bytes(&image))
+                .map(|b| b.to_vec())
+        };
+        if let Some(bytes) = embedded
+            && let Ok(frag) = crate::native::rci::decode(&bytes)
+            && let Some(frag) = check(frag)
+        {
+            return Some(frag);
+        }
+    }
+    if !image_seen {
         return None;
     }
     let bytes = std::fs::read(lib_dir.join(format!("{lib}.rci"))).ok()?;
     let frag = crate::native::rci::decode(&bytes).ok()?;
-    (frag.lib_name == lib).then_some(frag)
+    check(frag)
 }
 
 /// Plain `using Ns;` namespaces across source files (lexical scan —
@@ -1378,8 +1570,34 @@ fn merge_project_types(unit: &mut CompilationUnit) {
                         // Partial parts agree on struct/class upstream;
                         // strict AND keeps any mismatch loud downstream.
                         existing.is_struct = existing.is_struct && class.is_struct;
+                        // Cross-assembly coalescing (either side absorbed
+                        // another assembly's same-path class via the dep
+                        // union): preserve a lost implicit ctor exactly
+                        // like the dep union does. Pure same-assembly
+                        // partials (both unflagged) merge silently, so
+                        // splitting ctors across parts stays an error as
+                        // C# requires.
+                        let cross = existing.union_cross_assembly
+                            || class.union_cross_assembly;
+                        let has_instance_ctor =
+                            |ms: &[crate::models::ClassMember], n: &str| {
+                                ms.iter().any(|m| match m {
+                                    crate::models::ClassMember::Method(x) => {
+                                        x.name == n && !x.is_static
+                                    }
+                                    _ => false,
+                                })
+                            };
+                        let e_had =
+                            has_instance_ctor(&existing.members, &existing.name);
+                        let i_had =
+                            has_instance_ctor(&class.members, &existing.name);
                         existing.members.append(&mut class.members);
                         existing.span = existing.span.to(class.span);
+                        existing.union_cross_assembly = cross;
+                        if cross {
+                            preserve_union_implicit_ctor(e_had, i_had, existing);
+                        }
                     } else {
                         index.insert(key, merged.len());
                         merged.push(Member::Class(class));
@@ -1391,9 +1609,83 @@ fn merge_project_types(unit: &mut CompilationUnit) {
         *members = merged;
     }
 
+    // Nested partials (`private sealed partial class HillClimbing`
+    // split across `PortableThreadPool.HillClimbing{,.Complex}.cs`):
+    // the top-level merge never sees them, so lowering found two
+    // `HillClimbing` decls and the field-init `find` hit the
+    // fieldless part first (null `_randomIntervalGenerator`,
+    // segfault in the ctor). Recurse the same merge into every
+    // class's nested classes; cross-assembly provenance and the
+    // implicit-ctor rule ride along unchanged.
+    fn merge_nested(class: &mut crate::models::ClassDecl) {
+        use crate::models::{ClassMember, Member};
+        let taken = std::mem::take(&mut class.members);
+        let mut rest: Vec<ClassMember> = Vec::with_capacity(taken.len());
+        let mut nested: Vec<Member> = Vec::new();
+        let mut anchor: Option<usize> = None;
+        for m in taken {
+            if let ClassMember::Nested(Member::Class(nc)) = m {
+                if anchor.is_none() {
+                    anchor = Some(rest.len() + nested.len());
+                }
+                nested.push(Member::Class(nc));
+            } else {
+                rest.push(m);
+            }
+        }
+        if nested.is_empty() {
+            class.members = rest;
+            return;
+        }
+        merge(&mut nested);
+        let mut out: Vec<ClassMember> = Vec::with_capacity(rest.len() + nested.len());
+        let anchor = anchor.unwrap_or(rest.len());
+        let mut nested_iter = nested.into_iter();
+        let mut inserted = false;
+        for (i, m) in rest.into_iter().enumerate() {
+            if !inserted && i == anchor {
+                for n in nested_iter.by_ref() {
+                    if let Member::Class(mut nc) = n {
+                        merge_nested(&mut nc);
+                        out.push(ClassMember::Nested(Member::Class(nc)));
+                    } else {
+                        out.push(ClassMember::Nested(n));
+                    }
+                }
+                inserted = true;
+            }
+            out.push(m);
+        }
+        if !inserted {
+            for n in nested_iter {
+                if let Member::Class(mut nc) = n {
+                    merge_nested(&mut nc);
+                    out.push(ClassMember::Nested(Member::Class(nc)));
+                } else {
+                    out.push(ClassMember::Nested(n));
+                }
+            }
+        }
+        class.members = out;
+    }
+
     merge(&mut unit.members);
     for namespace in &mut unit.namespaces {
         merge(&mut namespace.members);
+    }
+    // Recurse into top-level and namespace classes (their nested
+    // partials merge above); deeper levels recurse themselves.
+    for member in unit.members.iter_mut() {
+        if let crate::models::Member::Class(c) = member {
+            merge_nested(c);
+        }
+    }
+    for namespace in unit.namespaces.iter_mut() {
+        for member in namespace.members.iter_mut() {
+            if let crate::models::Member::Class(c) = member {
+                merge_nested(c);
+            }
+        }
     }
 }
 
@@ -1428,6 +1720,55 @@ fn build_preloaded(
 /// included — a bare re-analysis would omit them). A failed re-analysis
 /// never fails the build (lowering already succeeded) — it only skips
 /// the sidecar.
+/// This lib's own post-resolution table entries for downstream builds:
+/// `(source_hash, classes, owned interfaces, owned delegates)`. Errors
+/// carry the re-analysis diagnostics; callers warn (sidecar) or fall
+/// back (embed) instead of failing the build, since lowering already
+/// succeeded.
+#[allow(clippy::type_complexity)]
+fn fragment_payload(
+    project: &crate::project::Project,
+    unit: &CompilationUnit,
+    type_owners: &std::collections::HashMap<TypeKey, String>,
+    preloaded: &crate::native::semantic::Preloaded,
+) -> std::result::Result<
+    (
+        u64,
+        Vec<crate::native::semantic::ClassInfo>,
+        Vec<crate::models::InterfaceDecl>,
+        Vec<crate::models::DelegateDecl>,
+    ),
+    Vec<crate::native::semantic::SemanticError>,
+> {
+    let table =
+        crate::native::semantic::analyze_with_preloaded(unit, type_owners, preloaded)?;
+    let hash = rci_source_hash(project);
+    // Interfaces/delegates carry no owner field: attribute by
+    // owners-map match on (simple name, arity).
+    // Over-approximation (same name+arity in two libs) resolves
+    // first-wins on consume, mirroring the table's own conflation.
+    let owned = |name: &str, arity: usize| {
+        type_owners.iter().any(|(k, v)| {
+            v == &project.name
+                && k.arity == arity
+                && k.path.rsplit('.').next().unwrap_or(&k.path) == name
+        })
+    };
+    let ifaces: Vec<_> = table
+        .interfaces
+        .iter()
+        .filter(|i| owned(&i.name, i.arity))
+        .cloned()
+        .collect();
+    let delegates: Vec<_> = table
+        .delegates
+        .iter()
+        .filter(|d| owned(&d.name, d.generic_params.len()))
+        .cloned()
+        .collect();
+    Ok((hash, table.classes, ifaces, delegates))
+}
+
 fn emit_rci_sidecar(
     out_dir: &std::path::Path,
     project: &crate::project::Project,
@@ -1436,34 +1777,10 @@ fn emit_rci_sidecar(
     preloaded: &crate::native::semantic::Preloaded,
 ) {
     let t = std::time::Instant::now();
-    match crate::native::semantic::analyze_with_preloaded(unit, type_owners, preloaded) {
-        Ok(table) => {
-            let hash = rci_source_hash(project);
-            // Interfaces/delegates carry no owner field: attribute by
-            // owners-map match on (simple name, arity).
-            // Over-approximation (same name+arity in two libs) resolves
-            // first-wins on consume, mirroring the table's own conflation.
-            let owned = |name: &str, arity: usize| {
-                type_owners.iter().any(|(k, v)| {
-                    v == &project.name
-                        && k.arity == arity
-                        && k.path.rsplit('.').next().unwrap_or(&k.path) == name
-                })
-            };
-            let ifaces: Vec<_> = table
-                .interfaces
-                .iter()
-                .filter(|i| owned(&i.name, i.arity))
-                .cloned()
-                .collect();
-            let delegates: Vec<_> = table
-                .delegates
-                .iter()
-                .filter(|d| owned(&d.name, d.generic_params.len()))
-                .cloned()
-                .collect();
+    match fragment_payload(project, unit, type_owners, preloaded) {
+        Ok((hash, classes, ifaces, delegates)) => {
             let bytes =
-                crate::native::rci::encode(&project.name, hash, &table.classes, &ifaces, &delegates);
+                crate::native::rci::encode(&project.name, hash, &classes, &ifaces, &delegates);
             let rci_path = out_dir.join(format!("{}.rci", project.name));
             match std::fs::write(&rci_path, &bytes) {
                 Ok(()) => eprintln!(
@@ -1519,6 +1836,20 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
         let mut project_io = invocation.io.clone();
         project_io.file = Some(project_path.display().to_string());
         project_io.input = None;
+        // Emission options: explicit CLI flags join the project's own
+        // `[build]` keys — either source enables the pass (a CLI flag
+        // never disables a TOML `true`; full CLI-overrides-TOML
+        // precedence for valued flags arrives with TOML parity).
+        project_io.optimize |= project.optimize;
+        project_io.strip |= project.strip;
+        // Valued TOML keys apply only when the CLI left them unset:
+        // explicit flags always win over the file.
+        if project_io.target.is_none() {
+            project_io.target.clone_from(&project.target);
+        }
+        if !project_io.rci_only {
+            project_io.rci_only = project.rci_only;
+        }
         let project_invocation = Invocation {
             command: invocation.command,
             io: project_io,
@@ -1529,20 +1860,53 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
             lint_overrides: invocation.lint_overrides.clone(),
             defines: invocation.defines.clone(),
         };
-        // Honor the project's [target] output (default: exe).
-        let out_format = OutFormat::from_str(&project.output_format).unwrap_or(OutFormat::Exe);
+        // Honor the project's [target] output (default: exe), unless
+        // `-O` overrides it (e.g. `install libs --format` rebuilds one
+        // tree in another format without editing 181 project files).
+        let out_format = project_invocation
+            .io
+            .out_format
+            .unwrap_or(OutFormat::from_str(&project.output_format).unwrap_or(OutFormat::Exe));
         if out_format == OutFormat::Shared {
             // Dependency fragments for dynamic-linking consume (also
             // reused for the `.rci` emit below so the sidecar mirrors
             // the built table).
             let preloaded = build_preloaded(&fragments);
             // Emit `out/<name>.so` so the post-build hook can install it
-            // (the `.rci` below lands next to it).
+            // (the `.rci` below lands next to it, unless embedded).
             let base = project_path.parent().unwrap_or_else(|| std::path::Path::new("."));
             let out_dir = base.join("out");
             std::fs::create_dir_all(&out_dir).map_err(|e| {
                 DriverError::from_msg(format!("cannot create {}: {e}", out_dir.display()))
             })?;
+            // Embedded by default: fragment bytes ride the post-magic table
+            // instead of a sidecar file (no image under `--rci-only`,
+            // so nothing to embed into there). Analysis failure falls
+            // back to a plain image plus the file.
+            let embed = !project_invocation.io.no_embed_types && !project_invocation.io.rci_only;
+            let embed_bytes = if embed {
+                match fragment_payload(&project, &unit, &type_owners, &preloaded) {
+                    Ok((hash, classes, ifaces, delegates)) => Some(crate::native::rci::encode(
+                        &project.name,
+                        hash,
+                        &classes,
+                        &ifaces,
+                        &delegates,
+                    )),
+                    Err(errs) => {
+                        eprintln!(
+                            "[rubyc] warning: embedding skipped (re-analysis failed: {})",
+                            errs.iter()
+                                .map(|e| format!("{} {}", e.code, e.message))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             // `--rci-only` (fragment backfill): skip codegen and the
             // image write entirely; the sidecar below is the product.
             if !project_invocation.io.rci_only {
@@ -1562,6 +1926,11 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
                     &invocation.defines,
                     &type_owners,
                     &preloaded,
+                    embed_bytes.as_deref(),
+                    crate::native::EmitOptions {
+                        optimize: project_invocation.io.optimize,
+                        strip: project_invocation.io.strip,
+                    },
                 )
                 .map_err(|e| DriverError::from_msg(e.to_string()))?;
                 let out_path = out_dir.join(format!("{}.so", project.name));
@@ -1570,8 +1939,11 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
                 })?;
                 eprintln!("[rubyc] wrote {}", out_path.display());
             }
-            // Same `.rci` sidecar serves dynamic and static consumers.
-            emit_rci_sidecar(&out_dir, &project, &unit, &type_owners, &preloaded);
+            // Same `.rci` sidecar serves dynamic and static consumers —
+            // unless the fragment already rides inside the image.
+            if !(embed && embed_bytes.is_some()) {
+                emit_rci_sidecar(&out_dir, &project, &unit, &type_owners, &preloaded);
+            }
         } else if out_format == OutFormat::Static {
             // Static archives merge dependency sources (the `dynamic`
             // fragment path stays shared-only: a dynamic member has no
@@ -1582,11 +1954,45 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
                     project.name
                 )));
             }
+            // Embedded by default: second `<name>.rci` archive member instead
+            // of a sidecar file (no archive under `--rci-only`, so
+            // nothing to embed into there). Analysis failure falls back
+            // to a plain archive plus the file.
+            let embed = !project_invocation.io.no_embed_types && !project_invocation.io.rci_only;
+            let embed_bytes = if embed {
+                match fragment_payload(
+                    &project,
+                    &unit,
+                    &type_owners,
+                    &build_preloaded(&fragments),
+                ) {
+                    Ok((hash, classes, ifaces, delegates)) => Some(crate::native::rci::encode(
+                        &project.name,
+                        hash,
+                        &classes,
+                        &ifaces,
+                        &delegates,
+                    )),
+                    Err(errs) => {
+                        eprintln!(
+                            "[rubyc] warning: embedding skipped (re-analysis failed: {})",
+                            errs.iter()
+                                .map(|e| format!("{} {}", e.code, e.message))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let archive = crate::native::compile_static_archive(
                 &unit,
                 pipeline.backend,
                 &project.name,
                 &invocation.defines,
+                embed_bytes.as_deref(),
             )
             .map_err(|e| DriverError::from_msg(e.to_string()))?;
             // Emit `out/<name>.a` so the post-build hook can install it
@@ -1605,14 +2011,17 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
                 })?;
                 eprintln!("[rubyc] wrote {}", out_path.display());
             }
-            // Same `.rci` sidecar serves dynamic and static consumers.
-            emit_rci_sidecar(
-                &out_dir,
-                &project,
-                &unit,
-                &type_owners,
-                &build_preloaded(&fragments),
-            );
+            // Same `.rci` sidecar serves dynamic and static consumers —
+            // unless the fragment already rides inside the archive.
+            if !(embed && embed_bytes.is_some()) {
+                emit_rci_sidecar(
+                    &out_dir,
+                    &project,
+                    &unit,
+                    &type_owners,
+                    &build_preloaded(&fragments),
+                );
+            }
         } else {
             emit_exe(
                 &project_invocation,
@@ -1655,19 +2064,68 @@ fn build_solution(path: &str, invocation: &Invocation, pipeline: &NativePipeline
             "--output is ambiguous for a solution containing multiple projects",
         ));
     }
-    let jobs = invocation.io.jobs.max(1).min(projects.len().max(1));
+    // Parallelism: explicit `--jobs` wins; otherwise the max TOML
+    // `[build] jobs` across member projects; unset everywhere = serial.
+    let mut jobs = invocation.io.jobs;
+    if jobs == 0 {
+        for pf in &projects {
+            if let Ok(p) = crate::project::Project::load(pf) {
+                jobs = jobs.max(p.jobs);
+            }
+        }
+    }
+    let jobs = jobs.max(1).min(projects.len().max(1));
+    // Solution profile (`--profile NAME`): resolve once, then merge its
+    // defines/optimize/strip into the invocation every project builds
+    // with. Unknown names fail loudly (a typo must not silently build
+    // the wrong configuration).
+    let mut invocation = invocation.clone();
+    if let Some(name) = invocation.io.profile.clone() {
+        match solution.profiles.get(&name) {
+            Some(profile) => {
+                for d in &profile.defines {
+                    if !invocation.defines.contains(d) {
+                        invocation.defines.push(d.clone());
+                    }
+                }
+                invocation.io.optimize |= profile.optimize;
+                invocation.io.strip |= profile.strip;
+            }
+            None => {
+                let mut known: Vec<&String> = solution.profiles.keys().collect();
+                known.sort();
+                return Err(DriverError::from_msg(format!(
+                    "unknown solution profile '{name}' (known: {})",
+                    known
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+    }
     if jobs <= 1 {
-        for project in projects {
-            build_project(&project.display().to_string(), invocation, pipeline)?;
+        for project in &projects {
+            build_project(&project.display().to_string(), &invocation, pipeline)?;
         }
         return Ok(());
     }
-    // Parallel backfill: workers pull project indices off an atomic
-    // counter (tail work balances itself — no chunking). Projects are
-    // independent builds (distinct sources, distinct `out/` artifacts,
-    // per-command hook dirs); the shared pipeline ports are stateless.
-    // Every project runs to completion; the first error in project
-    // order wins after the join.
+    build_projects_parallel(&projects, &invocation, pipeline, jobs)
+}
+
+/// Build independent projects, each in its own thread pulled from an
+/// atomic counter (tail work balances itself — no chunking). Projects
+/// are independent builds (distinct sources, distinct `out/`
+/// artifacts, per-command hook dirs); the shared pipeline ports are
+/// stateless. Every project runs to completion; the first error in
+/// project order wins after the join.
+fn build_projects_parallel(
+    projects: &[std::path::PathBuf],
+    invocation: &Invocation,
+    pipeline: &NativePipeline,
+    jobs: usize,
+) -> Result<()> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results: Vec<std::sync::Mutex<Option<Result<()>>>> =
         (0..projects.len()).map(|_| std::sync::Mutex::new(None)).collect();
@@ -1699,6 +2157,15 @@ fn cmd_build(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()> {
     let io = &invocation.io;
     if invocation.verbose {
         eprintln!("{}", crate::t!("rubyc.main.build.stage1"));
+    }
+    // Pulled-tree builds fetch first: a requested `.rcp`/`.rcs` under
+    // `dotnet-runtime/` that is not on disk means the tree was never
+    // pulled (ordinary typos elsewhere never trigger this).
+    if let Some(f) = io.file.as_deref() {
+        if f.contains("dotnet-runtime") && !std::path::Path::new(f).is_file() {
+            eprintln!("[rubyc] build: {f} is missing from the pulled tree; pulling first ...");
+            run_pull_script()?;
+        }
     }
     // Project/solution files take the project system path.
     if let Some(f) = io.file.as_deref() {
@@ -1757,12 +2224,36 @@ fn cmd_build(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()> {
         OutFormat::Shared => {
             let unit = into_unit(input, invocation)?;
             check_lints(&unit, invocation)?;
+            // Direct compiles have no project: fragment attribution is
+            // empty-owners (everything local), hash 0. Analysis failure
+            // falls back to a plain image, never fails the build.
+            let embed_bytes = if !io.no_embed_types {
+                match crate::native::analyze_fragment_bytes(
+                    &unit,
+                    &std::collections::HashMap::new(),
+                    "lib",
+                    0,
+                ) {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => {
+                        eprintln!("[rubyc] warning: embedding skipped (analysis failed)");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let image = crate::native::compile_shared_library(
                 &unit,
                 pipeline.backend,
                 pipeline.image_writer,
                 &io.libs.iter().map(PathBuf::from).collect::<Vec<_>>(),
                 &invocation.defines,
+                embed_bytes.as_deref(),
+                crate::native::EmitOptions {
+                    optimize: io.optimize,
+                    strip: io.strip,
+                },
             )
             .map_err(|e| DriverError::from_msg(e.to_string()))?;
             write_out(io, &image)?;
@@ -1782,11 +2273,31 @@ fn cmd_build(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()> {
                 })
                 .unwrap_or("lib")
                 .to_owned();
+            // Direct compiles have no project: fragment attribution is
+            // empty-owners (everything local), hash 0. Analysis failure
+            // falls back to a plain archive, never fails the build.
+            let embed_bytes = if !io.no_embed_types {
+                match crate::native::analyze_fragment_bytes(
+                    &unit,
+                    &std::collections::HashMap::new(),
+                    &member,
+                    0,
+                ) {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => {
+                        eprintln!("[rubyc] warning: embedding skipped (analysis failed)");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let archive = crate::native::compile_static_archive(
                 &unit,
                 pipeline.backend,
                 &member,
                 &invocation.defines,
+                embed_bytes.as_deref(),
             )
             .map_err(|e| DriverError::from_msg(e.to_string()))?;
             write_out(io, &archive)?;
@@ -2046,12 +2557,15 @@ fn cmd_check_roundtrip(file: Option<&str>) -> Result<()> {
 
 // -------------------------------------------------------- extension management
 
-fn cmd_install(invocation: &Invocation) -> Result<()> {
+fn cmd_install(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()> {
     let name = invocation
         .io
         .file
         .as_deref()
         .ok_or_else(|| DriverError::Message("install: missing package name".into()))?;
+    if name == "libs" {
+        return cmd_install_libs(invocation, pipeline);
+    }
     let kind = invocation
         .io
         .kind
@@ -2114,6 +2628,223 @@ fn cmd_install(invocation: &Invocation) -> Result<()> {
         "{}",
         crate::tf!("rubyc.cli.installed", name.to_string())
     );
+    Ok(())
+}
+
+/// Walk upward from the current directory for `rel` (a `/`-separated
+/// path like `dotnet-runtime/src/libraries/dotnet-runtime.rcs`).
+/// Returns the first hit, or `None` past the filesystem root.
+fn find_upward(rel: &str) -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(rel);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Ensure the pulled runtime tree, returning its solution path.
+/// Missing tree (or missing solution): run `tools/pull-dotnet.sh`
+/// from the enclosing checkout (found upward, like the tree) with
+/// inherited stdio so pull progress is visible; a missing script or
+/// a still-missing tree afterwards is a loud error (offline with
+/// nothing cached cannot proceed). Present tree: best-effort
+/// update check — behind upstream runs the pull script, network
+/// failure warns and proceeds with the local tree.
+fn ensure_pulled_tree() -> Result<std::path::PathBuf> {
+    let rel = "dotnet-runtime/src/libraries/dotnet-runtime.rcs";
+    if let Some(rcs) = find_upward(rel) {
+        if rcs.is_file() {
+            if tree_is_behind(&rcs) {
+                run_pull_script()?;
+            }
+            return Ok(rcs);
+        }
+    }
+    run_pull_script()?;
+    find_upward(rel).filter(|p| p.is_file()).ok_or_else(|| {
+        DriverError::Message(
+            "install libs: pull script ran but produced no dotnet-runtime/src/libraries/dotnet-runtime.rcs".into(),
+        )
+    })
+}
+
+/// Run `tools/pull-dotnet.sh` from the enclosing checkout (found
+/// upward, like the tree) with inherited stdio so pull progress is
+/// visible. Missing script or failing run is a loud error: offline
+/// with nothing cached cannot proceed.
+fn run_pull_script() -> Result<()> {
+    let script = find_upward("tools/pull-dotnet.sh").ok_or_else(|| {
+        DriverError::Message(
+            "install libs: no pulled runtime tree found (no dotnet-runtime/src/libraries/dotnet-runtime.rcs upward) and no tools/pull-dotnet.sh to fetch it; clone the rubyc repo or run from inside it".into(),
+        )
+    })?;
+    eprintln!("[rubyc] install libs: pulling dotnet/runtime ...");
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .status()
+        .map_err(|e| {
+            DriverError::Message(format!("install libs: cannot run pull script: {e}"))
+        })?;
+    if !status.success() {
+        return Err(DriverError::Message(
+            "install libs: pull script failed (offline?); nothing cached to fall back on".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a present tree is behind upstream (local HEAD vs
+/// `ls-remote`). Non-git trees and network failures report false
+/// with a warning and proceed on the local tree.
+fn tree_is_behind(rcs: &std::path::Path) -> bool {
+    let root = rcs
+        .ancestors()
+        .find(|a| a.join(".git").is_dir() && a.ends_with("dotnet-runtime"));
+    let Some(root) = root else { return false };
+    let local = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output();
+    let remote = std::process::Command::new("git")
+        .args(["ls-remote", "origin", "HEAD"])
+        .current_dir(root)
+        .output();
+    match (local, remote) {
+        (Ok(l), Ok(r)) if l.status.success() && r.status.success() => {
+            let l = String::from_utf8_lossy(&l.stdout);
+            let r = String::from_utf8_lossy(&r.stdout);
+            !l.trim().is_empty() && !r.is_empty() && !r.starts_with(l.trim())
+        }
+        _ => {
+            eprintln!("[rubyc] install libs: update check skipped (offline or unreachable); using the local tree");
+            false
+        }
+    }
+}
+
+/// Whether an installed image is fresh for a project: the image
+/// (`.so`, or `static/<name>.a`) exists and its embedded-or-sidecar
+/// fragment decodes with a matching lib name and a source hash equal
+/// to a fresh hash of the project's current own sources. Anything
+/// else (missing, undecodable, stale) means "build it".
+fn lib_is_fresh(
+    project_path: &std::path::Path,
+    want_static: bool,
+    dyn_dir: &std::path::Path,
+) -> bool {
+    let Ok(project) = crate::project::Project::load(project_path) else {
+        return false;
+    };
+    let image = if want_static {
+        dyn_dir.join("static").join(format!("{}.a", project.name))
+    } else {
+        dyn_dir.join(format!("{}.so", project.name))
+    };
+    let Ok(bytes) = std::fs::read(&image) else {
+        return false;
+    };
+    let frag_bytes: Option<Vec<u8>> = if want_static {
+        crate::native::arlib::read(&bytes)
+            .ok()
+            .and_then(|members| {
+                crate::native::embedded::archive_member(&members).map(|b| b.to_vec())
+            })
+            .or_else(|| {
+                std::fs::read(dyn_dir.join(format!("{}.rci", project.name))).ok()
+            })
+    } else {
+        crate::native::embedded::table_bytes(&bytes)
+            .or_else(|| crate::native::embedded::section_bytes(&bytes))
+            .map(|b| b.to_vec())
+            .or_else(|| std::fs::read(dyn_dir.join(format!("{}.rci", project.name))).ok())
+    };
+    let Some(frag_bytes) = frag_bytes else {
+        return false;
+    };
+    let Ok(frag) = crate::native::rci::decode(&frag_bytes) else {
+        return false;
+    };
+    frag.lib_name == project.name && frag.source_hash == rci_source_hash(&project)
+}
+
+/// `install libs [--format shared|static|both]`: ensure the pulled
+/// runtime tree, rebuild stale libraries, install via the post-build
+/// hooks. Each stage skips fresh work: pull runs only when the tree is
+/// missing or behind upstream, and only libraries whose installed
+/// image predates their inputs rebuild. `--format both` runs a shared
+/// pass then a static pass (dynamic projects skip the static pass —
+/// their members have no home image to copy-link from).
+fn cmd_install_libs(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()> {
+    let formats: Vec<bool> = match invocation.io.install_format.as_deref().unwrap_or("shared") {
+        "shared" => vec![false],
+        "static" => vec![true],
+        "both" => vec![false, true],
+        other => {
+            return Err(DriverError::Message(format!(
+                "install libs: invalid --format '{other}' (expected 'shared', 'static', or 'both')"
+            )));
+        }
+    };
+    let rcs = ensure_pulled_tree()?;
+    let solution = crate::project::Solution::load(&rcs).map_err(DriverError::from_msg)?;
+    let projects = solution.project_files().map_err(DriverError::from_msg)?;
+    let dyn_dir = crate::extensions::install_root().join("libraries");
+    for want_static in formats {
+        let mut stale = Vec::new();
+        let mut skipped_dynamic = 0usize;
+        for project in &projects {
+            // Dynamic members cannot static-link (no home image to
+            // copy-link from): skip them in the static pass with a note,
+            // erroring only on explicit single-project requests (see
+            // `build_project`). Unreadable projects stay stale so the
+            // build reports them instead of silently skipping.
+            let dynamic = crate::project::Project::load(project)
+                .map(|p| p.dynamic)
+                .unwrap_or(false);
+            if want_static && dynamic {
+                skipped_dynamic += 1;
+                continue;
+            }
+            if !lib_is_fresh(project, want_static, &dyn_dir) {
+                stale.push(project.clone());
+            }
+        }
+        let kind = if want_static { "static" } else { "shared" };
+        if stale.is_empty() {
+            eprintln!("[rubyc] install libs: all {} libraries up to date ({kind})", projects.len());
+            continue;
+        }
+        eprintln!(
+            "[rubyc] install libs: building {} of {} libraries ({kind})",
+            stale.len(),
+            projects.len()
+        );
+        if skipped_dynamic > 0 {
+            eprintln!(
+                "[rubyc] install libs: skipping {skipped_dynamic} dynamic projects for the static pass"
+            );
+        }
+        let mut pass = invocation.clone();
+        pass.io.out_format = Some(if want_static {
+            OutFormat::Static
+        } else {
+            OutFormat::Shared
+        });
+        let jobs = pass.io.jobs.max(1).min(stale.len().max(1));
+        if jobs <= 1 {
+            for project in &stale {
+                build_project(&project.display().to_string(), &pass, &pipeline)?;
+            }
+        } else {
+            build_projects_parallel(&stale, &pass, &pipeline, jobs)?;
+        }
+    }
     Ok(())
 }
 
@@ -2720,13 +3451,17 @@ fn emit_exe(
     if invocation.verbose {
         eprintln!("{}", crate::t!("rubyc.main.build.stage2"));
     }
-    let image = crate::native::compile_to_bytes_with_libs_preamble(
+    let image = crate::native::compile_to_bytes_with_libs_preamble_opts(
         &unit,
         pipeline.backend,
         pipeline.image_writer,
         &io.libs.iter().map(PathBuf::from).collect::<Vec<_>>(),
         !io.no_magic,
         &invocation.defines,
+        crate::native::EmitOptions {
+            optimize: io.optimize,
+            strip: io.strip,
+        },
     )
     .map_err(|e| DriverError::from_msg(e.to_string()))?;
 

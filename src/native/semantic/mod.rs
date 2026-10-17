@@ -221,6 +221,16 @@ fn const_fold(expr: &Expr, cx: &ConstCx) -> Option<ConstValue> {
         // `sizeof(T)` for primitives (64-bit target): byte size.
         // (`sizeof` of composite types needs layout — not constant
         // here; those stay unresolvable.)
+        //
+        // `checked(x)` / `unchecked(x)` wrappers (e.g. framework consts
+        // like `Int64.MinValue = unchecked((long)0x8000...L)`): fold
+        // the single argument (wrapping assumed intended, mirroring
+        // the cast arm above).
+        Expr::Call { callee, args, .. }
+            if (callee == "checked" || callee == "unchecked") && args.len() == 1 =>
+        {
+            const_fold(&args[0], cx)
+        }
         Expr::Call { callee, args, .. } if callee == "sizeof" => {
             let [arg] = args.as_slice() else {
                 return None;
@@ -626,8 +636,73 @@ pub fn analyze_with_preloaded(
             .find(|e| e.key() == key)
         {
             if existing.decl.is_partial && c.decl.is_partial {
+                // Cross-assembly provenance survives the merge: a part
+                // that absorbed another assembly's same-path class
+                // (driver dep-union) merging here means the entry spans
+                // assemblies, and each side keeps its constructibility
+                // below.
+                let cross = existing.decl.union_cross_assembly || c.decl.union_cross_assembly;
+                let has_instance_ctor = |ms: &[crate::models::ClassMember], n: &str| {
+                    ms.iter().any(|m| match m {
+                        crate::models::ClassMember::Method(x) => {
+                            x.name == n && !x.is_static
+                        }
+                        _ => false,
+                    })
+                };
+                let e_had = has_instance_ctor(&existing.decl.members, &existing.decl.name);
+                let i_had = has_instance_ctor(&c.decl.members, &c.decl.name);
                 existing.decl.members.extend(c.decl.members);
                 existing.decl.bases.extend(c.decl.bases);
+                existing.decl.union_cross_assembly =
+                    existing.decl.union_cross_assembly || c.decl.union_cross_assembly;
+                if cross
+                    && e_had != i_had
+                    && !existing.decl.members.iter().any(|m| match m {
+                        crate::models::ClassMember::Method(x) => {
+                            x.name == existing.decl.name
+                                && x.params.is_empty()
+                                && !x.is_static
+                        }
+                        _ => false,
+                    })
+                {
+                    // Exactly one side declared instance ctors, so the
+                    // other relied on the implicit parameterless one —
+                    // which exists only as absence and would be lost in
+                    // the union, breaking that side's `new X()` with a
+                    // loud `ctor_arity` (MLC vs CoreLib
+                    // `System.DefaultBinder`). Preserve it as an
+                    // explicit empty-body ctor (indistinguishable from
+                    // a source-written `X() { }`). Pure same-assembly
+                    // partials (no provenance flag) never take this
+                    // path: splitting ctors across parts is normal
+                    // there, and `new X()` stays an error as C#
+                    // requires.
+                    let name = existing.decl.name.clone();
+                    existing.decl.members.push(crate::models::ClassMember::Method(
+                        crate::models::MethodDecl {
+                            access: crate::models::Access::Internal,
+                            attrs: Vec::new(),
+                            generic_params: Vec::new(),
+                            ret_type: String::new(),
+                            name,
+                            params: Vec::new(),
+                            body: Some(crate::models::Block {
+                                stmts: Vec::new(),
+                                span: crate::models::Span::default(),
+                            }),
+                            span: crate::models::Span::default(),
+                            is_override: false,
+                            is_static: false,
+                            is_abstract: false,
+                            is_partial: false,
+                            is_extern: false,
+                            is_async: false,
+                            base_call: None,
+                        },
+                    ));
+                }
             } else {
                 errors.push(err(
                     "E0013",
@@ -876,7 +951,12 @@ pub fn analyze_with_preloaded(
             let crate::models::ClassMember::Method(method) = member else {
                 continue;
             };
-            let attr = method.attrs.iter().find(|a| a.name == "LibraryImport");
+            let attr = method.attrs.iter().find(|a| {
+                // Attribute names may be qualified
+                // (`System.Runtime.InteropServices.LibraryImport`);
+                // match the simple name.
+                a.name.rsplit('.').next().unwrap_or(&a.name) == "LibraryImport"
+            });
             let Some(attr) = attr else {
                 if method.body.is_none()
                     && !method.is_abstract
@@ -1353,6 +1433,19 @@ pub fn analyze_with_preloaded(
     // Chains hold qualified keys; sources resolve by key (distinct
     // types never conflate, ending layout corruption from collisions).
     for (decl, res) in raw_classes.iter().zip(&resolved) {
+        // TEMP-CHAINDBG: audit base chains for misaligned entries.
+        // Removed before close.
+        if std::env::var("RUBYC_CHAINDBG").is_ok()
+            && (decl.decl.name.contains("Latin1Encoding")
+                || decl.decl.name.contains("UnicodeEncoding"))
+            && !decl.decl.name.contains("Sealed")
+        {
+            eprintln!(
+                "[rubyc] TEMP-CHAINDBG {} chain={:?}",
+                decl.decl.name,
+                res.chain.iter().map(|k| k.path.clone()).collect::<Vec<_>>()
+            );
+        }
         let mut fields: Vec<FieldInfo> = Vec::new();
         let mut static_fields: Vec<FieldInfo> = Vec::new();
         let mut const_fields: Vec<FieldInfo> = Vec::new();
@@ -1366,8 +1459,36 @@ pub fn analyze_with_preloaded(
             if let Some(bc) = raw_classes.iter().find(|c| &c.key() == base_key) {
                 field_sources.push((bc,));
             }
+            // TEMP-CHAINDBG2: audit key misses.
+            // Removed before close.
+            else if std::env::var("RUBYC_CHAINDBG").is_ok()
+                && (decl.decl.name.contains("Latin1Encoding")
+                    || decl.decl.name.contains("UnicodeEncoding"))
+                && !decl.decl.name.contains("Sealed")
+            {
+                eprintln!(
+                    "[rubyc] TEMP-CHAINDBG2 {} miss base_key={:?}",
+                    decl.decl.name, base_key
+                );
+            }
         }
         field_sources.push((decl,));
+        // TEMP-SRCDBG: audit member source order.
+        // Removed before close.
+        if std::env::var("RUBYC_CHAINDBG").is_ok()
+            && (decl.decl.name.contains("Latin1Encoding")
+                || decl.decl.name.contains("UnicodeEncoding"))
+            && !decl.decl.name.contains("Sealed")
+        {
+            eprintln!(
+                "[rubyc] TEMP-SRCDBG {} rawkey={:?} sources={:?} preloaded_n={} pre_same_name={:?}",
+                decl.decl.name,
+                decl.key(),
+                field_sources.iter().map(|(s,)| s.decl.name.clone()).collect::<Vec<_>>(),
+                preloaded.classes.len(),
+                preloaded.classes.iter().filter(|c| c.name.contains("Latin1Encoding") && !c.name.contains("Sealed")).map(|c| format!("{:?}", c.key)).collect::<Vec<_>>(),
+            );
+        }
 
         // Preloaded dependency members (chain order, verbatim copies):
         // the raw loop below then appends/updates own + raw-base
@@ -1410,9 +1531,12 @@ pub fn analyze_with_preloaded(
                     const_fields.push(f.clone());
                 }
                 for m in &pre.methods {
+                    // Byref-ness joins the key (see the raw loop below):
+                    // value-vs-`ref` twins share erased param types.
                     if methods.iter().any(|mi| {
                         mi.name == m.name
                             && mi.param_types == m.param_types
+                            && mi.param_is_byref == m.param_is_byref
                             && mi.declaring_class == m.declaring_class
                     }) {
                         continue;
@@ -1425,10 +1549,66 @@ pub fn analyze_with_preloaded(
                     {
                         existing.type_name = p.type_name.clone();
                         existing.access = p.access;
-                        existing.declaring_class = p.declaring_class.clone();
+                        // declaring_class keeps the first (most-derived)
+                        // declarer; see the raw loop above.
                         continue;
                     }
                     properties.push(p.clone());
+                }
+            }
+        }
+        // Canonical instance-field slot order (root-first): slot
+        // numbers must agree across every entry in a hierarchy
+        // (a base ctor stores via the base entry while reads use
+        // the derived entry). Chain order is direct-first, so
+        // positional numbering (`fields.len() + 2` below) puts the
+        // same field at different slots per entry (faulted
+        // `ConsoleStream._canWrite`: stored at slot 9 via the base
+        // entry, read at slot 3 via the derived entry). Pre-assign
+        // root-first here; the loop below uses these instead.
+        // Seeded with already-pushed preloaded (verbatim) fields so
+        // recomputed slots continue after them. Method, property,
+        // static, and const handling keep their existing
+        // direct-first order (override/hiding resolution depends on
+        // it); only instance slot numbers change. First occurrence
+        // wins, mirroring the loop's dedup.
+        let mut field_slot_order: Vec<String> = Vec::new();
+        for fi in &fields {
+            if !field_slot_order.iter().any(|n| n == &fi.name) {
+                field_slot_order.push(fi.name.clone());
+            }
+        }
+        {
+            let mut root_first: Vec<&ScopedClass> = Vec::new();
+            for base_key in res.chain.iter().rev() {
+                if let Some(bc) = raw_classes.iter().find(|c| &c.key() == base_key) {
+                    root_first.push(bc);
+                }
+            }
+            root_first.push(decl);
+            for src in root_first {
+                for m in &src.decl.members {
+                    match m {
+                        crate::models::ClassMember::Field(f)
+                            if !f.is_static && !f.is_const =>
+                        {
+                            if !field_slot_order.iter().any(|n| n == &f.name) {
+                                field_slot_order.push(f.name.clone());
+                            }
+                        }
+                        crate::models::ClassMember::Property(p)
+                            if p.get.is_none()
+                                && p.set.is_none()
+                                && p.get_expr.is_none()
+                                && !p.is_static
+                                && !p.is_abstract =>
+                        {
+                            if !field_slot_order.iter().any(|n| n == &p.name) {
+                                field_slot_order.push(p.name.clone());
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1470,6 +1650,30 @@ pub fn analyze_with_preloaded(
                                 .get(&(src.key(), f.name.clone()))
                                 .cloned()
                                 .map(|v| convert_const(v, &f.type_name));
+                            // TEMP-CONSTDIAG: audit resolution of time
+                            // consts (bisecting the FromUnits throw).
+                            // Removed before close.
+                            if std::env::var("RUBYC_CONSTDIAG").is_ok()
+                                && matches!(
+                                    f.name.as_str(),
+                                    "MinHours" | "MaxHours" | "MinTicks" | "MaxTicks"
+                                        | "MinValue" | "MaxValue" | "CACHE_LINE_SIZE"
+                                )
+                            {
+                            eprintln!(
+                                "[rubyc] TEMP-CONSTDIAG {}.{} = {:?}",
+                                decl.decl.name, f.name, const_value
+                            );
+                            // TEMP-KEYDBG. Removed before close.
+                            if std::env::var("RUBYC_CONSTDIAG").is_ok()
+                                && f.name.as_str() == "CACHE_LINE_SIZE"
+                            {
+                                eprintln!(
+                                    "[rubyc] TEMP-KEYDBG key={:?}",
+                                    decl.key()
+                                );
+                            }
+                            }
                             if const_value.is_none() {
                                 errors.push(err_help(
                                     "E0030",
@@ -1488,6 +1692,7 @@ pub fn analyze_with_preloaded(
                                 is_static: false,
                                 is_const: true,
                                 const_value,
+                                is_byref: false,
                                 declaring_class: src.decl.name.clone(),
                             });
                             continue;
@@ -1514,6 +1719,7 @@ pub fn analyze_with_preloaded(
                                 is_static: true,
                                 is_const: false,
                                 const_value: None,
+                                is_byref: false,
                                 declaring_class: src.decl.name.clone(),
                             });
                             continue;
@@ -1538,7 +1744,38 @@ pub fn analyze_with_preloaded(
                         // imm32), so arbitrarily many fields address
                         // correctly. (An old disp8-only cap lived here;
                         // removed once disp32 fallback was verified.)
-                        let offset_slots = fields.len() + 2; // slots 0-1: vtable + refcount
+                        //
+                        // Layout override: `String._stringLength` lives
+                        // at offset 0, not in a field slot. Our string
+                        // objects store the character count at +0
+                        // (vtable-less, refcount at +8, data at +16),
+                        // so every table-driven read of `_stringLength`
+                        // (direct field reads, inlined `Length`
+                        // getters) must use slot 0. Without this they
+                        // read slot 2 (+16, first data word) as the
+                        // length — e.g. `ToCharArray` on `"\n"` saw
+                        // length 10 (0x0A) instead of 1 and overran.
+                        let is_string_len = f.name == "_stringLength"
+                            && src
+                                .decl
+                                .name
+                                .rsplit('.')
+                                .next()
+                                .unwrap_or(&src.decl.name)
+                                == "String";
+                        let offset_slots = if is_string_len {
+                            0
+                        } else {
+                            // Canonical root-first slot (see
+                            // field_slot_order above); legacy
+                            // positional numbering on miss (unreachable
+                            // — same declarations feed both).
+                            field_slot_order
+                                .iter()
+                                .position(|n| n == &f.name)
+                                .map(|i| i + 2)
+                                .unwrap_or(fields.len() + 2)
+                        };
                         fields.push(FieldInfo {
                             name: f.name.clone(),
                             type_name: f.type_name.clone(),
@@ -1547,6 +1784,7 @@ pub fn analyze_with_preloaded(
                             is_static: false,
                             is_const: false,
                             const_value: None,
+                            is_byref: f.is_byref,
                             declaring_class: src.decl.name.clone(),
                         });
                     }
@@ -1569,7 +1807,27 @@ pub fn analyze_with_preloaded(
                         {
                             existing.type_name = p.type_name.clone();
                             existing.access = p.access;
-                            existing.declaring_class = src.decl.name.clone();
+                            // declaring_class follows the nearest EXPLICIT
+                            // provider (bodies inline from there): sources
+                            // run base-first with own last, so
+                            // unconditional overwrite lands on base-most
+                            // (bodyless abstract), breaking
+                            // declarer-relative resolution inside inlined
+                            // bodies (private base fields read as
+                            // undeclared, faulting `Stream.CanWrite`
+                            // arms to zero). Only an explicit incoming
+                            // body re-points the declarer.
+                            if p.get.is_some()
+                                || p.set.is_some()
+                                || p.get_expr.is_some()
+                            {
+                                existing.declaring_class = src.decl.name.clone();
+                            }
+                            // Abstractness clears on concrete override
+                            // (derived entries must not read abstract):
+                            // only a bodyless-abstract incoming keeps it.
+                            existing.is_abstract =
+                                existing.is_abstract && p.is_abstract;
                         } else {
                             properties.push(PropertyInfo {
                                 name: p.name.clone(),
@@ -1577,17 +1835,58 @@ pub fn analyze_with_preloaded(
                                 access: p.access,
                                 declaring_class: src.decl.name.clone(),
                                 is_static: p.is_static,
+                                is_abstract: p.is_abstract,
                             });
                         }
                         if p.get.is_some() || p.set.is_some() || p.get_expr.is_some() {
                             continue;
                         }
+                        // Abstract properties declare no storage (their
+                        // body-less accessors are not auto-properties):
+                        // synthesizing a backing field shifts every
+                        // later instance offset.
+                        if p.is_abstract {
+                            continue;
+                        }
                         if fields.iter().any(|fi| fi.name == p.name) {
+                            continue;
+                        }
+                        // Static auto-properties (`static T X { get; …
+                        // }`) back into STATIC storage (real slots,
+                        // zero-initialized — initializers are ignored,
+                        // matching instance auto-props whose inits never
+                        // run either). Instance backing fields must NOT
+                        // serve statics (reads fault off a null
+                        // receiver); statics must NOT occupy object
+                        // layout (they'd shift instance offsets).
+                        if p.is_static {
+                            if static_fields.iter().any(|fi| fi.name == p.name) {
+                                continue;
+                            }
+                            static_fields.push(FieldInfo {
+                                name: p.name.clone(),
+                                type_name: p.type_name.clone(),
+                                access: p.access,
+                                offset_slots: 0,
+                                is_static: true,
+                                is_const: false,
+                                const_value: None,
+                                is_byref: false,
+                                declaring_class: src.decl.name.clone(),
+                            });
                             continue;
                         }
                         // No field-count cap (see instance-field case above:
                         // disp32 fallback covers large offsets).
-                        let offset_slots = fields.len() + 2; // slots 0-1: vtable + refcount
+                        // (Static auto-properties return above into
+                        // static storage; only instance props reach here.)
+                        // Canonical root-first slot (see
+                        // field_slot_order above).
+                        let offset_slots = field_slot_order
+                            .iter()
+                            .position(|n| n == &p.name)
+                            .map(|i| i + 2)
+                            .unwrap_or(fields.len() + 2); // slots 0-1: vtable + refcount
                         fields.push(FieldInfo {
                             name: p.name.clone(),
                             type_name: p.type_name.clone(),
@@ -1596,6 +1895,9 @@ pub fn analyze_with_preloaded(
                             is_static: false,
                             is_const: false,
                             const_value: None,
+                            // Auto-properties are never `ref` (ref
+                            // properties carry bodies and return above).
+                            is_byref: false,
                             declaring_class: src.decl.name.clone(),
                         });
                     }
@@ -1624,15 +1926,37 @@ pub fn analyze_with_preloaded(
                             .iter()
                             .map(|p| p.type_name.clone())
                             .collect();
+                        // Byref-ness joins the key: value-vs-`ref` twins
+                        // (`WriteAtOffset(h, buf, off)` vs `(…, ref off)`)
+                        // share erased param types — dropping the second
+                        // stranded every `ref`-marked call on the value
+                        // twin (the forwarder electing itself, recursing
+                        // forever on identical args).
+                        let param_byref: Vec<bool> =
+                            m.params.iter().map(|p| p.is_byref).collect();
                         if methods.iter().any(|mi| {
                             mi.name == m.name
                                 && mi.param_types == param_types
+                                && mi.param_is_byref == param_byref
                                 && mi.declaring_class == src.decl.name
                                 && mi.generic_params.len() == m.generic_params.len()
                         }) {
                             continue;
                         }
                         let slot = methods.len();
+                        // TEMP-PUSHDBG: audit push order.
+                        // Removed before close.
+                        if std::env::var("RUBYC_CHAINDBG").is_ok()
+                            && (decl.decl.name.contains("Latin1Encoding")
+                                || decl.decl.name.contains("UnicodeEncoding"))
+                            && !decl.decl.name.contains("Sealed")
+                            && (methods.len() < 3 || m.name.contains("SetDefaultFallbacks") || m.name == "GetType")
+                        {
+                            eprintln!(
+                                "[rubyc] TEMP-PUSHDBG {} src={} srckey={:?} method={} slot={}",
+                                decl.decl.name, src.decl.name, src.key(), m.name, slot
+                            );
+                        }
                         // Optional parameters (`void M(int x = 5)`): fold
                         // each default now (const/enum refs resolve via the
                         // fixpoint table, scoped to the DECLARING class)
@@ -1666,6 +1990,7 @@ pub fn analyze_with_preloaded(
                             // `params` is always last by language rules;
                             // any flagged param marks the method.
                             has_params: m.params.iter().any(|p| p.is_params),
+                            param_is_byref: m.params.iter().map(|p| p.is_byref).collect(),
                             param_defaults,
                             access: m.access,
                             is_static: m.is_static,
@@ -1678,7 +2003,12 @@ pub fn analyze_with_preloaded(
                             // `[Conditional("SYM")]`: calls omit unless
                             // `SYM` is defined (C# release semantics).
                             conditional_symbol: m.attrs.iter().find_map(|a| {
-                                if a.name != "Conditional" {
+                                // Qualified form
+                                // (`System.Diagnostics.Conditional`)
+                                // matches like the simple name.
+                                if a.name.rsplit('.').next().unwrap_or(&a.name)
+                                    != "Conditional"
+                                {
                                     return None;
                                 }
                                 a.arguments.first().and_then(|arg| match &arg.value {
@@ -1813,7 +2143,23 @@ pub fn analyze_with_preloaded(
             fields,
             static_fields,
             const_fields,
-            methods,
+            methods: {
+                // TEMP-METHDBG: audit methods order at push.
+                // Removed before close.
+                if std::env::var("RUBYC_CHAINDBG").is_ok()
+                    && (decl.decl.name.contains("Latin1Encoding")
+                        || decl.decl.name.contains("UnicodeEncoding"))
+                    && !decl.decl.name.contains("Sealed")
+                {
+                    eprintln!(
+                        "[rubyc] TEMP-METHDBG {} nmethods={} first3={:?}",
+                        decl.decl.name,
+                        methods.len(),
+                        methods.iter().take(3).map(|m| m.name.clone()).collect::<Vec<_>>()
+                    );
+                }
+                methods
+            },
             own_members,
             interfaces: implemented,
             properties,
@@ -1824,6 +2170,138 @@ pub fn analyze_with_preloaded(
             // complete table for parent-chain inheritance).
             owner: String::new(),
         });
+    }
+
+    // ---- pass 3vtable: vtable slot reconciliation.
+    // Per-entry positional slots misalign across inheritance: a base
+    // method sits at different positions in base vs derived entries
+    // (e.g. `Encoding.SetDefaultFallbacks` at 35 vs
+    // `Latin1Encoding`'s own method at 35), so cross-class virtual
+    // dispatch lands in unrelated bodies. Reassign slots base-first:
+    // each (name, signature) keeps its base entry's slot (overrides
+    // share it — our dispatch is always virtual, so hides behave as
+    // overrides consistently); new methods take fresh slots after
+    // the inherited max. `methods[]` ORDER is untouched (only slot
+    // VALUES change), so overload resolution and selection are
+    // unaffected. Processed base-first via memoized recursion
+    // (cycles keep positional slots as fallback).
+    {
+        fn sig_of(m: &MethodInfo) -> (String, String, usize) {
+            (
+                m.name.clone(),
+                m.param_types.join(","),
+                m.generic_params.len(),
+            )
+        }
+        fn base_index(table: &TypeTable, cls: &ClassInfo) -> Option<usize> {
+            // Primary class base: first base resolving to a table
+            // class, preferring the same namespace (nested and
+            // cross-namespace same-names must not alias). Interfaces
+            // resolve to no table class and are skipped naturally.
+            // TEMP-BASEDBG. Removed before close.
+            let dbg = std::env::var("RUBYC_CHAINDBG").is_ok()
+                && (cls.name.contains("Latin1Encoding") || cls.name.contains("UnicodeEncoding"))
+                && !cls.name.contains("Sealed");
+            let ns = cls
+                .key
+                .path
+                .rsplit_once('.')
+                .map(|(n, _)| n)
+                .unwrap_or("");
+            let mut fallback: Option<usize> = None;
+            for b in &cls.bases {
+                for (i, c) in table.classes.iter().enumerate() {
+                    if c.key.simple_name() != *b && c.name != *b {
+                        continue;
+                    }
+                    if c.key.path.rsplit_once('.').map(|(n, _)| n).unwrap_or("") == ns {
+                        if dbg {
+                            eprintln!("[rubyc] TEMP-BASEDBG {} base {b} -> {}", cls.name, c.key.path);
+                        }
+                        return Some(i);
+                    }
+                    fallback.get_or_insert(i);
+                }
+            }
+            if dbg {
+                eprintln!("[rubyc] TEMP-BASEDBG {} fallback={:?}", cls.name, fallback.map(|i| table.classes[i].key.path.clone()));
+            }
+            fallback
+        }
+        fn assign(
+            table: &mut TypeTable,
+            idx: usize,
+            stack: &mut Vec<String>,
+        ) {
+            let key = table.classes[idx].key.path.clone();
+            if stack.contains(&key) {
+                return; // cycle: keep positional slots
+            }
+            stack.push(key.clone());
+            if let Some(bi) = base_index(table, &table.classes[idx].clone()) {
+                assign(table, bi, stack);
+            }
+            // Inherited slot map from the (now final) base entry.
+            let inherited: std::collections::BTreeMap<
+                (String, String, usize),
+                usize,
+            > = match base_index(table, &table.classes[idx].clone()) {
+                Some(bi) => table.classes[bi]
+                    .methods
+                    .iter()
+                    .map(|m| (sig_of(m), m.vtable_slot))
+                    .collect(),
+                None => Default::default(),
+            };
+            // TEMP-SLOTDBG. Removed before close.
+            if std::env::var("RUBYC_CHAINDBG").is_ok()
+                && (table.classes[idx].name.contains("Latin1Encoding")
+                    || table.classes[idx].name.contains("UnicodeEncoding"))
+                && !table.classes[idx].name.contains("Sealed")
+            {
+                eprintln!(
+                    "[rubyc] TEMP-SLOTDBG {} inherited_n={} maxslot={:?}",
+                    table.classes[idx].name,
+                    inherited.len(),
+                    inherited.values().copied().max()
+                );
+            }
+            let mut next =
+                inherited.values().copied().max().map(|m| m + 1).unwrap_or(0);
+            // TEMP-SLOTMAP. Removed before close.
+            let mapdbg = std::env::var("RUBYC_CHAINDBG").is_ok()
+                && (table.classes[idx].name.contains("Latin1Encoding"))
+                && !table.classes[idx].name.contains("Sealed");
+            let cls = &mut table.classes[idx];
+            for m in cls.methods.iter_mut() {
+                if let Some(&s) = inherited.get(&sig_of(m)) {
+                    if mapdbg {
+                        eprintln!(
+                            "[rubyc] TEMP-SLOTMAP HIT {} params={:?} {} -> {}",
+                            m.name, m.param_types, m.vtable_slot, s
+                        );
+                    }
+                    m.vtable_slot = s;
+                } else {
+                    if mapdbg && m.vtable_slot < 40 {
+                        eprintln!(
+                            "[rubyc] TEMP-SLOTMAP MISS {} params={:?} stays {}",
+                            m.name, m.param_types, m.vtable_slot
+                        );
+                    }
+                    m.vtable_slot = next;
+                    next += 1;
+                }
+            }
+            stack.pop();
+        }
+        // NOTE: `table.classes` grows below (enums); reconcile only
+        // the classes built so far (enums clone Object's list verbatim
+        // and stay consistent automatically).
+        let n = table.classes.len();
+        for idx in 0..n {
+            assign(&mut table, idx, &mut Vec::new());
+        }
     }
 
     // ---- pass 3b: register enums as const-field types.
@@ -1856,6 +2334,7 @@ pub fn analyze_with_preloaded(
                 is_static: false,
                 is_const: true,
                 const_value: Some(ConstValue::Int(value)),
+                is_byref: false,
                 declaring_class: e.name.clone(),
             });
         }

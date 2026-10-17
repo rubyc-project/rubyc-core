@@ -22,27 +22,29 @@
 //!   name, key.path, key.arity u32, owner, bases[u32 n, strings]
 //!   fields/static_fields/const_fields: u32 n, each:
 //!     name, type_name, access byte, offset_slots u64,
-//!     is_static/is_const bytes, const_value (tag byte +
+//!     is_static/is_const/is_byref bytes, const_value (tag byte +
 //!     payload: 0 none, 1 Int i64, 2 Float u64 bits, 3 Str, 4 Null),
 //!     declaring_class
 //!   methods: u32 n, each:
 //!     name, ret_type, param_types[], param_has_default bytes[],
-//!     has_params byte, param_defaults[] (const_value each),
-//!     access byte, is_static/has_body/is_extension bytes,
+//!     has_params byte, param_is_byref bytes[], param_defaults[]
+//!     (const_value each), access byte,
+//!     is_static/has_body/is_extension bytes,
 //!     declaring_class, generic_params[], conditional_symbol
 //!     (present byte + string), vtable_slot u32
 //!   own_members: u32 n, each (name, is_field byte, access byte)
 //!   interfaces: u32 n, each (name, arity u32)
 //!   properties: u32 n, each
-//!     (name, type_name, access byte, declaring_class, is_static byte)
+//!   (name, type_name, access byte, declaring_class, is_static byte,
+//!   is_abstract byte)
 //!   is_enum/is_struct bytes, generic_params[]
 //! interfaces: u32 n, each:
 //!   name, generic_params[], methods[] (access, ret, name, generics,
-//!   params[] (type, name, is_this, is_params), is_static),
+//!   params[] (type, name, is_this, is_params, is_byref), is_static),
 //!   bases[], arity u32
 //! delegates: u32 n, each:
 //!   access byte, ret_type, name, generic_params[],
-//!   params[] (type, name, is_this, is_params)
+//!   params[] (type, name, is_this, is_params, is_byref)
 //! ```
 //!
 //! Decode lives here too (used by the consume path); both must stay in
@@ -54,7 +56,7 @@ use crate::native::semantic::{
     ClassInfo, ConstValue, FieldInfo, MethodInfo, PropertyInfo,
 };
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 5;
 const MAGIC: &[u8; 4] = b"RCI1";
 
 fn access_byte(a: Access) -> u8 {
@@ -144,6 +146,7 @@ impl Writer {
         self.u64(f.offset_slots as u64);
         self.u8(u8::from(f.is_static));
         self.u8(u8::from(f.is_const));
+        self.u8(u8::from(f.is_byref));
         self.const_value(&f.const_value);
         self.string(&f.declaring_class);
     }
@@ -157,6 +160,10 @@ impl Writer {
             self.u8(u8::from(*b));
         }
         self.u8(u8::from(m.has_params));
+        self.u32(m.param_is_byref.len() as u32);
+        for b in &m.param_is_byref {
+            self.u8(u8::from(*b));
+        }
         self.u32(m.param_defaults.len() as u32);
         for d in &m.param_defaults {
             self.const_value(d);
@@ -183,6 +190,7 @@ impl Writer {
         self.access(p.access);
         self.string(&p.declaring_class);
         self.u8(u8::from(p.is_static));
+        self.u8(u8::from(p.is_abstract));
     }
 
     fn param(&mut self, p: &Param) {
@@ -190,6 +198,7 @@ impl Writer {
         self.string(&p.name);
         self.u8(u8::from(p.is_this));
         self.u8(u8::from(p.is_params));
+        self.u8(u8::from(p.is_byref));
     }
 
     fn method_sig(&mut self, m: &MethodSig) {
@@ -382,6 +391,7 @@ impl<'a> Reader<'a> {
         let offset_slots = self.u64() as usize;
         let is_static = self.u8() != 0;
         let is_const = self.u8() != 0;
+        let is_byref = self.u8() != 0;
         let const_value = self.const_value();
         let declaring_class = self.string();
         FieldInfo {
@@ -391,6 +401,7 @@ impl<'a> Reader<'a> {
             offset_slots,
             is_static,
             is_const,
+            is_byref,
             const_value,
             declaring_class,
         }
@@ -403,6 +414,8 @@ impl<'a> Reader<'a> {
         let n = self.u32() as usize;
         let param_has_default = (0..n).map(|_| self.u8() != 0).collect();
         let has_params = self.u8() != 0;
+        let n = self.u32() as usize;
+        let param_is_byref = (0..n).map(|_| self.u8() != 0).collect();
         let n = self.u32() as usize;
         let param_defaults = (0..n).map(|_| self.const_value()).collect();
         let access = self.access();
@@ -423,6 +436,7 @@ impl<'a> Reader<'a> {
             param_types,
             param_has_default,
             has_params,
+            param_is_byref,
             param_defaults,
             access,
             is_static,
@@ -441,12 +455,14 @@ impl<'a> Reader<'a> {
         let access = self.access();
         let declaring_class = self.string();
         let is_static = self.u8() != 0;
+        let is_abstract = self.u8() != 0;
         PropertyInfo {
             name,
             type_name,
             access,
             declaring_class,
             is_static,
+            is_abstract,
         }
     }
 
@@ -455,6 +471,7 @@ impl<'a> Reader<'a> {
         let name = self.string();
         let is_this = self.u8() != 0;
         let is_params = self.u8() != 0;
+        let is_byref = self.u8() != 0;
         Param {
             type_name,
             name,
@@ -462,6 +479,7 @@ impl<'a> Reader<'a> {
             default_value: None,
             is_this,
             is_params,
+            is_byref,
         }
     }
 

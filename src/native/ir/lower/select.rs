@@ -42,13 +42,76 @@ pub(super) fn materialize_defaults(
                 dst
             }
             Some(ConstValue::Str(s)) => {
-                let (off, len) = b.string_literal(s);
-                b.build_string(off, len)
+                let (off, len) = b.utf16_literal(s);
+                b.build_utf16_string(off, len)
             }
             Some(ConstValue::Null) => b.const_i64(0),
             None => b.const_i64(0),
         };
         argv.push(v);
+    }
+}
+
+/// Implicit numeric conversion table (C# widening conversions over
+/// canonical spellings), plus two deliberate latitudes:
+///
+/// * Integral↔integral stays blanket-applicable (score 1, legacy):
+///   C# allows int *constants* into smaller targets when the value
+///   fits (`ShiftRightBytesInVector(x, 8)` into a `byte` param), and
+///   arg types here carry no values to check fit. Rejecting would
+///   break valid code; narrowing variables keep 64-bit values at
+///   runtime (truncation divergence — same long-standing gap as
+///   narrowing casts, which stay representation no-ops).
+/// * `Double → Single` stays applicable (score 1): the lexer erases
+///   float suffixes, so a `double`-spelled literal may genuinely be
+///   a `float` (`24.0f`).
+///
+/// Everything else narrowing out of a floating source
+/// (`Double → Int32`, `Single → Int64`, float → `Decimal`) is
+/// inapplicable, so overload ranking elects exact matches instead
+/// of silently reinterpreting (`FromHours(24.0)` picked `(int)`
+/// over `(double)` and hashed the bit pattern).
+fn implicit_numeric(a: &str, p: &str) -> bool {
+    if a == p {
+        return true;
+    }
+    const INTEGRAL: &[&str] = &[
+        "SByte", "Byte", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64", "Char",
+        "IntPtr", "UIntPtr",
+    ];
+    if INTEGRAL.contains(&a) && INTEGRAL.contains(&p) {
+        return true;
+    }
+    match (a, p) {
+        (_, "Double") => matches!(
+            a,
+            "SByte" | "Byte" | "Int16" | "UInt16" | "Int32" | "UInt32" | "Int64" | "UInt64"
+                | "Char" | "Single"
+        ),
+        (_, "Single") => {
+            matches!(
+                a,
+                "SByte" | "Byte" | "Int16" | "UInt16" | "Int32" | "UInt32" | "Int64" | "UInt64"
+                    | "Char"
+            ) || a == "Double"
+        }
+        (_, "Decimal") => matches!(
+            a,
+            "SByte" | "Byte" | "Int16" | "UInt16" | "Int32" | "UInt32" | "Int64" | "UInt64"
+                | "Char"
+        ),
+        (_, "Int64") => matches!(a, "SByte" | "Byte" | "Int16" | "UInt16" | "Int32" | "UInt32" | "Char" | "IntPtr"),
+        (_, "UInt64") => matches!(a, "Byte" | "UInt16" | "UInt32" | "Char" | "UIntPtr"),
+        (_, "Int32") => matches!(a, "SByte" | "Byte" | "Int16" | "UInt16" | "Char"),
+        (_, "UInt32") => matches!(a, "Byte" | "UInt16" | "Char"),
+        (_, "Int16") => matches!(a, "SByte" | "Byte"),
+        (_, "UInt16") => matches!(a, "Byte" | "Char"),
+        (_, "IntPtr") => matches!(
+            a,
+            "SByte" | "Byte" | "Int16" | "UInt16" | "Int32" | "UInt32" | "Int64" | "Char"
+        ),
+        (_, "UIntPtr") => matches!(a, "Byte" | "UInt16" | "UInt32" | "UInt64" | "Char"),
+        _ => false,
     }
 }
 
@@ -67,6 +130,18 @@ pub(super) fn compat_score(arg: &str, param: &str, table: &TypeTable, vars: &[St
     if arg == param {
         return Some(0);
     }
+    // Call-site `ref`/`in` markers (parser `&`-wrap): conversions
+    // judge the INNER type (byref-ness itself is enforced by the
+    // caller — `rank_candidates`/`legacy_pick` require byref params
+    // for marked args). Without this every marked arg degrades to
+    // inapplicable and the twin never ranks.
+    let arg_owned;
+    let arg: &str = if let Some(inner) = arg.strip_suffix('&') {
+        arg_owned = inner.to_owned();
+        &arg_owned
+    } else {
+        arg
+    };
     // Discards (`out _`): applicable to any parameter without
     // influencing the ranking (they carry no type information).
     if arg == "_" {
@@ -191,12 +266,15 @@ pub(super) fn compat_score(arg: &str, param: &str, table: &TypeTable, vars: &[St
     if a_arr != p_arr {
         return None;
     }
-    const NUM: &[&str] = &[
-        "sbyte", "byte", "short", "ushort", "int", "uint", "long", "ulong", "nint", "nuint",
-        "char", "float", "double", "decimal", "SByte", "Byte", "Int16", "UInt16", "Int32",
-        "UInt32", "Int64", "UInt64", "IntPtr", "UIntPtr", "Char", "Single", "Double", "Decimal",
-    ];
-    if NUM.contains(&a_base.as_str()) && NUM.contains(&p_base.as_str()) {
+    // Implicit numeric conversions (C# spec: widening only). The old
+    // blanket "any numeric to any numeric" latitude mis-selected
+    // overloads (`FromHours(24.0)` picked `(int)` over `(double)`)
+    // and hid narrowing bugs. `double → float` stays applicable: the
+    // lexer erases float suffixes, so a `double`-spelled literal may
+    // genuinely be a `float` (`24.0f`); without this, float call
+    // sites with literals would stop resolving. (Spelling here is
+    // canonical: `Double`, `Int32`, … — see `canonical_primitive`.)
+    if implicit_numeric(&a_base, &p_base) {
         return Some(1);
     }
     if table.derives_from(&a_base, &p_base)
@@ -247,6 +325,14 @@ pub(super) fn compat_score(arg: &str, param: &str, table: &TypeTable, vars: &[St
             if op_base == a_simple {
                 return true;
             }
+            // Operators are inherited like any member: an operator on a
+            // base class applies to derived arguments (`ErrArg`'s
+            // `implicit operator ErrArg(SymWithType)` accepts a
+            // `PropWithType`, used for `params ErrArg[]` args in CSharp's
+            // ErrorHandling). Interfaces do not carry operators.
+            if table.derives_from(&a_simple, &op_base) {
+                return true;
+            }
             let bare = op_param.trim().trim_end_matches('?');
             bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && bare.chars().next().is_some_and(|c| c.is_ascii_uppercase())
@@ -286,19 +372,31 @@ pub(super) fn rank_candidates<'m>(
     class_vars: &[String],
 ) -> Option<&'m MethodInfo> {
     // Tier 1: exact arity, applicable, best score.
-    let mut best: Option<(&MethodInfo, u32)> = None;
+    let mut best: Option<(&MethodInfo, (usize, std::cmp::Reverse<u32>))> = None;
     for m in cands {
+        // Byref alignment first: a marked (`T&`) argument never
+        // binds a by-value parameter (see `byref_applicable`).
+        if !byref_applicable(m, arg_types, recv_skip) {
+            continue;
+        }
         let mut vars = m.generic_params.clone();
         vars.extend(class_vars.iter().cloned());
         if let Some((s, true)) =
             score_call(&m.param_types, arg_types, recv_skip, table, &vars, m.has_params)
         {
+            // Marked args prefer byref homes (more hits win; score
+            // breaks ties). Unmarked calls score hits 0=0 and keep
+            // legacy order exactly.
+            let key = (
+                byref_hits(m, arg_types, recv_skip),
+                std::cmp::Reverse(s),
+            );
             let better = match &best {
                 None => true,
-                Some((_, bs)) => s < *bs,
+                Some((_, bk)) => key > *bk,
             };
             if better {
-                best = Some((*m, s));
+                best = Some((*m, key));
             }
         }
     }
@@ -307,8 +405,11 @@ pub(super) fn rank_candidates<'m>(
     }
     // Tier 2: defaults-fillable (or params-expanded), given args
     // applicable — best score, then fewest params.
-    let mut best2: Option<(&MethodInfo, (u32, usize))> = None;
+    let mut best2: Option<(&MethodInfo, ((std::cmp::Reverse<usize>, u32), usize))> = None;
     for m in cands {
+        if !byref_applicable(m, arg_types, recv_skip) {
+            continue;
+        }
         let len = m.param_types.len();
         let mut vars = m.generic_params.clone();
         vars.extend(class_vars.iter().cloned());
@@ -325,7 +426,13 @@ pub(super) fn rank_candidates<'m>(
         {
             continue;
         }
-        let key = (s, len);
+        let key = (
+            (
+                std::cmp::Reverse(byref_hits(m, arg_types, recv_skip)),
+                s,
+            ),
+            len,
+        );
         let better = match &best2 {
             None => true,
             Some((_, bk)) => key < *bk,
@@ -335,6 +442,72 @@ pub(super) fn rank_candidates<'m>(
         }
     }
     best2.map(|(m, _)| m)
+}
+
+/// Byref applicability (C# `ref`/`in` overload resolution): a marked
+/// (`T&`) argument requires a byref parameter — it never binds a
+/// by-value one (the `WriteAtOffset(handle, buf, ref off)` forwarder
+/// self-elected its own value twin and overflowed the stack on
+/// identical args). Unmarked args keep legacy leniency both ways
+/// (`out` markers were always erased, and `&x` interop passes
+/// addresses to `IntPtr` value params — the address-sink exception
+/// below). `recv_skip` aligns args to params (see `score_call`).
+fn byref_applicable(m: &MethodInfo, arg_types: &[String], recv_skip: usize) -> bool {
+    for (i, a) in arg_types.iter().enumerate() {
+        if !a.trim_end().ends_with('&') {
+            continue;
+        }
+        let pi = i + recv_skip;
+        if m.param_is_byref.get(pi).copied().unwrap_or(false) {
+            continue;
+        }
+        let p = m.param_types.get(pi).map(String::as_str).unwrap_or("");
+        if !is_addr_sink_type(p) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Count of marked (`T&`) args landing on byref params (ranking
+/// preference; zero for all legacy unmarked calls, preserving their
+/// order exactly).
+fn byref_hits(m: &MethodInfo, arg_types: &[String], recv_skip: usize) -> usize {
+    let mut hits = 0usize;
+    for (i, a) in arg_types.iter().enumerate() {
+        if !a.trim_end().ends_with('&') {
+            continue;
+        }
+        let pi = i + recv_skip;
+        if m.param_is_byref.get(pi).copied().unwrap_or(false) {
+            hits += 1;
+        }
+    }
+    hits
+}
+
+/// Integer address sinks: explicit `&x` passes addresses to these
+/// value params (interop escape hatch — refs erase to ints). Same
+/// set the SafeHandle marshaling uses, plus the framework aliases —
+/// plus POINTER params (`&x` to `double*` is the entire `SinCos`
+/// shape; without this the marked call misses and the build fails
+/// where legacy object-leniency used to elect).
+fn is_addr_sink_type(p: &str) -> bool {
+    matches!(
+        base_type_name(p).as_str(),
+        "IntPtr"
+            | "UIntPtr"
+            | "nint"
+            | "nuint"
+            | "int"
+            | "uint"
+            | "long"
+            | "ulong"
+            | "Int32"
+            | "UInt32"
+            | "Int64"
+            | "UInt64"
+    ) || is_pointer_ty(p)
 }
 
 /// Applicability score of explicit args against effective parameter
@@ -347,7 +520,7 @@ pub(super) fn rank_candidates<'m>(
 /// MethodDef, MemberRef)` vs `(int, TableIndex[])`); a single trailing
 /// arg also tries the array type itself (normal form). Expanded calls
 /// never count as exact arity (C# prefers the normal form).
-pub(super) fn score_call(
+pub(crate) fn score_call(
     params: &[String],
     arg_types: &[String],
     recv_skip: usize,
@@ -588,6 +761,11 @@ pub(super) fn legacy_pick<'m>(
 ) -> Option<&'m MethodInfo> {
     let mut best: Option<(&MethodInfo, (usize, u32))> = None;
     for m in cands {
+        // Byref alignment (see `byref_applicable`): marked args never
+        // bind by-value params, even in the fail-open fallback.
+        if !byref_applicable(m, arg_types, 0) {
+            continue;
+        }
         let mut hard = 0usize;
         let mut soft = 0u32;
         for (a, p) in arg_types.iter().zip(m.param_types.iter()) {
@@ -616,12 +794,41 @@ pub(super) fn legacy_pick<'m>(
 /// misses them.
 pub(super) fn entries_for<'t>(table: &'t TypeTable, type_name: &str) -> Vec<&'t ClassInfo> {
     let mut out: Vec<&ClassInfo> = Vec::new();
+    // Generic-instantiation spellings (`new TupleSlim<A,B,C>`,
+    // `Task<VoidTaskResult>`) match same-bare-named entries: strip
+    // generic arguments BEFORE the simple-name split (type args
+    // contain dots — splitting first mangles to garbage like
+    // `...Needle,FalseConst>`). Legacy order throughout
+    // (first-match first).
+    let (base_path, _) = crate::native::semantic::split_arity(type_name);
+    let simple = base_path
+        .rsplit('.')
+        .next()
+        .unwrap_or(base_path.as_str());
+    // Dedupe by table INDEX, not by key: same-key entries are distinct
+    // types (cross-assembly collisions like MLC vs CoreLib
+    // `System.DefaultBinder` share one key path; owners are empty
+    // alike in pure-source builds, so owner can't split them either).
+    // Staged exact twins never co-register (only `.rc` sources
+    // compile), so every same-named entry here is a genuine
+    // candidate construction must try.
+    let mut seen: Vec<usize> = Vec::new();
     if let Some(info) = table.class(type_name) {
-        out.push(info);
+        if let Some(idx) = table.classes.iter().position(|c| {
+            c.key == info.key && c.owner == info.owner && c.name == info.name
+        }) {
+            seen.push(idx);
+            out.push(info);
+        }
     }
-    let simple = type_name.rsplit('.').next().unwrap_or(type_name);
-    for c in table.classes.iter().filter(|c| c.name == simple) {
-        if !out.iter().any(|e| e.key == c.key) {
+    for (idx, c) in table
+        .classes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.name == simple)
+    {
+        if !seen.contains(&idx) {
+            seen.push(idx);
             out.push(c);
         }
     }
@@ -669,6 +876,16 @@ pub(super) fn select_visible<'t>(
     explicit_arity: Option<usize>,
 ) -> Option<&'t MethodInfo> {
     let mut first_hit: Option<&MethodInfo> = None;
+    // Best visible pick across entries (exact arity first, then
+    // lowest score; ties keep declaration order): first-visible
+    // alone misroutes when an earlier entry offers a merely
+    // applicable overload and a later entry the exact one (`new
+    // Task<VoidTaskResult>(false, ...)` picked non-generic
+    // `Task(Action<object?>, ...)` over the generic `(bool, ...)`
+    // 4-arg, leaving `m_stateFlags` zero and `IsCompleted` false).
+    // Scores recompute here (pick_overload doesn't return them);
+    // same inputs, so same result it ranked by internally.
+    let mut best: Option<(&MethodInfo, (bool, std::cmp::Reverse<u32>))> = None;
     for &info in entries.iter() {
         if let Some(m) = pick_overload(
             info,
@@ -688,9 +905,25 @@ pub(super) fn select_visible<'t>(
                 &m.declaring_class,
                 viewer,
             ) {
-                return Some(m);
+                let mut vars = m.generic_params.clone();
+                vars.extend(info.generic_params.iter().cloned());
+                if let Some((s, exact)) =
+                    score_call(&m.param_types, arg_types, 0, table, &vars, m.has_params)
+                {
+                    let key = (exact, std::cmp::Reverse(s));
+                    let better = match &best {
+                        None => true,
+                        Some((_, bk)) => key > *bk,
+                    };
+                    if better {
+                        best = Some((m, key));
+                    }
+                }
             }
         }
+    }
+    if let Some((m, _)) = best {
+        return Some(m);
     }
     first_hit
 }
@@ -836,6 +1069,32 @@ pub(super) fn normalize_type_ref(table: &TypeTable, t: &str) -> String {
     dotted.rsplit('.').next().unwrap_or(&dotted).to_owned()
 }
 
+/// Array element type for shape dispatch, tolerating a trailing
+/// nullable annotation on the ARRAY itself (`byte[]?` → `byte`;
+/// `int?[]` keeps its nullable element `int?`; non-arrays yield
+/// `None`). Bare `ends_with("[]")` checks go blind on nullable
+/// arrays (`char[]?` fields like StreamWriter's `_charBuffer` took
+/// the wrong stride/path everywhere), so array-shape sites use
+/// this. The `?` strip applies only to a `?` following `]` —
+/// element nullability is preserved.
+pub(super) fn array_elem_ty(ty: &str) -> Option<String> {
+    // Call-site `ref`/`in` markers ride as a trailing `&`: see
+    // through to the array shape (a `ref arr` still indexes).
+    let t = ty.trim().strip_suffix('&').map(str::trim).unwrap_or(ty.trim());
+    let t = t.strip_suffix('?').filter(|s| s.trim_end().ends_with(']')).map(str::trim).unwrap_or(t);
+    t.strip_suffix("[]").map(|e| e.trim().to_owned())
+}
+
+/// Pointer-shape test tolerating a trailing nullable annotation
+/// (`char*?` addresses like `char*`). Bare `ends_with('*')` checks
+/// go blind on nullable pointers, misrouting them to object paths.
+/// Call-site `ref`/`in` markers (`byte*&`) see through likewise.
+pub(super) fn is_pointer_ty(ty: &str) -> bool {
+    let t = ty.trim().strip_suffix('&').map(str::trim).unwrap_or(ty.trim());
+    let t = t.strip_suffix('?').unwrap_or(t);
+    t.ends_with('*') && !t.ends_with("[]")
+}
+
 /// Base type name for extension-receiver matching: strip generic args
 /// (`ReadOnlySpan<char>` → `ReadOnlySpan`), namespace qualifiers,
 /// and `?`/`[]`/`*` suffixes, and canonicalize primitive aliases
@@ -849,7 +1108,7 @@ pub(super) fn base_type_name(t: &str) -> String {
         if s.ends_with("[]") {
             s.pop();
             s.pop();
-        } else if s.ends_with('?') || s.ends_with('*') {
+        } else if s.ends_with('?') || s.ends_with('*') || s.ends_with('&') {
             s.pop();
         } else {
             break;
@@ -902,7 +1161,7 @@ pub(super) fn canonical_primitive(s: &str) -> String {    match s {
 /// NOTE: no `[]`-stripping here (unlike `base_type_name`) — `string[]`
 /// is an array, not a string, and must NOT match.
 pub(super) fn is_string_type(t: &str) -> bool {
-    let s = t.trim().trim_start_matches("global::");
+    let s = t.trim().trim_start_matches("global::").trim_end_matches('?');
     let simple = s.rsplit('.').next().unwrap_or(s);
     canonical_primitive(simple) == "String"
 }
@@ -1007,13 +1266,127 @@ pub(super) fn substitute_generics(ret: &str, params: &[String], args: &[String])
     out
 }
 
-/// Resolve a possibly-generic type spelling to its definition entry:
+/// Balanced top-level generic arguments of a type spelling
+/// (`Dictionary<string, List<int>>` → `["string", "List<int>"]`).
+/// Empty when the spelling carries no `<...>` list.
+pub(super) fn generic_args_of(ty: &str) -> Vec<String> {
+    let bytes = ty.as_bytes();
+    let Some(lt) = ty.find('<') else {
+        return Vec::new();
+    };
+    let mut depth = 0i32;
+    let mut end = bytes.len();
+    for (i, &c) in bytes.iter().enumerate().skip(lt) {
+        match c {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let inner = &ty[lt + 1..end];
+    let mut out = Vec::new();
+    let mut nest = 0i32;
+    let mut start = 0usize;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => nest += 1,
+            '>' | ')' | ']' => nest -= 1,
+            ',' if nest == 0 => {
+                out.push(inner[start..i].trim().to_owned());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(inner[start..].trim().to_owned());
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// Resolve a possibly-instantiated generic spelling to its
+/// definition entry (`System.ReadOnlySpan<byte>` → the
+/// `System.ReadOnlySpan<T>` entry): instantiation entries are not
+/// registered per type argument, but members and layout live on
+/// the definition. Returns `None` for non-generic spellings
+/// without an entry (legacy miss).
+pub(super) fn definition_entry<'t>(
+    table: &'t TypeTable,
+    spelling: &str,
+) -> Option<&'t ClassInfo> {
+    let s = spelling.trim().trim_start_matches("global::");
+    // Nested instantiations (`Dictionary<K,V>.AlternateLookup<A>`
+    // names the INNER type): resolve the inner-most segment, like
+    // `class_for_spelling` — the outer base is the wrong scope.
+    let s = match s.rfind(">.") {
+        Some(i) => s[i + 2..].trim(),
+        None => s,
+    };
+    let lt = s.find('<')?;
+    let base = s[..lt].trim_end().to_owned();
+    if base.is_empty() {
+        return None;
+    }
+    table.class(&base)
+}
+/// Member-lookup entry for a nullability-annotated receiver
+/// (`string?`): C# nullability is an annotation, not a different
+/// type, so members resolve through the base type. Reference bases
+/// only — value types keep `Nullable<T>` semantics (their members
+/// live on the wrapper: `Value`/`HasValue`, not the inner type).
+/// Without this, `envPath.StartsWith('/')` on a `string?` local
+/// missed every entry, fell to the span extensions, and stuffed
+/// the char into a span slot (fault on `[47+24]`). Primitives
+/// spelled canonically (`Int32?`) hit struct entries and stay
+/// out; lowercase spellings (`int?`) match no entry and stay
+/// out; open variables (`T?`) stay out.
+pub(super) fn nullable_base<'t>(table: &'t TypeTable, spelling: &str) -> Option<&'t ClassInfo> {
+    // Call-site `ref`/`in` markers (`T?&`) see through to the
+    // nullable shape before the `?` handling below.
+    let spelling = spelling.trim().strip_suffix('&').map(str::trim).unwrap_or(spelling.trim());
+    let base = spelling.strip_suffix('?')?.trim();
+    if base.is_empty() || base.ends_with('?') {
+        return None;
+    }
+    // Canonicalize primitive spellings (`string` → `String`,
+    // `int` → `Int32` — the latter hits a struct entry and stays
+    // out below, preserving `Nullable<T>` semantics).
+    let canon = canonical_primitive(base);
+    let info = table.class(&canon).or_else(|| table.class(base)).or_else(|| {
+        let simple = canon.rsplit('.').next().unwrap_or(&canon);
+        table.classes.iter().find(|c| {
+            c.name == simple || c.name == base || c.key.path == base || c.key.path == canon
+        })
+    })?;
+    if info.is_struct || info.is_enum {
+        return None;
+    }
+    Some(info)
+}
 /// `Vector512<byte>` prefers the generic `Vector512<T>` entry (arity
 /// match) over the non-generic `Vector512` statics class, so static
 /// members of the instantiation (`Vector512<byte>.Count`) resolve.
 /// Primitive spellings canonicalize (`string` → `String`). Bare names
 /// behave exactly like `class()`.
-pub(super) fn class_for_spelling<'t>(table: &'t TypeTable, spelling: &str) -> Option<&'t ClassInfo> {
+/// Visible crate-wide: static-initializer dependency ordering
+/// (`ir::mod`) resolves receiver spellings with the same rules as
+/// call sites.
+pub(crate) fn class_for_spelling<'t>(table: &'t TypeTable, spelling: &str) -> Option<&'t ClassInfo> {
+    // Nested generic instantiations
+    // (`Dictionary<K,V>.AlternateLookup<A>` names the INNER type):
+    // resolve the inner-most segment — the outer base is the wrong
+    // scope (it would match `Dictionary` instead of
+    // `AlternateLookup`). Non-nested spellings pass through
+    // unchanged.
+    let spelling = match spelling.rfind(">.") {
+        Some(i) => spelling[i + 2..].trim(),
+        None => spelling,
+    };
     let args = explicit_type_args(spelling);
     // Base without generic arguments or ?/[]/* suffixes (definition
     // lookup ignores them); qualification preserved.
@@ -1080,7 +1453,7 @@ pub(super) fn extension_method<'t>(
     arg_types: &[String],
     explicit_arity: Option<usize>,
 ) -> Option<&'t MethodInfo> {
-    if recv_type == "object" {
+    if recv_type == "object" || recv_type == "_" {
         // Unknown-typed receivers already lower through placeholders;
         // a global scan here only risks false positives.
         return None;
@@ -1187,7 +1560,14 @@ pub(super) fn lower_extension_call(
     let mut argv = vec![recv];
     argv.extend(explicit);
     let dst = b.fresh();
-    match static_function_index_for(ctx, &ext_mi.declaring_class, &ext_mi.name, full) {
+    match static_function_index_for(
+        ctx,
+        &ext_mi.declaring_class,
+        &ext_mi.name,
+        full,
+        &ext_mi.param_types,
+        &ext_mi.param_is_byref,
+    ) {
         Some(fidx) => {
             b.push_raw(Instr::CallStatic { dst, fidx, args: argv });
             Ok(dst)
@@ -1216,6 +1596,16 @@ pub(crate) fn is_method_group(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> bool 
 /// field, property, outer static, or type). Used where only the name
 /// is at hand (e.g. the undeclared-variable fallback in `eval`).
 pub(crate) fn is_method_group_name(name: &str, b: &Body<'_>, ctx: &Ctx<'_>) -> bool {
+    // TEMP-MGNAMEDBG. Removed before close.
+    if std::env::var("RUBYC_MGDBG").is_ok() && (name == "Foo" || name == "CompletionSentinel") {
+        let in_scope = b.scopes.lookup(name).is_some();
+        let cur = ctx.table.class(ctx.current_class);
+        let has_method = cur.is_some_and(|info| info.method(name).is_some());
+        eprintln!(
+            "[rubyc] TEMP-MGNAMEDBG name={name} class={} in_scope={in_scope} has_method={has_method}",
+            ctx.current_class
+        );
+    }
     if b.scopes.lookup(name).is_some() {
         return false;
     }
@@ -1254,4 +1644,79 @@ pub(crate) fn dep_import_index(ctx: &Ctx, lib_hint: &str, symbol: &str) -> usize
 /// name+arity share the symbol, like bare names today).
 pub(crate) fn qualified_symbol(entry: &ClassInfo, method: &str, arity: usize) -> String {
     format!("{}::{}#{}", entry.key.path, method, arity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table_of(src: &str) -> TypeTable {
+        let unit = crate::parser::rd::parse(src).expect("repro parses");
+        crate::native::semantic::analyze(&unit).expect("repro analyzes")
+    }
+
+    /// User-defined implicit operators are inherited: an operator on a
+    /// base class applies to derived arguments (CSharp's
+    /// `ErrorHandling.Error(ErrorCode, params ErrArg[])` calls pass a
+    /// `PropWithType` where `ErrArg` offers `implicit operator
+    /// ErrArg(SymWithType)`).
+    #[test]
+    fn inherited_implicit_operator_applies_to_derived_arg() {
+        let table = table_of(
+            r#"namespace t {
+                class SymWithType { }
+                class PropWithType : SymWithType { }
+                class ErrArg {
+                    public static implicit operator ErrArg(SymWithType swt) { return new ErrArg(); }
+                }
+            }"#,
+        );
+        assert_eq!(
+            compat_score("t.PropWithType", "ErrArg", &table, &[]),
+            Some(2),
+            "base-class operator accepts derived arg"
+        );
+        assert_eq!(
+            compat_score("t.SymWithType", "ErrArg", &table, &[]),
+            Some(2),
+            "direct operator still accepts"
+        );
+        assert_eq!(
+            compat_score("int", "string", &table, &[]),
+            None,
+            "unrelated types still rejected (no over-widening)"
+        );
+    }
+
+    /// Same-name lookup never lists one entry twice: a duplicated
+    /// entry poisons the adopted-entry fallback (pointer-identity
+    /// skips both copies) and turns resolvable constructions into
+    /// loud `ctor_arity` failures.
+    #[test]
+    fn entries_for_single_entry_yields_one() {
+        use crate::native::semantic::TypeKey;
+        let table = TypeTable {
+            classes: vec![ClassInfo {
+                name: "Dup".to_owned(),
+                key: TypeKey::new("Sys.Dup", 0),
+                bases: Vec::new(),
+                fields: Vec::new(),
+                static_fields: Vec::new(),
+                const_fields: Vec::new(),
+                methods: Vec::new(),
+                own_members: Vec::new(),
+                interfaces: Vec::new(),
+                properties: Vec::new(),
+                is_enum: false,
+                generic_params: Vec::new(),
+                is_struct: false,
+                owner: String::new(),
+            }],
+            interfaces: Vec::new(),
+            delegates: Vec::new(),
+            imports: Vec::new(),
+            aliases: Vec::new(),
+        };
+        assert_eq!(entries_for(&table, "Dup").len(), 1);
+    }
 }

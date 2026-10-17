@@ -22,6 +22,7 @@ fn table() -> TypeTable {
                     is_static: false,
                     is_const: false,
                     const_value: None,
+                    is_byref: false,
                     declaring_class: "Animal".into(),
                 }],
                 static_fields: vec![],
@@ -39,6 +40,7 @@ fn table() -> TypeTable {
                     is_extension: false,
                     generic_params: vec![],
                     vtable_slot: 0,
+                    param_is_byref: vec![],
                     conditional_symbol: None,
                     has_params: false,
                 }],
@@ -73,6 +75,7 @@ fn table() -> TypeTable {
                     is_extension: false,
                     generic_params: vec![],
                     vtable_slot: 0,
+                    param_is_byref: vec![],
                     conditional_symbol: None,
                     has_params: false,
                 }],
@@ -1524,4 +1527,83 @@ fn preload_merges_fragment_verbatim() {
             .unwrap_or_else(|| panic!("missing property {}", p.name));
         assert_eq!(got.type_name, p.type_name, "property {}", p.name);
     }
+}
+
+#[test]
+fn abstract_properties_declare_no_backing_storage() {
+    // Abstract accessors are not auto-properties: synthesizing a
+    // backing field shifts every later instance offset (Stream's
+    // abstract `CanRead`/`CanWrite` pushed MemoryStream's `_buffer`
+    // from slot 3 to slot 8, faulting `WriteByte` on the null it
+    // read at the stale slot).
+    let src = "namespace t; abstract class Base { public abstract bool Flag { get; set; } public int After; }";
+    let unit = crate::parser::parse(src).unwrap();
+    let table = crate::native::semantic::analyze(&unit).unwrap();
+    let entry = table.class("Base").expect("Base present");
+    assert!(
+        entry.field("Flag").is_none(),
+        "abstract Flag must not gain a backing field"
+    );
+    let prop = entry
+        .properties
+        .iter()
+        .find(|p| p.name == "Flag")
+        .expect("Flag property recorded");
+    assert!(prop.is_abstract, "Flag recorded abstract");
+    let after = entry.field("After").expect("After field present");
+    assert_eq!(
+        after.offset_slots, 2,
+        "first real field keeps slot 2, got {}",
+        after.offset_slots
+    );
+}
+
+#[test]
+fn field_offsets_agree_across_hierarchy_entries() {    // Canonical root-first field layout: a field's slot must be
+    // identical in its declaring entry and in every derived entry
+    // (base ctors store via the base entry while reads use the
+    // derived entry — direct-first numbering faulted
+    // `ConsoleStream._canWrite` reads: stored via the base entry,
+    // read via the derived entry at a different slot).
+    let src = "namespace t; class Base { public int F; } class Mid : Base { public int G; } class Leaf : Mid { public int H; }";
+    let unit = crate::parser::parse(src).unwrap();
+    let table = crate::native::semantic::analyze(&unit).unwrap();
+    let off = |cls: &str, field: &str| {
+        table
+            .classes
+            .iter()
+            .find(|c| c.key.path == cls)
+            .unwrap_or_else(|| panic!("missing entry {cls}"))
+            .field(field)
+            .unwrap_or_else(|| panic!("missing field {field} in {cls}"))
+            .offset_slots
+    };
+    assert_eq!(off("t.Base", "F"), off("t.Mid", "F"), "F base vs mid");
+    assert_eq!(off("t.Base", "F"), off("t.Leaf", "F"), "F base vs leaf");
+    assert_eq!(off("t.Mid", "G"), off("t.Leaf", "G"), "G mid vs leaf");
+    // Root-first order: base fields precede derived fields.
+    assert!(off("t.Leaf", "F") < off("t.Leaf", "G"), "F before G");
+    assert!(off("t.Leaf", "G") < off("t.Leaf", "H"), "G before H");
+}
+
+#[test]
+fn hex_enum_variants_fold() {
+    // Hex discriminants (e.g. `TaskStateFlags.RanToCompletion =
+    // 0x1000000`) must fold to their numeric values; a zero fold
+    // makes every mask check false (spurious
+    // `ThrowAsyncIOInProgress` via `Task.IsCompleted`).
+    let src = "namespace t; enum Flags { None = 0, Big = 0x1000000, Next, Combo = Big | 0x2000000 }";
+    let unit = crate::parser::parse(src).unwrap();
+    let table = crate::native::semantic::analyze(&unit).unwrap();
+    let e = table.class("Flags").expect("Flags present");
+    let val = |n: &str| {
+        e.const_fields
+            .iter()
+            .find(|f| f.name == n)
+            .unwrap_or_else(|| panic!("missing const {n}"))
+            .const_value
+            .clone()
+    };
+    assert_eq!(val("Big"), Some(crate::native::semantic::ConstValue::Int(0x1000000)));
+    assert_eq!(val("Next"), Some(crate::native::semantic::ConstValue::Int(0x1000001)));
 }

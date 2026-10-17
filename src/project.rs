@@ -38,6 +38,22 @@ pub struct Project {
     /// per library after verification — unverified dynamic builds
     /// risk silent misresolution (see `native::rci`).
     pub dynamic: bool,
+    /// From `[build] optimize = true`: function-level dead-code
+    /// elimination (`--optimize`). CLI `--optimize` also enables it;
+    /// either source suffices (explicit CLI never disables a TOML `true`).
+    pub optimize: bool,
+    /// From `[build] strip = true`: drop `.symtab`/`.strtab` from
+    /// executable images (`--strip`). Same OR rule as `optimize`.
+    pub strip: bool,
+    /// From `[build] jobs = N`: solution build parallelism for this
+    /// project (`--jobs N`). 0 = unset (CLI `--jobs` or 1 wins).
+    pub jobs: usize,
+    /// From `[build] target = "…"`: compilation target name
+    /// (`--target`). `None` = unset (CLI `--target` wins).
+    pub target: Option<String>,
+    /// From `[build] rci-only = true`: emit only the `.rci` sidecar
+    /// (`--rci-only`). Same OR rule as `optimize`.
+    pub rci_only: bool,
     /// From `[libs] external = [...]`, `ruby_c = [...]`.
     pub external_libs: Vec<String>,
     pub ruby_c_libs: Vec<String>,
@@ -91,6 +107,26 @@ impl Project {
             }
             if section == "build" && key == "dynamic" {
                 p.dynamic = val.trim() == "true";
+            }
+            if section == "build" && key == "optimize" {
+                p.optimize = val.trim() == "true";
+            }
+            if section == "build" && key == "strip" {
+                p.strip = val.trim() == "true";
+            }
+            if section == "build" && key == "jobs" {
+                if let Ok(n) = val.trim().parse::<usize>() {
+                    p.jobs = n;
+                }
+            }
+            if section == "build" && key == "target" {
+                let s = as_string(&val);
+                if !s.is_empty() {
+                    p.target = Some(s);
+                }
+            }
+            if section == "build" && key == "rci-only" {
+                p.rci_only = val.trim() == "true";
             }
             if section == "libs" && key == "external" {
                 p.external_libs = parse_string_array(&val);
@@ -283,7 +319,22 @@ impl Solution {
                     sol.projects.push(PathBuf::from(as_string(&val)));
                 }
                 ("hooks", "pre-solution") => sol.hook_pre_solution = Some(as_string(&val)),
-                _ => {}
+                _ => {
+                    // `[profile.NAME]` sections: named build profiles
+                    // selected with `--profile NAME` (defines append,
+                    // optimize/strip OR into every project).
+                    if let Some(name) = section.strip_prefix("profile.") {
+                        if !name.is_empty() {
+                            let entry = sol.profiles.entry(name.to_owned()).or_default();
+                            match key {
+                                "defines" => entry.defines = parse_string_array(&val),
+                                "optimize" => entry.optimize = val.trim() == "true",
+                                "strip" => entry.strip = val.trim() == "true",
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(sol)
@@ -422,5 +473,67 @@ fn glob_walk(dir: &Path, segments: &[String], out: &mut Vec<PathBuf>) {
                 glob_walk(&path, &segments[1..], out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(text: &str) -> Project {
+        Project::parse(text, Path::new("t.rcp")).expect("test project parses")
+    }
+
+    #[test]
+    fn build_optimize_strip_keys_parse() {
+        let p = parse(
+            "[meta]\nname = \"x\"\n[target]\noutput = \"exe\"\n[build]\n\
+             sources = []\noptimize = true\nstrip = true\n",
+        );
+        assert!(p.optimize, "optimize = true parses");
+        assert!(p.strip, "strip = true parses");
+    }
+
+    #[test]
+    fn build_optimize_strip_default_off() {
+        let p = parse("[meta]\nname = \"x\"\n[build]\nsources = []\n");
+        assert!(!p.optimize && !p.strip, "absent keys default to false");
+    }
+
+    #[test]
+    fn build_jobs_target_rcionly_keys_parse() {
+        let p = parse(
+            "[meta]\nname = \"x\"\n[build]\nsources = []\njobs = 6\n\
+             target = \"linux_x86_64\"\nrci-only = true\n",
+        );
+        assert_eq!(p.jobs, 6, "jobs parses");
+        assert_eq!(p.target.as_deref(), Some("linux_x86_64"), "target parses");
+        assert!(p.rci_only, "rci-only parses");
+    }
+
+    #[test]
+    fn build_jobs_target_rcionly_default_unset() {
+        let p = parse("[meta]\nname = \"x\"\n[build]\nsources = []\n");
+        assert_eq!(p.jobs, 0, "jobs defaults to unset (0)");
+        assert_eq!(p.target, None, "target defaults to unset");
+        assert!(!p.rci_only, "rci-only defaults to false");
+    }
+
+    #[test]
+    fn solution_profile_sections_parse() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("rubyc_profile_test.rcs");
+        std::fs::write(
+            &path,
+            "solution mini\nversion = \"1\"\n[[project]]\npath = \"a.rcp\"\n\
+             [profile.release]\ndefines = [\"DEBUG\"]\noptimize = true\nstrip = true\n",
+        )
+        .unwrap();
+        let sol = Solution::load(&path).expect("solution parses");
+        let _ = std::fs::remove_file(&path);
+        let prof = sol.profiles.get("release").expect("profile parsed");
+        assert_eq!(prof.defines, vec!["DEBUG".to_string()]);
+        assert!(prof.optimize && prof.strip);
     }
 }

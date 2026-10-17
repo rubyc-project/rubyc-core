@@ -17,6 +17,18 @@ pub(super) fn vtable_symbol(entry: &ClassInfo) -> String {
 /// address import. `None` means no storage anywhere (callers keep their
 /// existing miss behavior: loud error on writes, zero on reads).
 pub(super) fn static_addr(field: &FieldInfo, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Option<VReg> {
+    // TEMP-INVDIAG3: audit Invariant static slot lookups.
+    // Removed before close.
+    if std::env::var("RUBYC_INVDIAG").is_ok() && field.name == "Invariant" {
+        let key = (field.declaring_class.clone(), field.name.clone());
+        eprintln!(
+            "[rubyc] TEMP-INVDIAG3 fdecl={} in {}.{} slot={:?}",
+            field.declaring_class,
+            ctx.current_class,
+            ctx.current_method.clone().unwrap_or_default(),
+            ctx.static_index.get(&key)
+        );
+    }
     // External statics first: the local slot (if any) is hollow zeroed
     // storage — the dep's initializers ran in its home image, not here.
     if let Some(entry) = member_host(ctx.table, &field.declaring_class, &field.name)
@@ -207,7 +219,59 @@ pub(crate) fn external_target(
     ))
 }
 
-pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result<String, LowerError> {    match expr {
+/// Leftmost identifier of a dotted path (`Lib` in `Lib.C.x`).
+fn dotted_root(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Ident { name, .. } => Some(name),
+        Expr::Member { object, name, .. } => {
+            if name.starts_with('<') {
+                return None;
+            }
+            dotted_root(object)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a dotted path's root denotes a VALUE (member access) rather
+/// than a namespace/type (type reference): locals/params, `this`,
+/// `base`, current-class fields/properties, or method groups.
+fn dotted_root_is_value(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> bool {
+    let Some(root) = dotted_root(expr) else {
+        return true;
+    };
+    if root == "this" || root == "base" || root == "_" {
+        return true;
+    }
+    if b.scopes.lookup(root).is_some() {
+        return true;
+    }
+    if let Some(info) = this_info(ctx, root) {
+        if info.field(root).is_some() || info.property(root).is_some() {
+            return true;
+        }
+    }
+    is_method_group_name(root, b, ctx)
+}
+
+/// Flatten a dotted path expression (`Lib.C`, `System.Text.Json`) to
+/// its source spelling. Returns `None` for anything else (calls,
+/// indexers, generic spellings like `Vector512<byte>` which parse as
+/// `Member(Vector512, "<byte>")`).
+pub(super) fn dotted_spelling(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident { name, .. } => Some(name.clone()),
+        Expr::Member { object, name, .. } => {
+            if name.starts_with('<') {
+                return None;
+            }
+            dotted_spelling(object).map(|base| format!("{base}.{name}"))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result<String, LowerError> {    match expr {
         Expr::Ident { name, .. } => {
             // Declared bindings win over the `this` keyword (mirrors
             // eval): an `@this` parameter types as its declared type,
@@ -368,7 +432,35 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 }
                 return Ok("object".to_owned());
             }
-            let base_type = static_type_of(object, b, ctx)?;
+            let mut base_type = static_type_of(object, b, ctx)?;
+            // Namespace-qualified or nested type reference (`Lib.C`
+            // used as a receiver): if the receiver itself spells a
+            // known class path and its root is not a value in scope,
+            // it is a type, not a member access — resolve it directly
+            // instead of degrading through the bare namespace ident.
+            // (Without this, the recursion below types `Lib` as
+            // `object` and every qualified access silently becomes a
+            // zero placeholder.) Value-rooted paths keep existing
+            // behavior: only non-value roots take this shortcut.
+            if !dotted_root_is_value(object, b, ctx) {
+                if let Some(dotted) = dotted_spelling(object) {
+                    // TEMP-RESTYPE. Removed before close.
+                    if std::env::var("RUBYC_FIELDDBG").is_ok()
+                        && (name == "CACHE_LINE_SIZE" || name == "PaddingHelpers")
+                    {
+                        eprintln!(
+                            "[rubyc] TEMP-RESTYPE dotted={dotted} hit={} name={name} in {}.{}",
+                            ctx.table.class(&dotted).is_some(),
+                            ctx.current_class,
+                            ctx.current_method.clone().unwrap_or_default()
+                        );
+                    }
+                    if ctx.table.class(&dotted).is_some() {
+                        base_type = dotted;
+                    }
+                }
+            }
+            // Arrays expose `Length`/`Rank` (int) and `LongLength`
             // Arrays expose `Length`/`Rank` (int) and `LongLength`
             // (long) without a class entry (`byte[].Length`).
             if base_type.contains('[') {
@@ -382,11 +474,137 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
             // Arity-aware entry resolution: a generic-spelled receiver
             // (`Vector512<byte>`) prefers the generic definition over
             // a same-named non-generic class.
+            // Namespace-qualified or nested type reference (`Lib.C`):
+            // the recursion above degrades bare namespace idents
+            // (`Lib`) to `object`, losing the path — every qualified
+            // access then silently becomes a zero placeholder. If the
+            // whole dotted spelling names a class, this IS a type
+            // reference; else if the receiver spelling alone does,
+            // recover it for member lookup below. Value receivers keep
+            // priority: usable bases never reach this fallback, and an
+            // unresolvable receiver spelling falls through to the
+            // legacy `object` behavior unchanged.
+            // Degraded-`object` recovery: in a full world the degraded
+            // `object` RESOLVES (System.Object), so the `Some` arm
+            // below keeps it and the qualified path is lost forever
+            // (`System.Numerics.BitOperations` typed as `object` — the
+            // Log2 fold missed and the probe printed `a0` — while a
+            // bare unit without Object recovered fine). When the base
+            // is just the degraded unknown AND the full dotted spelling
+            // names a real class rooted at a non-value, prefer the
+            // dotted hit. Value-rooted paths keep legacy behavior
+            // (`Holder.SD`-style fail-open zeros survive: a local whose
+            // dotted path coincidentally spells a class must not
+            // reroute).
+            let dotted_hit = if matches!(base_type.trim(), "object" | "Object")
+                && !dotted_root_is_value(object, b, ctx)
+            {
+                dotted_spelling(expr).filter(|d| ctx.table.class(d).is_some())
+            } else {
+                None
+            };
+            let base_type = match dotted_hit {
+                Some(hit) => hit,
+                None => match class_for_spelling(ctx.table, &base_type) {
+                    Some(_) => base_type,
+                    None => {
+                        dotted_spelling(expr)
+                            .filter(|d| ctx.table.class(d).is_some())
+                            .or_else(|| {
+                                dotted_spelling(object)
+                                    .filter(|d| ctx.table.class(d).is_some())
+                            })
+                            .unwrap_or(base_type.clone())
+                    }
+                },
+            };
+            // Self-denoting type reference: the whole dotted spelling
+            // already IS the resolved base (`Lib.C` typing member `C`
+            // against base `Lib.C`). The expression names the type
+            // itself, not a member of it — return it directly instead
+            // of searching `C` among `Lib.C`'s members (which degrades
+            // to `object` and collapses every qualified access above
+            // it). Only exact equality triggers, so genuine member
+            // paths (`Lib.C.counter`) and value receivers are
+            // unaffected.
+            if let Some(spelled) = dotted_spelling(expr) {
+                if spelled == base_type {
+                    return Ok(base_type);
+                }
+            }
             let Some(first) = class_for_spelling(ctx.table, &base_type) else {
                 return Ok("object".to_owned());
             };
+            // Same-named sibling fallback: `class_for_spelling`
+            // first-matches (`State` may hit `XxHash32.State`, which
+            // lacks `TotalLength`), while the member lives on a
+            // same-named sibling (`XxHashShared.State`, imported via
+            // `using static`). Prefer any same-named entry that
+            // actually declares the member — otherwise genuine
+            // members degrade to `object` and poison overload ranking
+            // downstream (`XxHashShared.MergeAccumulators` went
+            // unknown on an `object` length product).
+            let simple_base = base_type
+                .rsplit('.')
+                .next()
+                .unwrap_or(base_type.as_str())
+                .split('<')
+                .next()
+                .unwrap_or(base_type.as_str());
+            let first = {
+                let mut hit = first;
+                if hit.field(name).is_none() && hit.property(name).is_none() {
+                    // TEMP-SIBDBG. Removed before close.
+                    if std::env::var("RUBYC_SIBDBG").is_ok() {
+                        eprintln!(
+                            "[rubyc] TEMP-SIBDBG base={} name={} first={} candidates={:?}",
+                            base_type,
+                            name,
+                            hit.key.path,
+                            ctx.table
+                                .classes
+                                .iter()
+                                .filter(|c| {
+                                    c.name.rsplit('.').next().unwrap_or(&c.name) == simple_base
+                                })
+                                .map(|c| c.key.path.clone())
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    for cand in &ctx.table.classes {
+                        let cand_simple =
+                            cand.name.rsplit('.').next().unwrap_or(&cand.name);
+                        if cand_simple != simple_base {
+                            continue;
+                        }
+                        // TEMP-SIBDBG2. Removed before close.
+                        if std::env::var("RUBYC_SIBDBG").is_ok() {
+                            eprintln!(
+                                "[rubyc] TEMP-SIBDBG2 cand={} has_field={} has_prop={}",
+                                cand.key.path,
+                                cand.field(name).is_some(),
+                                cand.property(name).is_some()
+                            );
+                        }
+                        if cand.field(name).is_some() || cand.property(name).is_some() {
+                            hit = cand;
+                            break;
+                        }
+                    }
+                }
+                hit
+            };
             // Same-named nesting fallback (see `member_host`): prefer
             // the entry actually declaring the member.
+            // TEMP-FIELDDBG4. Removed before close.
+            if std::env::var("RUBYC_FIELDDBG").is_ok() && name == "CACHE_LINE_SIZE" {
+                eprintln!(
+                    "[rubyc] TEMP-FIELDDBG4 base={base_type} first={} field_some={} prop_some={}",
+                    first.key.path,
+                    first.field(name).is_some(),
+                    first.property(name).is_some()
+                );
+            }
             let info = if first.field(name).is_some() || first.property(name).is_some() {
                 first
             } else if member_host(ctx.table, &base_type, name).is_some() {
@@ -456,6 +674,10 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 None => name.clone(),
             };
             let base_type = static_type_of(object, b, ctx)?;
+            // TEMP-TYPEDBG.
+            if std::env::var("RUBYC_TYPEDBG").is_ok() {
+                eprintln!("[rubyc] TEMP-TYPEDBG-ENTRY {name} recv={base_type}");
+            }
             let arg_types: Vec<String> = args
                 .iter()
                 .map(|a| {
@@ -492,7 +714,31 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 // types as `Memory<byte>`, not bare `Memory` — without
                 // this, downstream overloads miss and legacy first-match
                 // elects the wrong overload).
-                return Ok(substitute_generics(&m.ret_type, &m.generic_params, &type_args));
+                let mut ret = substitute_generics(&m.ret_type, &m.generic_params, &type_args);
+                // Class type arguments: a call on `ROS<byte>` returning
+                // `ROS<T>` (the declaring class's parameter) must type
+                // as `ROS<byte>`, not open `ROS<T>` — otherwise member
+                // lookups miss the table and degrade to array-shape
+                // reads at wrong offsets. Same-entry methods only;
+                // inherited generic variance stays legacy.
+                if let Some(recv) = class_for_spelling(ctx.table, &base_type)
+                    .or_else(|| definition_entry(ctx.table, &base_type))
+                {
+                    if let Some(decl) = ctx.table.class(&m.declaring_class) {
+                        if decl.key == recv.key && !decl.generic_params.is_empty() {
+                            ret = substitute_generics(
+                                &ret,
+                                &decl.generic_params,
+                                &generic_args_of(&base_type),
+                            );
+                        }
+                    }
+                }
+                // TEMP-TYPEDBG.
+                if std::env::var("RUBYC_TYPEDBG").is_ok() {
+                    eprintln!("[rubyc] TEMP-TYPEDBG {name} recv={base_type} ret={ret}");
+                }
+                return Ok(ret);
             }
             // Extension fallback so chained extension calls keep their
             // declared result type (`s.AsSpan().StartsWith(...)`),
@@ -590,7 +836,13 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
         }
         Expr::Literal(l) => {
             let ty = match l {
-                Literal::Float(_) => "float",
+                // C# types unsuffixed/`d`-suffixed float literals as
+                // `double` (`24.0`, `24d`); `f`-suffixed (`24.0f`) is
+                // `float`, but the lexer erases suffixes, so every
+                // float literal spells `double` (the common case) and
+                // overload latitude keeps `double → float` applicable
+                // for genuine `float` literals (see `compat_score`).
+                Literal::Float(_) => "double",
                 Literal::Int(_) => "int",
                 Literal::Bool(_) => "bool",
                 Literal::Str(_) => "string",
@@ -607,7 +859,18 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
         // `object` and never matches non-nullable value types.
         Expr::Default { type_name, .. } => {
             if type_name.is_empty() || type_name == "void" {
-                Ok("object".to_owned())
+                // Bare `default` (target type unknown here): report as
+                // discard-like wildcard, NOT `object`. `object` means
+                // null/unknown and is correctly REJECTED for value-type
+                // and enum parameters — but `default` converts to every
+                // parameter type (`M(default)` means `M(default(T))`
+                // for whatever `T` the overload wants), so it must rank
+                // applicable-but-uninformative like `out _` (see
+                // `compat_score`). Without this, overloads taking
+                // structs/enums never match bare-default args (the
+                // `Task` base-chain ctor silently skipped, leaving
+                // `m_stateFlags` zero and `IsCompleted` false).
+                Ok("_".to_owned())
             } else {
                 Ok(type_name.clone())
             }
@@ -616,6 +879,28 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
         // unknown result would poison overload applicability downstream
         // (`StoreUnsafe(ref buf, (nuint)offset)` vs `nuint`).
         Expr::Cast { type_name, .. } => Ok(type_name.clone()),
+        // Array allocation: `new T[n]` types as `T[]`; collection
+        // expressions (`[e1, …]`, `{ e1, … }`) carry no element type
+        // — infer from the first initializer (all elements share
+        // the 8-byte representation, so the coarse element type
+        // only drives `[]`-detection and span packing, never
+        // layout). Tuples (`elem_type == "tuple"`) are NOT arrays
+        // and stay unknown here.
+        Expr::NewArray { elem_type, init, .. } => {
+            if elem_type == "tuple" || elem_type == "anonymous_method" {
+                return Ok("object".to_owned());
+            }
+            if !elem_type.is_empty() {
+                return Ok(format!("{elem_type}[]"));
+            }
+            if let Some(first) = init.first() {
+                let t = static_type_of(first, b, ctx)?;
+                if t != "object" {
+                    return Ok(format!("{t}[]"));
+                }
+            }
+            Ok("object".to_owned())
+        }
         // Binary operators (coarse C# typing — keeps overload
         // applicability precise instead of degrading everything to
         // `object`): comparisons/logicals yield `bool`; `??` yields
@@ -636,12 +921,117 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 }
                 return static_type_of(rhs, b, ctx);
             }
+            // Deep left-nested same-op spines (`a+b+c+...` hundreds
+            // deep in lookup tables) overflow via recursion below, so
+            // fold them iteratively here (mirrors eval's flattening):
+            // collect leaf types down the spine (each leaf is shallow
+            // — only the spine itself is deep), then join pairwise.
+            // Only pure arithmetic/bitwise ops (no branches, no
+            // control flow); anything else keeps the legacy path.
+            // Only spines longer than 2 (pairs keep the exact legacy
+            // path, including the string/float special cases).
+            {
+                let flattenable = matches!(
+                    op,
+                    AstBinOp::Add
+                        | AstBinOp::Sub
+                        | AstBinOp::Mul
+                        | AstBinOp::Div
+                        | AstBinOp::Rem
+                        | AstBinOp::BitAnd
+                        | AstBinOp::BitOr
+                        | AstBinOp::BitXor
+                        | AstBinOp::Shl
+                        | AstBinOp::Shr
+                        | AstBinOp::ShrShr
+                );
+                if flattenable {
+                    let mut rights: Vec<&Expr> = vec![rhs];
+                    let mut cur: &Expr = lhs;
+                    while let Expr::Binary {
+                        op: op2, lhs: l2, rhs: r2, ..
+                    } = cur
+                    {
+                        if *op2 != *op {
+                            break;
+                        }
+                        rights.push(r2);
+                        cur = l2;
+                    }
+                    if rights.len() > 2 {
+                        let mut acc = static_type_of(cur, b, ctx)?;
+                        for r in rights.iter().rev() {
+                            let t = static_type_of(r, b, ctx)?;
+                            let is_ptr = |x: &str| {
+                                let xr = x.trim();
+                                xr.ends_with('*') && !xr.ends_with("[]")
+                            };
+                            acc = if matches!(op, &AstBinOp::Add)
+                                && (is_stringy(&acc) || is_stringy(&t))
+                            {
+                                "string".to_owned()
+                            } else if matches!(op, &AstBinOp::Add) && is_ptr(&acc) {
+                                acc
+                            } else if matches!(op, &AstBinOp::Add) && is_ptr(&t) {
+                                t
+                            } else {
+                                numeric_result(&acc, &t)
+                            };
+                        }
+                        return Ok(acc);
+                    }
+                }
+            }
+            // TEMP-MULDBG. Removed before close.
+            if std::env::var("RUBYC_MULDBG").is_ok()
+                && ctx
+                    .current_method
+                    .as_deref()
+                    .is_some_and(|m| m.contains("GetCurrentHashAsHash128"))
+            {
+                let dl = static_type_of(lhs, b, ctx)
+                    .map(|t| t.clone())
+                    .unwrap_or_else(|e| format!("ERR:{e:?}"));
+                let dr = static_type_of(rhs, b, ctx)
+                    .map(|t| t.clone())
+                    .unwrap_or_else(|e| format!("ERR:{e:?}"));
+                eprintln!("[rubyc] TEMP-MULDBG l={dl} r={dr}");
+            }
             let (l, r) = (
                 static_type_of(lhs, b, ctx)?,
                 static_type_of(rhs, b, ctx)?,
             );
             if matches!(op, &AstBinOp::Add) && (is_stringy(&l) || is_stringy(&r)) {
                 return Ok("string".to_owned());
+            }
+            // Deep left-nested same-op spines (`a+b+c+...` hundreds deep
+            // in lookup tables) would overflow via the recursion above.
+            // Detect them here and fold iteratively instead: collect
+            // leaf types down the spine (each leaf is shallow), then
+            // join. Only for spines longer than 2 (common pairs keep
+            // the exact legacy path).
+            // NOTE: implemented in eval flattening; typing stays
+            // recursive (frames are small here — measured safe past
+            // 2000 depth; revisit if a deeper shape appears).
+            // Pointer arithmetic types as the pointer (mirrors
+            // `pointer_arith` in eval: `p + i` stays `T*`, `p - q`
+            // counts elements). Without this, ranking sees `byte* +
+            // int` as `int` while lowering scales it as a pointer —
+            // the mismatch misroutes every address-taking call
+            // (`XxHashShared.MergeAccumulators` went unknown).
+            if matches!(op, &AstBinOp::Add | &AstBinOp::Sub) {
+                let is_ptr = |t: &str| {
+                    let tr = t.trim();
+                    tr.ends_with('*') && !tr.ends_with("[]")
+                };
+                if matches!(op, &AstBinOp::Sub) && is_ptr(&l) && is_ptr(&r) {
+                    return Ok("long".to_owned());
+                }
+                for t in [&l, &r] {
+                    if is_ptr(t) {
+                        return Ok(t.clone());
+                    }
+                }
             }
             Ok(numeric_result(&l, &r))
         }
@@ -678,6 +1068,21 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
             );
             if t == e {
                 Ok(t)
+            } else if t.trim().strip_suffix('?').unwrap_or(t.trim())
+                == e.trim().strip_suffix('?').unwrap_or(e.trim())
+            {
+                // Nullable-annotation-only difference (`byte[]?` vs
+                // `byte[]`): unify to the nullable spelling (preserves
+                // nullability; shape dispatch like array checks strips
+                // it as needed). Without this the ternary degrades to
+                // `object` and downstream coercion bails (a nullable
+                // array stayed a raw array in a span-typed local —
+                // zeroed-length spans faulted console Flush).
+                Ok(if t.trim().ends_with('?') {
+                    t
+                } else {
+                    e
+                })
             } else {
                 Ok("object".to_owned())
             }
@@ -692,6 +1097,29 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 Some(pos) => callee[..pos].to_string(),
                 None => callee.clone(),
             };
+            // `sizeof(T)` types as `int` (C# spec; the value fold in
+            // calls.rs computes the size). Without this it degrades
+            // to `object`, poisoning enclosing arithmetic
+            // (`AccumulatorCount * sizeof(ulong)` typed
+            // `int*object`, collapsing a `MergeAccumulators` overload
+            // to unknown).
+            if name == "sizeof" {
+                return Ok("int".to_owned());
+            }
+            // `typeof(T)` types as `System.Type` (C# spec; the value
+            // is a placeholder box in calls.rs). Without this it
+            // degrades to `object`, hiding `Type`-family receivers
+            // from reflection interceptions (and any `Type`-gated
+            // logic): `typeof(X).GetConstructors(...)` ran the real
+            // body and faulted instead of answering empty.
+            if name == "typeof" {
+                return Ok("System.Type".to_owned());
+            }
+            // Static local functions type by declaration (checked
+            // before method lookup, mirroring call lowering).
+            if let Some(ret) = resolve_local_ret(ctx, &name, args.len()) {
+                return Ok(ret);
+            }
             let arg_types: Vec<String> = args
                 .iter()
                 .map(|a| {
@@ -727,6 +1155,40 @@ pub(super) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
         Expr::Unary { op, .. } if matches!(op, crate::models::UnOp::Not) => {
             Ok("bool".to_owned())
         }
+        // Bitwise complement and numeric negation preserve the
+        // operand type (`~TotalLength` stays `ulong`; without this
+        // they degraded to `object` and rejected overloads — the
+        // `high64` half of `MergeAccumulators` went unknown on it).
+        Expr::Unary { op, inner, .. }
+            if matches!(
+                op,
+                crate::models::UnOp::BitNot | crate::models::UnOp::Neg
+            ) =>
+        {
+            static_type_of(inner, b, ctx)
+        }
+        // Assignment expression (`x = v`, incl. nested assigns in
+        // ternaries like `(_byteBuffer = new byte[...])`): types as
+        // the assigned value (C# types it as the target, which the
+        // value converts to). Without this it degrades to `object`
+        // and poisons enclosing ternaries (`stackalloc-array` vs
+        // `object` → `object`), which then skips span coercion —
+        // StreamWriter's `byteBuffer` stayed a raw array and Flush
+        // encoded into a zero-length destination.
+        Expr::Assign { value, .. } => static_type_of(value, b, ctx),
+        // Call-site `ref`/`in` markers (parser) and explicit
+        // address-of: the inner type, &-suffixed so overload ranking
+        // can require byref parameters (unmarked value behavior
+        // self-elected same-name value twins — `WriteAtOffset`
+        // recursed forever on identical args). Consumers strip `&`
+        // for conversions (see `base_type_name`, `compat_score`,
+        // `span_elem_width`); explicit `&x` interop to integer
+        // params stays applicable via the address-sink rule.
+        Expr::Unary {
+            op: crate::models::UnOp::AddrOf,
+            inner,
+            ..
+        } => Ok(format!("{}&", static_type_of(inner, b, ctx)?)),
         // Fallback: any other expression type — treat as `object`.
         _ => Ok("object".to_owned()),
     }
@@ -816,15 +1278,113 @@ pub(super) fn is_float_expr(b: &Body<'_>, ctx: &Ctx<'_>, expr: &Expr) -> bool {
         // Comparisons yield an integer bool.
         Expr::Binary { op, .. } if op.is_comparison() => false,
         // Arithmetic / bitwise: float when either operand is float.
-        Expr::Binary { lhs, rhs, .. } => {
-            is_float_expr(b, ctx, lhs) || is_float_expr(b, ctx, rhs)
+        // Iterative worklist (never recurse): hundred-deep `+` chains
+        // in lookup tables would otherwise overflow the compiler.
+        Expr::Binary { .. } => {
+            let mut work = vec![expr];
+            while let Some(e) = work.pop() {
+                match e {
+                    Expr::Literal(Literal::Float(_)) => return true,
+                    Expr::Binary { lhs, rhs, .. } => {
+                        work.push(lhs);
+                        work.push(rhs);
+                    }
+                    Expr::Unary { inner, .. } => work.push(inner),
+                    Expr::Ternary {
+                        then_expr,
+                        else_expr,
+                        ..
+                    } => {
+                        work.push(then_expr);
+                        work.push(else_expr);
+                    }
+                    // Calls/members/indexers: check the callee shape
+                    // without resolving (resolution recurses separately
+                    // and shallowly).
+                    _ => {}
+                }
+            }
+            false
         }
-        Expr::Unary { inner, .. } => is_float_expr(b, ctx, inner),
-        Expr::Ternary {
-            then_expr,
-            else_expr,
-            ..
-        } => is_float_expr(b, ctx, then_expr) || is_float_expr(b, ctx, else_expr),
         _ => false,
     }
+}
+
+/// Whether a type spelling is (or contains) a managed reference —
+/// the compile-time fold for the
+/// `RuntimeHelpers.IsReferenceOrContainsReferences<T>()` intrinsic
+/// (whose managed body is a self-call placeholder that would
+/// recurse forever if lowered literally). Conservative `true`
+/// when unknown (callers take the careful path; only the fast
+/// memmove-style path is skipped). Primitives, pointers, and
+/// enums are false; arrays and classes/interfaces/delegates are
+/// true; structs recurse into instance fields (cycle-guarded);
+/// `Nullable<T>` analyzes `T`; open type variables (`TKey`)
+/// stay conservative-true.
+pub(super) fn type_contains_refs(table: &TypeTable, spelling: &str) -> bool {
+    fn go(table: &TypeTable, spelling: &str, depth: usize, seen: &mut Vec<String>) -> bool {
+        if depth > 8 {
+            return true;
+        }
+        let mut s = spelling.trim();
+        // `scoped`/`ref`/`readonly` modifiers never change ref-ness.
+        for prefix in ["scoped ", "ref ", "readonly ", "in ", "out "] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                s = rest.trim();
+            }
+        }
+        // Nullability annotations ride on the inner type.
+        s = s.trim_end().trim_end_matches('?').trim();
+        if s.is_empty() {
+            return true;
+        }
+        // Pointers carry no managed references.
+        if s.ends_with('*') {
+            return false;
+        }
+        // Arrays are reference types (any rank, incl. `[,]`).
+        if s.ends_with(']') {
+            return true;
+        }
+        // Primitives and well-known value types without references.
+        // (`nint`/`nuint`/`IntPtr`/`UIntPtr` are machine words.)
+        let base = base_type_name(s);
+        if matches!(
+            base.as_str(),
+            "SByte" | "Byte" | "Int16" | "UInt16" | "Int32" | "UInt32" | "Int64"
+                | "UInt64" | "IntPtr" | "UIntPtr" | "Char" | "Single" | "Double"
+                | "Decimal" | "Boolean" | "sbyte" | "byte" | "short" | "ushort"
+                | "int" | "uint" | "long" | "ulong" | "nint" | "nuint" | "char"
+                | "float" | "double" | "decimal" | "bool" | "void"
+        ) {
+            return false;
+        }
+        // `Nullable<T>`: the null flag is a bool; refs ride in `T`.
+        if base == "Nullable" {
+            if let Some(inner) = s.find('<').and_then(|i| s.rfind('>').map(|j| (i, j)))
+                && inner.0 + 1 < inner.1
+            {
+                return go(table, &s[inner.0 + 1..inner.1], depth + 1, seen);
+            }
+            return true;
+        }
+        let Some(entry) = table.class(&base).or_else(|| table.class(s)) else {
+            // Open type variable (`TKey`) or unknown: conservative.
+            return true;
+        };
+        if entry.is_enum {
+            return false;
+        }
+        if seen.iter().any(|k| *k == entry.key.path) {
+            return true;
+        }
+        seen.push(entry.key.path.clone());
+        if entry.is_struct {
+            return entry.fields.iter().any(|f| {
+                !f.is_static && !f.is_const && go(table, &f.type_name, depth + 1, seen)
+            });
+        }
+        true
+    }
+    go(table, spelling, 0, &mut Vec::new())
 }

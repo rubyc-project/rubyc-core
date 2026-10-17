@@ -5,6 +5,7 @@
 
 pub mod arlib;
 pub mod container;
+pub mod embedded;
 pub mod index;
 pub mod ir;
 pub mod jit;
@@ -16,6 +17,52 @@ pub mod target;
 use crate::models::CompilationUnit;
 use crate::native::target::{CodeGenBackend, ImageWriter};
 use std::path::Path;
+
+/// Encode a type fragment for embedding (`--embed-types`): the same
+/// bytes a `.rci` sidecar would carry. Empty owners means a standalone
+/// unit, so every interface/delegate counts as owned by `lib_name`;
+/// otherwise only entries attributed to `lib_name` are included.
+/// `source_hash` is 0 for direct compiles (no project to hash —
+/// link-time users accept those fragments as-is, like `--lib` bodies).
+#[allow(clippy::type_complexity)]
+pub fn analyze_fragment_bytes(
+    unit: &CompilationUnit,
+    owners: &std::collections::HashMap<crate::native::semantic::TypeKey, String>,
+    lib_name: &str,
+    source_hash: u64,
+) -> Result<
+    Vec<u8>,
+    Vec<crate::native::semantic::SemanticError>,
+> {
+    let table = crate::native::semantic::analyze_with_owners(unit, owners)?;
+    let owned = |name: &str, arity: usize| {
+        owners.is_empty()
+            || owners.iter().any(|(k, v)| {
+                v == lib_name
+                    && k.arity == arity
+                    && k.path.rsplit('.').next().unwrap_or(&k.path) == name
+            })
+    };
+    let ifaces: Vec<_> = table
+        .interfaces
+        .iter()
+        .filter(|i| owned(&i.name, i.arity))
+        .cloned()
+        .collect();
+    let delegates: Vec<_> = table
+        .delegates
+        .iter()
+        .filter(|d| owned(&d.name, d.generic_params.len()))
+        .cloned()
+        .collect();
+    Ok(crate::native::rci::encode(
+        lib_name,
+        source_hash,
+        &table.classes,
+        &ifaces,
+        &delegates,
+    ))
+}
 
 /// Everything that can go wrong while producing a native executable.
 #[derive(Debug)]
@@ -94,6 +141,43 @@ pub fn compile_to_bytes_with_libs_preamble<B: CodeGenBackend + ?Sized, W: ImageW
     entry_preamble: bool,
     defines: &[String],
 ) -> Result<Vec<u8>, Error> {
+    compile_to_bytes_with_libs_preamble_opts(
+        unit,
+        backend,
+        writer,
+        libs,
+        entry_preamble,
+        defines,
+        EmitOptions::default(),
+    )
+}
+
+/// Image emission options: size optimizations applied after linking.
+/// Both default off: output is byte-identical to the unoptimized image.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmitOptions {
+    /// Function-level dead-code elimination (`--optimize`): drop
+    /// functions unreachable from the entry point, exports, `@init`,
+    /// and address-taken references.
+    pub optimize: bool,
+    /// Drop `.symtab`/`.strtab` from executable images (`--strip`).
+    /// Shared libraries always keep `.dynsym` (required for linking).
+    pub strip: bool,
+}
+
+/// Like [`compile_to_bytes_with_libs_preamble`], plus emission options.
+pub fn compile_to_bytes_with_libs_preamble_opts<
+    B: CodeGenBackend + ?Sized,
+    W: ImageWriter + ?Sized,
+>(
+    unit: &CompilationUnit,
+    backend: &B,
+    writer: &W,
+    libs: &[std::path::PathBuf],
+    entry_preamble: bool,
+    defines: &[String],
+    opts: EmitOptions,
+) -> Result<Vec<u8>, Error> {
     let t = std::time::Instant::now();
     let program = ir::lower_with_defines(unit, true, defines).map_err(Error::Lower)?;
     eprintln!("[rubyc] timing: semantic+lower {:.1}s", t.elapsed().as_secs_f64());
@@ -126,15 +210,33 @@ pub fn compile_to_bytes_with_libs_preamble<B: CodeGenBackend + ?Sized, W: ImageW
                 .unwrap_or("")
                 .to_owned();
             for m in archive {
+                // Type-fragment members (`.rci`) ride along for readers;
+                // only machine-code members link.
+                if m.name.ends_with(".rci") {
+                    continue;
+                }
                 let decoded = backend.decode_object(&m.bytes).map_err(Error::Target)?;
                 members.push((stem.clone(), decoded));
             }
         }
         linker::link_static_archives(&mut mc, members).map_err(Error::Link)?;
     }
+    // Dead import slots (null, referenced by nothing) leave before
+    // resolution: unreachable natives must never demand `--lib` bodies
+    // or fail the link, optimized or not. Referenced slots still
+    // resolve (or fail loudly) below.
+    linker::drop_unreferenced_null_slots(&mut mc);
+    if opts.optimize {
+        // DCE first: slots only dead code references leave with it, so
+        // unreachable natives never demand `--lib` bodies below.
+        let t = std::time::Instant::now();
+        linker::dead_code_eliminate(&mut mc);
+        eprintln!("[rubyc] timing: dce {:.1}s", t.elapsed().as_secs_f64());
+    }
     if !mc.import_names.is_empty() {
         linker::resolve_imports(&mut mc, &elf_libs).map_err(Error::Link)?;
     }
+    mc.strip_symbols = opts.strip;
 
     // Executables are self-contained static images (no dynamic
     // linker involved): dependency-image imports (`.so` hints, left
@@ -195,6 +297,8 @@ pub fn compile_shared_library<B: CodeGenBackend + ?Sized, W: ImageWriter + ?Size
     writer: &W,
     libs: &[std::path::PathBuf],
     defines: &[String],
+    embed_types: Option<&[u8]>,
+    opts: EmitOptions,
 ) -> Result<Vec<u8>, Error> {
     compile_shared_library_with_owners(
         unit,
@@ -204,12 +308,15 @@ pub fn compile_shared_library<B: CodeGenBackend + ?Sized, W: ImageWriter + ?Size
         defines,
         &std::collections::HashMap::new(),
         &crate::native::semantic::Preloaded::empty(),
+        embed_types,
+        opts,
     )
 }
 
 /// Like [`compile_shared_library`], plus per-entry library ownership
 /// for dynamic-linking (see `ir::lower_with_owners`). Empty owners
-/// behave exactly as before.
+/// behave exactly as before. `embed_types` carries pre-encoded `.rci`
+/// bytes into a `.rubyc_types` section instead of a sidecar file.
 pub fn compile_shared_library_with_owners<
     B: CodeGenBackend + ?Sized,
     W: ImageWriter + ?Sized,
@@ -221,6 +328,8 @@ pub fn compile_shared_library_with_owners<
     defines: &[String],
     owners: &std::collections::HashMap<crate::native::semantic::TypeKey, String>,
     preloaded: &crate::native::semantic::Preloaded,
+    embed_types: Option<&[u8]>,
+    opts: EmitOptions,
 ) -> Result<Vec<u8>, Error> {
     // Libraries need no `main`; no @start stub is generated.
     let t = std::time::Instant::now();
@@ -245,9 +354,18 @@ pub fn compile_shared_library_with_owners<
             linker::resolve_imports(&mut mc, libs).map_err(Error::Link)?;
         }
     }
+    if opts.optimize {
+        linker::dead_code_eliminate(&mut mc);
+    }
+    mc.strip_symbols = opts.strip;
 
     let t = std::time::Instant::now();
-    let image = writer.write_shared_library(&mc).map_err(Error::Target)?;
+    let image = match embed_types {
+        Some(types) => writer
+            .write_shared_library_embedded(&mc, types)
+            .map_err(Error::Target)?,
+        None => writer.write_shared_library(&mc).map_err(Error::Target)?,
+    };
     eprintln!("[rubyc] timing: image {:.1}s", t.elapsed().as_secs_f64());
 
     // Same preamble invariant as executables, at offset 64 instead of the
@@ -269,11 +387,14 @@ pub fn compile_shared_library_with_owners<
 /// `main`; no @start stub is generated, exactly like shared builds).
 /// The same `.rci` sidecar serves both dynamic and static consumers.
 /// Static state duplicates per linked image (see `linker`).
+/// `embed_types` adds a second `<member>.rci` archive member with
+/// pre-encoded fragment bytes instead of a sidecar file.
 pub fn compile_static_archive<B: CodeGenBackend + ?Sized>(
     unit: &CompilationUnit,
     backend: &B,
     member_name: &str,
     defines: &[String],
+    embed_types: Option<&[u8]>,
 ) -> Result<Vec<u8>, Error> {
     let t = std::time::Instant::now();
     let program =
@@ -286,10 +407,17 @@ pub fn compile_static_archive<B: CodeGenBackend + ?Sized>(
     eprintln!("[rubyc] timing: backend {:.1}s", t.elapsed().as_secs_f64());
 
     let object = backend.encode_object(&mc).map_err(Error::Target)?;
-    Ok(arlib::write(&[arlib::Member {
+    let mut members = vec![arlib::Member {
         name: member_name.to_owned(),
         bytes: object,
-    }]))
+    }];
+    if let Some(types) = embed_types {
+        members.push(arlib::Member {
+            name: format!("{member_name}.rci"),
+            bytes: types.to_vec(),
+        });
+    }
+    Ok(arlib::write(&members))
 }
 
 

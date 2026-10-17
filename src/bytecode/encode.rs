@@ -204,6 +204,7 @@ impl Writer {
                     self.byte(access_byte);
                     self.byte(field.is_const as u8);
                     self.byte(field.is_static as u8);
+                    self.byte(field.is_byref as u8);
                     self.attrs(&field.attrs);
                     self.string(&field.type_name);
                     self.string(&field.name);
@@ -234,6 +235,9 @@ impl Writer {
                     }
                     if prop.is_static {
                         flags |= 0b100;
+                    }
+                    if prop.is_abstract {
+                        flags |= 0b1000;
                     }
                     self.byte(flags);
                     self.attrs(&prop.attrs);
@@ -430,6 +434,14 @@ impl Writer {
         } else {
             format::tag::ABSENT
         });
+        // By-reference marker (`ref`/`out`/`in`): load-bearing for
+        // lowering (callers box, callees dereference), unlike
+        // `is_params` which the v1 contract drops.
+        self.byte(if param.is_byref {
+            format::tag::PRESENT
+        } else {
+            format::tag::ABSENT
+        });
     }
 
     fn block(&mut self, block: &Block) {
@@ -473,12 +485,18 @@ impl Writer {
                 name,
                 init,
                 access,
+                is_byref,
                 ..
             } => {
                 self.byte(format::tag::LET);
                 self.string(type_name);
                 self.string(name);
                 self.byte(*access as u8);
+                self.byte(if *is_byref {
+                    format::tag::PRESENT
+                } else {
+                    format::tag::ABSENT
+                });
                 self.expr(init);
             }
             Stmt::If {
@@ -569,6 +587,28 @@ impl Writer {
             }
             Stmt::Break { .. } => self.byte(format::tag::stmt::BREAK),
             Stmt::Continue { .. } => self.byte(format::tag::stmt::CONTINUE),
+            Stmt::Label { name, .. } => {
+                self.byte(format::tag::stmt::LABEL);
+                self.string(name);
+            }
+            Stmt::Fixed {
+                declarators, body, ..
+            } => {
+                self.byte(format::tag::stmt::FIXED);
+                self.u32(declarators.len());
+                for (ty, name, init) in declarators {
+                    self.string(ty);
+                    self.string(name);
+                    match init {
+                        Some(e) => {
+                            self.byte(format::tag::PRESENT);
+                            self.expr(e);
+                        }
+                        None => self.byte(format::tag::ABSENT),
+                    }
+                }
+                self.block(body);
+            }
             Stmt::Goto {
                 label,
                 case_expr,
@@ -633,6 +673,24 @@ impl Writer {
                     }
                     None => self.byte(format::tag::ABSENT),
                 }
+            }
+            Stmt::LocalFunction {
+                name,
+                params,
+                ret_type,
+                body,
+                is_static,
+                ..
+            } => {
+                self.byte(format::tag::stmt::LOCAL_FUNCTION);
+                self.string(name);
+                self.u32(params.len());
+                for p in params {
+                    self.param(p);
+                }
+                self.string(ret_type);
+                self.block(body);
+                self.byte(if *is_static { 1 } else { 0 });
             }
         }
     }
@@ -723,13 +781,18 @@ impl Writer {
                 self.expr(else_expr);
             }
             Expr::New {
-                class_name, args, ..
+                class_name, args, init, ..
             } => {
                 self.byte(format::tag::NEW);
                 self.string(class_name);
                 self.u32(args.len());
                 for arg in args {
                     self.expr(arg);
+                }
+                self.u32(init.len());
+                for m in init {
+                    self.string(&m.name);
+                    self.expr(&m.value);
                 }
             }
             Expr::Member { object, name, .. } => {
@@ -748,10 +811,14 @@ impl Writer {
                     self.expr(arg);
                 }
             }
-            Expr::NewArray { elem_type, size, .. } => {
+            Expr::NewArray { elem_type, size, init, .. } => {
                 self.byte(format::tag::NEW_ARRAY);
                 self.string(elem_type);
                 self.expr(size);
+                self.u32(init.len());
+                for e in init {
+                    self.expr(e);
+                }
             }
             Expr::Index { object, index, is_range, .. } => {
                 self.byte(format::tag::INDEX);

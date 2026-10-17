@@ -37,6 +37,7 @@ impl CodeGenBackend for StubBackend {
             init_fn: None,
             relocs: vec![],
             heap_size: 0,
+            strip_symbols: false,
         })
     }
 }

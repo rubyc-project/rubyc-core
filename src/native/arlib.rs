@@ -3,7 +3,9 @@
 //! Each member holds one library's serialized `MachineCode`; the static
 //! link step merges members into the final image. No SysV symbol index:
 //! our linker resolves members itself, and plain archives keep GNU `ar`
-//! (`t`/`x`) interoperable.
+//! (`t`/`x`) interoperable. Member-name convention: the bare lib name
+//! carries machine code, `<name>.rci` (with `--embed-types`) carries
+//! its type fragment — linkers skip `.rci` members when merging code.
 //!
 //! Layout: `!<arch>\n`, then per member a 60-byte header
 //! (name[16] mtime[12] uid[6] gid[6] mode[8] size[10] `` `\n ``) plus

@@ -55,6 +55,7 @@ fn every_en_key_translates() {
         "rubyc.native.target.TargetError.no_shared_library",
         "rubyc.native.target.TargetError.no_static_archive",
         "rubyc.native.target.TargetError.bad_object",
+        "rubyc.native.target.TargetError.no_type_embed",
         "rubyc.lint.W0001",
         "rubyc.lint.W0002",
         "rubyc.models.symbols.Scope.declare.duplicate",

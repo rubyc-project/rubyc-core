@@ -1,11 +1,14 @@
 //! First-class `string` lowering. A string object is laid out as
-//! `[0..8)=len, [8..16)=refcount, [16..)=utf8 data`, so:
-//! - `s[i]` reads one byte at `obj + 16 + i` -> `LoadByte { off: 0 }` over a
-//!   `base + 16 + i` address (byte granularity, not the 8-byte `LoadField`
-//!   array path).
-//! - `a + b` allocates a runtime-sized object of `len_a + len_b + 16` bytes
-//!   (`AllocDyn`), stores the total length at `+0`, refcount `1` at `+8`, and
-//!   `MemCpy`s both payloads into `+16`.
+//! `[0..8)=len (character count), [8..16)=refcount, [16..)=utf16 data`
+//! (`char_len*2` bytes, see `build_utf16_string`), so:
+//! - `s[i]` reads one UTF-16 unit at `obj + 16 + i*2` -> `LoadField`
+//!   masked with `0xFFFF` (zero-extended char, not the 8-byte array
+//!   path and not a single byte: byte reads return the low byte of
+//!   even chars and zero for odd ones).
+//! - `a + b` allocates a runtime-sized object of `(len_a + len_b)*2 + 16`
+//!   bytes (`AllocDyn`), stores the total character count at `+0`,
+//!   refcount `1` at `+8`, and `MemCpy`s both payloads (`len*2` bytes
+//!   each) into `+16`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -102,10 +105,17 @@ const SRC_INDEX: &str = r#"class c {
 
 #[test]
 fn string_index_emits_loadbyte() {
+    // `s[i]` on a UTF-16 string reads one 16-bit unit at
+    // `obj + 16 + i*2`: a full-width `LoadField` masked with
+    // `0xFFFF` (zero-extended char).
     let p = lower(SRC_INDEX);
     assert!(
-        has(&p, |i| matches!(i, Instr::LoadByte { off, .. } if *off == 0)),
-        "`s[i]` on a string must lower to a byte-granularity LoadByte (off = 0)"
+        has(&p, |i| matches!(i, Instr::Bin { op: crate::native::ir::BinOp::BitAnd, .. })),
+        "`s[i]` on a string must mask the loaded unit to 16 bits"
+    );
+    assert!(
+        has(&p, |i| matches!(i, Instr::Const { imm: 0xFFFF, .. })),
+        "`s[i]` must carry a 0xFFFF unit mask"
     );
 }
 
@@ -113,21 +123,27 @@ fn string_index_emits_loadbyte() {
 fn string_index_reads_past_the_16_byte_header() {
     let p = lower(SRC_INDEX);
     let defs = defs(&p);
-    // The LoadByte's base must be an address computed as `obj + 16 + i`, i.e.
-    // it must be built from the `Const { imm: 16 }` data offset.
+    // The unit load's base must be an address computed as
+    // `obj + 16 + i*2`, i.e. it must be built from both the
+    // `Const { imm: 16 }` data offset and a `Const { imm: 2 }`
+    // element stride.
     let base = p
         .functions
         .iter()
         .flat_map(|f| f.blocks.iter())
         .flat_map(|b| b.instrs.iter())
         .find_map(|i| match i {
-            Instr::LoadByte { base, .. } => Some(*base),
+            Instr::LoadField { base, .. } => Some(*base),
             _ => None,
         })
-        .expect("a LoadByte base must exist for s[i]");
+        .expect("a LoadField base must exist for s[i]");
     assert!(
         reaches_const(&defs, base, 16),
-        "the LoadByte base (obj + 16 + i) must incorporate the 16-byte string header offset"
+        "the LoadField base (obj + 16 + i*2) must incorporate the 16-byte string header offset"
+    );
+    assert!(
+        reaches_const(&defs, base, 2),
+        "the LoadField base (obj + 16 + i*2) must incorporate the 2-byte char stride"
     );
 }
 

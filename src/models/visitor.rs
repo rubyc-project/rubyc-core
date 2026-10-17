@@ -79,6 +79,14 @@ pub trait Visitor {
         match stmt {
             Stmt::Expression(expr) => self.visit_expr(expr),
             Stmt::Block { body, .. } => self.visit_block(body),
+            Stmt::Fixed { declarators, body, .. } => {
+                for (_, _, init) in declarators {
+                    if let Some(e) = init {
+                        self.visit_expr(e);
+                    }
+                }
+                self.visit_block(body);
+            }
             Stmt::Assign { value, .. } => self.visit_expr(value),
             Stmt::MemberAssign { object, value, .. } => {
                 self.visit_expr(object);
@@ -164,7 +172,10 @@ pub trait Visitor {
                     self.visit_expr(e);
                 }
             }
-            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Goto { .. } => {}
+            Stmt::LocalFunction { body, .. } => {
+                self.visit_block(body);
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Goto { .. } | Stmt::Label { .. } => {}
         }
     }
 

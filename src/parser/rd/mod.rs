@@ -36,9 +36,11 @@ pub fn parse_lenient(source: &str) -> (CompilationUnit, Vec<SyntaxError>) {
         pending: Vec::new(),
         pending_members: Vec::new(),
         pre_pending: Vec::new(),
+        in_base_init: false,
         enum_values: Vec::new(),
         aliases: Vec::new(),
         static_usings: Vec::new(),
+        foreach_seq: 0,
     };
     let unit = parser.compilation_unit();
     (unit, std::mem::take(&mut parser.errors))
@@ -53,10 +55,19 @@ pub(super) struct Parser {
     pub(super) source: Vec<u8>,
     /// Enclosing namespace :: class :: function for error context.
     pub(super) context: ScopeContext,
+    /// Monotonic counter for hygienic `foreach` desugar temporaries
+    /// (`__foreach_coll_N`, `__foreach_idx_N`).
+    pub(super) foreach_seq: u32,
     /// Trailing declarators from a multi-declarator statement
     /// (`int a = 1, b = 2;`) that the compact `Let` AST cannot carry in a
     /// single node. Drained by `block()` so each becomes its own `Stmt::Let`.
     pub(super) pending: Vec<crate::models::Stmt>,
+    /// Inside `: base(...)` / `: this(...)` argument lists: `out`
+    /// variables declared there lower after the chained call (their
+    /// `Let`s splice at the body front), so their slots must stay
+    /// the old nameless default (box without writeback) — an `Ident`
+    /// would fail as undeclared at the call.
+    pub(super) in_base_init: bool,
     /// Trailing declarators from a multi-declarator field
     /// (`string? a, b, c;`) that one `FieldDecl` cannot carry.
     /// Drained by the class body loop so each becomes its own member.
@@ -118,9 +129,11 @@ impl Parser {
             pending: Vec::new(),
             pending_members: Vec::new(),
             pre_pending: Vec::new(),
+        in_base_init: false,
             enum_values: Vec::new(),
             aliases: Vec::new(),
             static_usings: Vec::new(),
+        foreach_seq: 0,
         }
     }
 
@@ -287,6 +300,7 @@ impl Parser {
                             init: crate::models::Expr::Literal(
                                 crate::models::Literal::Int(0),
                             ),
+                            is_byref: false,
                             access: crate::models::Access::Default,
                             span: span_at(self, open).to(nspan),
                         });
@@ -477,6 +491,7 @@ impl Parser {
                     },
                     name,
                     init: crate::models::Expr::Literal(crate::models::Literal::Int(0)),
+                    is_byref: false,
                     access: crate::models::Access::Default,
                     span: span_at(self, open).to(nspan),
                 });

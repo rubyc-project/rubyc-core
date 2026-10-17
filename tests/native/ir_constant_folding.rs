@@ -149,7 +149,12 @@ fn const_field_non_constant_init_is_an_error() {
 
 // ---- helpers ----
 fn program_main(p: &Program) -> &crate::native::ir::IrFunction {
-    p.functions.last().unwrap()
+    // By name, not position: synthetic helpers (e.g. the placeholder
+    // vtable stub) may trail entry functions.
+    p.functions
+        .iter()
+        .find(|f| f.name.contains("main"))
+        .expect("main lowers")
 }
 fn f_blocks(f: &crate::native::ir::IrFunction) -> &[Instr] {
     &f.blocks[0].instrs

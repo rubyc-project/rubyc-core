@@ -66,27 +66,39 @@ impl Index {
 }
 
 /// Load or regenerate the index for `lib_dir` (`.../libraries`).
-/// Missing `.rci` files decode-skipped (the consume path reports those
-/// per-dependency); an empty fragment set yields an empty index without
-/// writing a file.
+/// Fragment bytes come from each lib's image first (embedded
+/// `.rubyc_types` section in `.so`, `<member>.rci` member in `.a`) and
+/// fall back to its `.rci` sidecar file; libs with neither are skipped
+/// (the consume path reports those per-dependency). The table regenerates
+/// whenever any artifact is newer than it (mtime-guarded, so
+/// steady-state builds pay stats, not full re-decodes). An empty
+/// fragment set yields an empty index without writing a file.
 pub fn ensure(lib_dir: &Path) -> Result<Index, String> {
     let tsv = lib_dir.join(INDEX_FILE);
-    let mut rcis: Vec<PathBuf> = Vec::new();
     let entries = std::fs::read_dir(lib_dir).map_err(|e| format!("cannot list {}: {e}", lib_dir.display()))?;
+    let mut libs: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut artifacts: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot list {}: {e}", lib_dir.display()))?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "rci") {
-            rcis.push(path);
+        let is_artifact = path.extension().is_some_and(|e| {
+            e == "rci" || e == "so" || e == "a"
+        });
+        if !is_artifact {
+            continue;
+        }
+        artifacts.push(path.clone());
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            libs.entry(stem.to_owned()).or_default().push(path);
         }
     }
-    rcis.sort();
-    if rcis.is_empty() {
+    libs.values_mut().for_each(|v| v.sort());
+    if libs.is_empty() {
         return Ok(Index::default());
     }
     let tsv_fresh = tsv.is_file()
         && mtime(&tsv)
-            .zip(rcis.iter().map(|p| mtime(p)).collect::<Option<Vec<_>>>())
+            .zip(artifacts.iter().map(|p| mtime(p)).collect::<Option<Vec<_>>>())
             .is_some_and(|(t, ms)| ms.iter().all(|m| *m <= t));
     if tsv_fresh {
         let text =
@@ -94,11 +106,41 @@ pub fn ensure(lib_dir: &Path) -> Result<Index, String> {
         return Ok(Index::build(&parse_rows(&text)));
     }
     let mut rows = Vec::new();
-    for path in &rcis {
-        let Ok(bytes) = std::fs::read(path) else { continue };
-        let Ok(frag) = crate::native::rci::decode(&bytes) else {
+    for (lib, paths) in &libs {
+        let mut frag_bytes: Option<Vec<u8>> = None;
+        for path in paths {
+            let Ok(image) = std::fs::read(path) else {
+                continue;
+            };
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let embedded = match ext {
+                "so" => super::embedded::table_bytes(&image)
+                    .or_else(|| super::embedded::section_bytes(&image))
+                    .map(|b| b.to_vec()),
+                "a" => super::arlib::read(&image)
+                    .ok()
+                    .and_then(|members| {
+                        super::embedded::archive_member(&members).map(|b| b.to_vec())
+                    }),
+                _ => None,
+            };
+            if embedded.is_some() {
+                frag_bytes = embedded;
+                break;
+            }
+            if ext == "rci" {
+                frag_bytes = Some(image);
+            }
+        }
+        let Some(frag_bytes) = frag_bytes else {
             continue;
         };
+        let Ok(frag) = crate::native::rci::decode(&frag_bytes) else {
+            continue;
+        };
+        if frag.lib_name != *lib {
+            continue;
+        }
         for c in &frag.classes {
             rows.push(Row {
                 path: c.key.path.clone(),
@@ -254,6 +296,62 @@ mod tests {
         // Second call loads the file instead of re-decoding.
         let index = ensure(&dir).expect("tsv load");
         assert!(index.lookup("A.B").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fragment embedded in an image with no sidecar file at all:
+    /// the index must still cover the lib.
+    #[test]
+    fn ensure_indexes_embedded_without_sidecar() {
+        use crate::native::semantic::{ClassInfo, TypeKey};
+        let dir = std::env::temp_dir().join(format!(
+            "rubyc-index-emb-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let class = ClassInfo {
+            name: "Widget".into(),
+            key: TypeKey::new("A.B.Widget", 0),
+            bases: vec![],
+            fields: vec![],
+            static_fields: vec![],
+            const_fields: vec![],
+            methods: vec![],
+            own_members: vec![],
+            interfaces: vec![],
+            properties: vec![],
+            is_enum: false,
+            generic_params: vec![],
+            is_struct: false,
+            owner: "LibE".into(),
+        };
+        let frag = crate::native::rci::encode("LibE", 7, &[class], &[], &[]);
+        // Minimal ELF carrying the fragment as `.rubyc_types`.
+        let strings = b"\0.rubyc_types\0.shstrtab\0";
+        let shoff = 64usize;
+        let types_off = shoff + 3 * 64;
+        let str_off = types_off + frag.len();
+        let mut image = vec![0u8; str_off + strings.len()];
+        image[0..4].copy_from_slice(b"\x7fELF");
+        image[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        image[58..60].copy_from_slice(&64u16.to_le_bytes());
+        image[60..62].copy_from_slice(&3u16.to_le_bytes());
+        image[62..64].copy_from_slice(&2u16.to_le_bytes());
+        let mut sh = |i: usize, name: u32, typ: u32, off: usize, size: usize| {
+            let at = shoff + i * 64;
+            image[at..at + 4].copy_from_slice(&name.to_le_bytes());
+            image[at + 4..at + 8].copy_from_slice(&typ.to_le_bytes());
+            image[at + 24..at + 32].copy_from_slice(&(off as u64).to_le_bytes());
+            image[at + 32..at + 40].copy_from_slice(&(size as u64).to_le_bytes());
+        };
+        sh(1, 1, 1, types_off, frag.len());
+        sh(2, 14, 3, str_off, strings.len());
+        image[types_off..types_off + frag.len()].copy_from_slice(&frag);
+        image[str_off..str_off + strings.len()].copy_from_slice(strings);
+        std::fs::write(dir.join("LibE.so"), &image).unwrap();
+        let index = ensure(&dir).expect("regen from embedded");
+        assert_eq!(index.lookup("A.B"), vec!["LibE"]);
+        assert!(dir.join(INDEX_FILE).is_file(), "tsv written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

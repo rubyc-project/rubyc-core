@@ -48,6 +48,7 @@ fn sample_unit(span_start: u32) -> CompilationUnit {
                 span: sp(20),
                 is_partial: false,
                 is_struct: false,
+                union_cross_assembly: false,
             })],
             span: sp(10),
         }],
@@ -212,6 +213,7 @@ mod structural_eq {
             name: name.into(),
             init,
             access: Access::Default,
+            is_byref: false,
             span: Span::default(),
         }
     }
@@ -249,6 +251,7 @@ mod structural_eq {
             span: Span::default(),
             is_partial: false,
             is_struct: false,
+            union_cross_assembly: false,
         }
     }
 
@@ -399,6 +402,7 @@ mod structural_eq {
             name: "x".into(),
             init: expr_int(1),
             access: Access::Default,
+            is_byref: false,
             span: Span::default(),
         };
         assert!(!a.structural_eq(&c));
@@ -462,6 +466,7 @@ mod structural_eq {
             default_value: None,
             is_this: false,
             is_params: false,
+            is_byref: false,
         };
         assert!(p == p.clone());
 

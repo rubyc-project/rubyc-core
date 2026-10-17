@@ -111,6 +111,44 @@ fn object_initializer_parse() {
 }
 
 #[test]
+fn object_initializer_members_captured() {
+    // `new Foo { X = 1, Y = 2 }` must capture the member writes on
+    // `Expr::New.init` (they run after construction — field stores
+    // or setter dispatch). Index- and collection-initializer
+    // elements stay dropped (documented gap).
+    let src = r#"namespace test {
+    public class Foo {
+        public int X;
+        public int Y;
+        public static Foo Create() {
+            return new Foo { X = 1, Y = 2 };
+        }
+    }
+}"#;
+    let unit = parser::parse(src)
+        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    let Member::Class(decl) = &unit.namespaces[0].members[0] else {
+        panic!("expected class");
+    };
+    let m = decl
+        .members
+        .iter()
+        .find_map(|m| match m {
+            ClassMember::Method(m) if m.name == "Create" => Some(m),
+            _ => None,
+        })
+        .expect("Create method");
+    let body = m.body.as_ref().expect("body");
+    let Stmt::Return { value: Some(Expr::New { init, .. }), .. } = &body.stmts[0] else {
+        panic!("expected return-new, got {:?}", body.stmts[0]);
+    };
+    assert_eq!(init.len(), 2, "both member writes captured");
+    assert_eq!(init[0].name, "X");
+    assert_eq!(init[1].name, "Y");
+    assert!(matches!(init[0].value, Expr::Literal(Literal::Int(1))));
+}
+
+#[test]
 fn ref_in_assignment_parse() {
     let src = r#"namespace test {
     public ref struct RefFieldHolder {
@@ -1804,8 +1842,8 @@ fn spaced_ternary_vs_adjacent_null_conditional() {
         panic!("expected let statement")
     };
     assert!(
-        matches!(idx, Expr::Index { .. }),
-        "adjacent form must be an index, got {idx:?}"
+        matches!(idx, Expr::Ternary { .. }),
+        "adjacent form must be a null-guarded index (ternary), got {idx:?}"
     );
 }
 
@@ -2962,4 +3000,60 @@ fn query_as_call_argument_parses() {
     let src = "namespace t { class C { object M(object xs) { var r = Take(from pi in xs where pi != null select pi); return r; } object Take(object q) { return q; } int Main() { return 0; } } }";
     parser::parse(src)
         .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+}
+
+#[test]
+fn attributed_lambda_forms_parse() {
+    // Attributes on lambdas (C# 10+): `[Attr(...)] (params) => body`.
+    // The attribute list is consumed only when a lambda shape follows
+    // the closing bracket (a bare `[` otherwise starts a collection);
+    // attributes carry no lowering meaning and are dropped. Regression:
+    // event subscription `E += [Attr] (x) => {...}` failed with
+    // "expected ';' after assignment".
+    for src in [
+        r#"class C { Main() { E += [System.Obsolete("x")] (x) => { }; return 0; } }"#,
+        r#"class C { Main() { var f = [A] (a, b) => a; return 0; } }"#,
+        r#"class C { Main() { var f = [A] x => x; return 0; } }"#,
+        r#"class C { Main() { var f = [A] static (x) => x; return 0; } }"#,
+        r#"class C { Main() { var f = [A] async (x) => x; return 0; } }"#,
+    ] {
+        parser::parse(src)
+            .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
+    }
+    // Collection expressions still parse as collections, not lambdas.
+    parser::parse(r#"class C { Main() { var xs = new int[3]; xs[0] = 1; return 0; } }"#)
+        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+}
+
+#[test]
+fn attribute_new_array_arguments_parse() {
+    // `new[]` / `new T[]` / `new T(...)` as attribute argument values
+    // (e.g. `[UnmanagedCallConv(CallConvs = new[] { typeof(X) })]`):
+    // values are inert metadata, consumed balanced. Regression: Common
+    // interop sources failed with "expected ')' to close attribute
+    // arguments, found 'LeftBracket'".
+    for src in [
+        r#"class C { [A(CallConvs = new[] { typeof(X) })] int M() { return 0; } }"#,
+        r#"class C { [A(Vals = new int[] { 1, 2 })] int M() { return 0; } }"#,
+        r#"class C { [A(V = new Foo(1, "x"))] int M() { return 0; } }"#,
+    ] {
+        parser::parse(src)
+            .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
+    }
+}
+
+#[test]
+fn extension_block_generic_receiver_parses() {
+    // Extension blocks whose receiver type carries generic commas
+    // (`extension<TKey, TValue>(ConcurrentDictionary<TKey, TValue> d)`):
+    // the receiver scanner must not mistake the generic comma for a
+    // separator. Regression: Common polyfills failed with "expected
+    // identifier as method name, found 'Less'".
+    for src in [
+        r#"class P { extension<TKey, TValue>(ConcurrentDictionary<TKey, TValue> dictionary) where TKey : notnull { public int M() { return 0; } } }"#,
+        r#"class P { extension<T>(List<T> items) { public int M() { return 0; } } }"#,
+    ] {
+        parser::parse(src)
+            .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
+    }
 }

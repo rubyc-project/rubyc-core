@@ -16,6 +16,9 @@ pub struct Symbol {
     /// Frame slot assigned during lowering.
     pub slot: usize,
     pub access: Access,
+    /// By-reference parameter (`ref`/`out`/`in`): the home holds an
+    /// address (callers box), and accesses dereference through it.
+    pub is_byref: bool,
 }
 
 /// A single lexical scope.
@@ -76,11 +79,34 @@ impl ScopeStack {
         self.scopes.pop();
     }
 
+    /// Depth for checkpoint/restore (see `Body` fail-soft inlining).
+    pub fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Truncate to a shallower depth (drops pushed scopes).
+    /// Slot numbers stay monotonic (never reused).
+    pub fn truncate(&mut self, depth: usize) {
+        self.scopes.truncate(depth);
+    }
+
     pub fn declare(
         &mut self,
         name: &str,
         type_name: &str,
         access: Access,
+    ) -> Result<usize, String> {
+        self.declare_byref(name, type_name, access, false)
+    }
+
+    /// Declare with an explicit by-reference flag (for `ref`/`out`/`in`
+    /// parameters, whose homes hold addresses).
+    pub fn declare_byref(
+        &mut self,
+        name: &str,
+        type_name: &str,
+        access: Access,
+        is_byref: bool,
     ) -> Result<usize, String> {
         let slot = self.next_slot;
         self.scopes
@@ -91,6 +117,7 @@ impl ScopeStack {
                 type_name: type_name.to_owned(),
                 slot,
                 access,
+                is_byref,
             })?;
         self.next_slot += 1;
         Ok(slot)

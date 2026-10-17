@@ -140,6 +140,13 @@ pub enum Instr {
     Neg { dst: VReg, a: VReg },
     /// dst = -a (f64)
     FNeg { dst: VReg, a: VReg },
+    /// dst = (i64)a truncating toward zero (C# unchecked `long`/`int`
+    /// conversion from `float`/`double`; `a` holds f64 bits, dst an
+    /// i64 — `cvttsd2si` semantics, out-of-range yields i64::MIN).
+    F2I { dst: VReg, src: VReg },
+    /// dst = (f64)a as bits (C# conversion from any integral type;
+    /// `cvtsi2sd` semantics, exact for |a| < 2**53).
+    I2F { dst: VReg, src: VReg },
 
     /// Direct call. `args` is the full argument list already in calling
     /// order: `[receiver?] ++ params`. The ABI places them in registers,
@@ -358,6 +365,14 @@ impl IrFunction {
         };
         if receiver == ReceiverKind::This {
             f.fresh_vreg(); // vreg 0 = this
+        } else {
+            // Static methods take no receiver, but vreg 0 stays
+            // reserved: parameter homes are 1-based everywhere
+            // (bindings seed, backend prologue fills), so fresh
+            // temporaries must start past them. Without this, the
+            // first temp of a static method collides with its last
+            // parameter's home and silently overwrites it.
+            f.fresh_vreg(); // vreg 0 = unused padding
         }
         for _ in 0..arity {
             f.fresh_vreg(); // params follow

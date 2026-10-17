@@ -133,9 +133,41 @@ const IO_FLAGS: &[FlagSpec] = &[
         help: "rubyc.cli.flag.rci_only",
     },
     FlagSpec::value('j', "jobs", "N", "rubyc.cli.flag.jobs"),
+    FlagSpec {
+        short: None,
+        long: "no-embed-types",
+        kind: ArgKind::Switch,
+        choices: &[],
+        placeholder: "",
+        help: "rubyc.cli.flag.no_embed_types",
+    },
     // Last: every command selects flags by numeric index, so appended
     // flags must never shift existing positions.
     FlagSpec::value('l', "lib", "FILE", "rubyc.cli.flag.lib"),
+    FlagSpec {
+        short: None,
+        long: "optimize",
+        kind: ArgKind::Switch,
+        choices: &[],
+        placeholder: "",
+        help: "rubyc.cli.flag.optimize",
+    },
+    FlagSpec {
+        short: None,
+        long: "strip",
+        kind: ArgKind::Switch,
+        choices: &[],
+        placeholder: "",
+        help: "rubyc.cli.flag.strip",
+    },
+    FlagSpec {
+        short: None,
+        long: "profile",
+        kind: ArgKind::Required,
+        choices: &[],
+        placeholder: "NAME",
+        help: "rubyc.cli.flag.profile",
+    },
 ];
 
 /// `new --solution`: scaffold a `.rcs` solution instead of a `.rcp` project.
@@ -187,6 +219,10 @@ pub const BUILD: CommandSpec = CommandSpec {
         IO_FLAGS[11],
         IO_FLAGS[12],
         IO_FLAGS[13],
+        IO_FLAGS[14],
+        IO_FLAGS[15],
+        IO_FLAGS[16],
+        IO_FLAGS[17],
     ],
     examples: "rubyc.cli.BUILD.examples",
 };
@@ -246,7 +282,19 @@ pub const LIST: CommandSpec = CommandSpec {
 pub const INSTALL: CommandSpec = CommandSpec {
     name: "install",
     about: "rubyc.cli.INSTALL.about",
-    flags: &[],
+    flags: &[
+        IO_FLAGS[12],
+        IO_FLAGS[13],
+        IO_FLAGS[14],
+        FlagSpec {
+            short: None,
+            long: "format",
+            kind: ArgKind::Required,
+            choices: &["shared", "static", "both"],
+            placeholder: "FMT",
+            help: "rubyc.cli.flag.install_format",
+        },
+    ],
     examples: "rubyc.cli.INSTALL.examples",
 };
 
@@ -398,6 +446,9 @@ pub(super) fn apply_switch(flag: &FlagSpec, verbose: &mut bool, quiet: &mut bool
         "skip-pre-hook" => io.skip_pre_hook = true,
         "skip-post-hook" => io.skip_post_hook = true,
         "rci-only" => io.rci_only = true,
+        "no-embed-types" => io.no_embed_types = true,
+        "optimize" => io.optimize = true,
+        "strip" => io.strip = true,
         "remote" => {}
         _ => unreachable!("unhandled switch flag '{}'", flag.long),
     }
@@ -454,6 +505,7 @@ pub(super) fn store_value(
         "base64" => io.base64 = true,
         "shebang" => io.shebang = Some(value.to_owned()),
         "lib" => io.libs.push(value.to_owned()),
+        "format" => io.install_format = Some(value.to_owned()),
         "jobs" => {
             io.jobs = value.parse::<usize>().map_err(|_| crate::cli::CliError::InvalidValue {
                 flag: "--jobs".into(),
@@ -463,6 +515,7 @@ pub(super) fn store_value(
         }
         "base" => io.base = Some(value.to_owned()),
         "targets-dir" => io.targets_dir = Some(value.to_owned()),
+        "profile" => io.profile = Some(value.to_owned()),
         "target" => io.target = Some(value.to_owned()),
         "kind" => io.kind = Some(value.to_owned()),
         "url" => io.url = Some(value.to_owned()),

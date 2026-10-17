@@ -508,13 +508,17 @@ impl Parser {
         self.peek_at(offset).kind == TokenKind::LeftParen
     }
 
-    /// Parse a local function declaration. The signature is parsed
-    /// permissively; the body is consumed up to the matching `}`.
+    /// Parse a local function declaration, preserving it as
+    /// `Stmt::LocalFunction` when static, non-generic, and bodied
+    /// (lowered to a real function); anything else keeps the legacy
+    /// zero placeholder (`Let fn = 0` + `Break`).
     fn parse_local_function(&mut self, start: Span) -> Option<Stmt> {
         // Optional `static` / `async` / `unsafe` modifiers, plus `ref` /
         // `readonly` / `scoped` return modifiers (by-ref-ness has no
         // runtime representation here), plus `extern` (extern locals
         // are bodyless `[UnsafeAccessor]` declarations).
+        let mut is_static = false;
+        let mut is_async = false;
         while matches!(
             self.peek().kind,
             TokenKind::Keyword(Keyword::Static)
@@ -525,12 +529,22 @@ impl Parser {
                 | TokenKind::Keyword(Keyword::Scoped)
                 | TokenKind::Keyword(Keyword::Extern)
         ) {
+            if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Static)) {
+                is_static = true;
+            }
+            if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Async)) {
+                is_async = true;
+            }
             self.bump();
         }
         // Tuple return type: `(T1 n1, T2 n2) Name(` or `(T1, T2) Name(`.
         // Consumed as a unit; the element names are not bindings
         // (unlike tuple *declarations*, which never appear here).
+        // Tuple-returning locals keep the legacy placeholder.
+        let mut tuple_ret = false;
+        let mut ret_type: Option<String> = None;
         if self.peek().kind == TokenKind::LeftParen {
+            tuple_ret = true;
             let mut depth = 0i32;
             while self.peek().kind != TokenKind::Eof {
                 match self.peek().kind {
@@ -574,12 +588,14 @@ impl Parser {
                 }
             }
         } else {
-            let _ = self.type_name();
+            ret_type = self.type_name();
         }
         let lf_name = self.expect_identifier("as function name")?;
-        // Skip the optional generic parameter list (`>>`/`>>>`
-        // lex as Shr/ShrShr).
+        // Generic parameter list (`>>`/`>>>` lex as Shr/ShrShr):
+        // generic locals keep the legacy placeholder.
+        let mut is_generic = false;
         if matches!(self.peek().kind, TokenKind::Less | TokenKind::Shl) {
+            is_generic = true;
             let mut depth = 0i32;
             while self.peek().kind != TokenKind::Eof {
                 match self.peek().kind {
@@ -611,18 +627,26 @@ impl Parser {
                 self.bump();
             }
         }
-        // Parameter list.
+        // Parameter list, parsed for real (malformed lists fall
+        // back to the legacy skip-and-placeholder below).
         self.expect(&TokenKind::LeftParen, "to open local function params")?;
-        let mut depth = 1i32;
-        loop {
-            if self.peek().kind == TokenKind::LeftParen {
-                depth += 1;
-            } else if self.peek().kind == TokenKind::RightParen {
-                depth -= 1;
-            }
+        let params = self.param_list();
+        let params_ok = matches!(self.peek().kind, TokenKind::RightParen)
+            || matches!(self.peek().kind, TokenKind::Eof);
+        if matches!(self.peek().kind, TokenKind::RightParen) {
             self.bump();
-            if depth == 0 || self.peek().kind == TokenKind::Eof {
-                break;
+        } else {
+            let mut depth = 0i32;
+            loop {
+                if self.peek().kind == TokenKind::LeftParen {
+                    depth += 1;
+                } else if self.peek().kind == TokenKind::RightParen {
+                    depth -= 1;
+                }
+                self.bump();
+                if depth == 0 || self.peek().kind == TokenKind::Eof {
+                    break;
+                }
             }
         }
         // Type constraints: `where T : ...` (consumed, not recorded —
@@ -630,29 +654,64 @@ impl Parser {
         self.skip_type_constraints();
         // Body: `=> expr;`, a block `{ ... }`, or a bare `;` for
         // bodyless `extern` declarations (`[UnsafeAccessor]` locals).
+        // Only block and expression bodies become real functions.
+        enum LocalBody {
+            Block(Block),
+            Missing,
+        }
+        let mut body = LocalBody::Missing;
         if self.peek().kind == TokenKind::FatArrow {
             self.bump();
-            let _ = self.expression();
+            if let Some(e) = self.expression() {
+                let espan = start.to(self.peek_at(0).span);
+                body = LocalBody::Block(Block {
+                    stmts: vec![Stmt::Return {
+                        value: Some(e),
+                        span: espan,
+                    }],
+                    span: espan,
+                });
+            }
             let _ = self.expect(&TokenKind::Semicolon, "after expression-bodied local function");
         } else if self.peek().kind == TokenKind::Semicolon {
             self.bump(); // bodyless extern: no body to consume
         } else {
-            let _ = self.block();
+            body = LocalBody::Block(self.block());
         }
+        let end = start.to(self.peek_at(0).span);
         // The local function name is a callable value in its ENCLOSING scope.
-        // The compact AST has no `LocalFunction` node, so expose the name to
-        // the semantic scan as a zero-initialized `Let`. Push it AFTER the
-        // body so the enclosing `block()` (not the body's own block) drains it.
+        // Keep exposing it to the semantic scan as a zero-initialized
+        // `Let` (harmless when real lowering succeeds; the fallback
+        // value when it does not). Push it AFTER the body so the
+        // enclosing `block()` (not the body's own block) drains it.
         self.pending.push(Stmt::Let {
+            is_byref: false,
             type_name: String::from("fn"),
-            name: lf_name,
+            name: lf_name.clone(),
             init: Expr::Literal(Literal::Int(0)),
             access: Access::Default,
-            span: start.to(self.peek_at(0).span),
+            span: end,
         });
-        Some(Stmt::Break {
-            span: start.to(self.peek_at(0).span),
-        })
+        // Real node only for the supported shape; everything else
+        // keeps the legacy no-op exactly as before.
+        let supported = is_static
+            && !is_async
+            && !tuple_ret
+            && !is_generic
+            && params_ok
+            && ret_type.is_some()
+            && !params.iter().any(|p| p.is_this || p.is_params);
+        match (supported, body) {
+            (true, LocalBody::Block(b)) => Some(Stmt::LocalFunction {
+                name: lf_name,
+                params,
+                ret_type: ret_type.unwrap_or_else(|| "void".to_owned()),
+                body: b,
+                is_static: true,
+                span: end,
+            }),
+            _ => Some(Stmt::Break { span: end }),
+        }
     }
 
     /// Detect a typed lambda: `Type (params) => body;` — an identifier
@@ -934,25 +993,42 @@ impl Parser {
             return Some(Stmt::Block { body, span });
         }
 
-        // Goto label: `Name:` prefixing a statement. Jumps are not
-        // representable in the native IR (`goto` lowers to a no-op), so
-        // the label itself is inert — consume it and parse what follows.
-        // The colon must not be the first half of `::`: `global::Ns`
-        // (and alias-qualified names) are types, never labels.
+        // Goto label: `Name:` prefixing a statement. Preserved as
+        // `Stmt::Label` (native lowering turns it into a block
+        // target for `goto`). The colon must not be the first half
+        // of `::`: `global::Ns` (and alias-qualified names) are
+        // types, never labels.
         if matches!(self.peek().kind, TokenKind::Identifier(_))
             && self.peek_at(1).kind == TokenKind::Colon
             && self.peek_at(2).kind != TokenKind::Colon
         {
+            let TokenKind::Identifier(name) = self.peek().kind.clone() else {
+                unreachable!("peeked Identifier above");
+            };
+            let name_span = self.peek().span;
             self.bump(); // label name
             self.bump(); // ':'
+            let label = Stmt::Label {
+                name,
+                span: name_span,
+            };
             // A label at the end of a block has no following statement.
             if matches!(
                 self.peek().kind,
                 TokenKind::RightBrace | TokenKind::Eof | TokenKind::Keyword(Keyword::Case) | TokenKind::Keyword(Keyword::Default)
             ) {
-                return None;
+                return Some(label);
             }
-            return self.statement();
+            // Wrap so both survive the single-statement return.
+            return self.statement().map(|stmt| {
+                Stmt::Block {
+                    body: Block {
+                        stmts: vec![label, stmt],
+                        span: name_span,
+                    },
+                    span: name_span,
+                }
+            });
         }
 
         // Lambda expression at statement level: `name => expr;` or
@@ -1002,6 +1078,7 @@ impl Parser {
             for name in bindings {
                 if name != "_" {
                     self.pending.push(Stmt::Let {
+                        is_byref: false,
                         type_name: String::from("var"),
                         name,
                         init: Expr::Literal(Literal::Int(0)),
@@ -1208,6 +1285,7 @@ impl Parser {
                     "rubyc.parser.rd.Parser.ctx.after_declaration",
                 )?;
                 return Some(Stmt::Let {
+                    is_byref: false,
                     type_name: format!("tuple{tuple_suffix}"),
                     name,
                     init,
@@ -1217,27 +1295,60 @@ impl Parser {
             }
             if self.eat(&TokenKind::Assign).is_some() {
                 // Form (b): destructuring assignment `(T1 n1, T2 n2) = expr;`.
-                // The compact AST does not model tuple deconstruction, so
-                // synthesize a single Expression for the rhs. The destructure
-                // target names are values in the enclosing scope; expose each
-                // to the semantic scan as a zero-init `Let` carrying its
-                // DECLARED type (so `physicalFileProvider` below types as
-                // `PhysicalFileProvider`, not `var`/`int`).
+                // Tuples lower as `tuple[]` arrays (see the literal rule),
+                // so destructure by indexing a temp: each name reads its
+                // slot once, in order, with a single evaluation of the
+                // right-hand side. (The old code evaluated the rhs and
+                // dropped it, leaving every name zero — `index += 0`
+                // looped forever and OOMed init in
+                // `CompareStringIgnoreCase`.)
                 let value = self.expression()?;
-                for (ty, dn) in decon_names {
+                let end = start.to(self.peek_at(0).span);
+                let tmp = "__tuple_tmp".to_owned();
+                self.pending.push(Stmt::Let {
+                    is_byref: false,
+                    type_name: "tuple[]".to_owned(),
+                    name: tmp.clone(),
+                    init: value,
+                    access: Access::Default,
+                    span: end,
+                });
+                for (ty, dn) in &decon_names {
                     self.pending.push(Stmt::Let {
-                        type_name: ty,
-                        name: dn,
+                        is_byref: false,
+                        type_name: ty.clone(),
+                        name: dn.clone(),
                         init: Expr::Literal(Literal::Int(0)),
                         access: Access::Default,
-                        span: start.to(self.peek_at(0).span),
+                        span: end,
                     });
+                }
+                for (i, (_, dn)) in decon_names.iter().enumerate() {
+                    if dn == "_" {
+                        continue;
+                    }
+                    self.pending.push(Stmt::Expression(Expr::Assign {
+                        target: Box::new(Expr::Ident {
+                            name: dn.clone(),
+                            span: end,
+                        }),
+                        value: Box::new(Expr::Index {
+                            object: Box::new(Expr::Ident {
+                                name: tmp.clone(),
+                                span: end,
+                            }),
+                            index: Box::new(Expr::Literal(Literal::Int(i as i64))),
+                            is_range: false,
+                            span: end,
+                        }),
+                        span: end,
+                    }));
                 }
                 self.expect(
                     &TokenKind::Semicolon,
                     "rubyc.parser.rd.Parser.ctx.after_declaration",
                 )?;
-                return Some(Stmt::Expression(value));
+                return Some(Stmt::Expression(Expr::Literal(Literal::Int(0))));
             }
             // Could not recover cleanly; bail.
             self.unexpected(
@@ -1442,16 +1553,94 @@ impl Parser {
                         self.bump();
                     }
                 }
-                let _ = self.type_name();
-                let _ = self.expect_identifier("as foreach variable")?;
+                let var_type = self
+                    .type_name()
+                    .unwrap_or_else(|| "var".to_owned());
+                let var_name = self.expect_identifier("as foreach variable")?;
                 if matches!(self.peek().kind, TokenKind::Keyword(Keyword::In_)) {
                     self.bump();
                 }
-                let _ = self.expression();
+                let coll = self.expression()?;
                 self.expect(&TokenKind::RightParen, "to close foreach header")?;
-                let _ = self.control_body();
-                return Some(Stmt::Break {
-                    span: start.to(self.peek_at(0).span),
+                let body = self.control_body();
+                // Desugar to an index loop over `Length` (arrays,
+                // strings, and spans lower both correctly, so those
+                // iterate for real). Anything without `Length`
+                // reads zero and skips the body — the legacy no-op.
+                // Types WITH `Length` but no integer indexer (invalid
+                // C# — no enumerator exists either) may iterate
+                // garbage instead of skipping; no valid program does
+                // this.
+                let n = self.foreach_seq;
+                self.foreach_seq += 1;
+                let coll_name = format!("__foreach_coll_{n}");
+                let idx_name = format!("__foreach_idx_{n}");
+                let sp = start.to(self.peek_at(0).span);
+                let ident = |name: &str| Expr::Ident {
+                    name: name.to_owned(),
+                    span: sp,
+                };
+                let mut stmts = vec![Stmt::Let {
+                    is_byref: false,
+                    type_name: var_type,
+                    name: var_name,
+                    init: Expr::Index {
+                        object: Box::new(ident(&coll_name)),
+                        index: Box::new(ident(&idx_name)),
+                        is_range: false,
+                        span: sp,
+                    },
+                    access: Access::Default,
+                    span: sp,
+                }];
+                stmts.extend(body.stmts);
+                return Some(Stmt::Block {
+                    body: Block {
+                        stmts: vec![
+                            Stmt::Let {
+                                is_byref: false,
+                                type_name: "var".to_owned(),
+                                name: coll_name.clone(),
+                                init: coll,
+                                access: Access::Default,
+                                span: sp,
+                            },
+                            Stmt::For {
+                                init: Some(Box::new(Stmt::Let {
+                                    is_byref: false,
+                                    type_name: "int".to_owned(),
+                                    name: idx_name.clone(),
+                                    init: Expr::Literal(Literal::Int(0)),
+                                    access: Access::Default,
+                                    span: sp,
+                                })),
+                                cond: Some(Expr::Binary {
+                                    op: BinOp::Lt,
+                                    lhs: Box::new(ident(&idx_name)),
+                                    rhs: Box::new(Expr::Member {
+                                        object: Box::new(ident(&coll_name)),
+                                        name: "Length".to_owned(),
+                                        span: sp,
+                                    }),
+                                    span: sp,
+                                }),
+                                step: Some(Box::new(Stmt::Assign {
+                                    name: idx_name.clone(),
+                                    value: Expr::Binary {
+                                        op: BinOp::Add,
+                                        lhs: Box::new(ident(&idx_name)),
+                                        rhs: Box::new(Expr::Literal(Literal::Int(1))),
+                                        span: sp,
+                                    },
+                                    span: sp,
+                                })),
+                                body: Block { stmts, span: sp },
+                                span: sp,
+                            },
+                        ],
+                        span: sp,
+                    },
+                    span: sp,
                 });
             }
             TokenKind::Keyword(Keyword::From) if matches!(self.peek_at(1).kind, TokenKind::Identifier(_)) => {
@@ -1475,29 +1664,28 @@ impl Parser {
             }
             TokenKind::Keyword(Keyword::Fixed) => {
                 // `fixed (type* varName = expr, ...) { ... }` — multiple
-                // declarators share the one type (C#).
+                // declarators share the one type (C#). Preserved as
+                // `Stmt::Fixed` (names, inits, and body all survive);
+                // lowering pins each name to its data address and runs
+                // the body. Previously this dropped the inits (binding
+                // zero) and the body (returning no-op), so all pinned
+                // code silently vanished.
                 self.bump(); // 'fixed'
                 self.expect(&TokenKind::LeftParen, "to open fixed statement")?;
                 // Parse the declaration: `type* varName = expr`.
-                // Pinned names are values in the embedded statement's
-                // scope — expose each to the scan as a zero-init `Let`
-                // (drained by the body `block()`, like `out` vars).
-                let _type_name = self.type_name()?;
+                let type_name = self.type_name()?;
                 // Optional `*` for pointer types.
                 if self.eat(&TokenKind::Star).is_some() {
                     // The `*` is consumed; type_name already holds the base type.
                 }
+                let mut declarators: Vec<(String, String, Option<Expr>)> = Vec::new();
                 if let Some(name) = self.expect_identifier("as fixed variable name") {
-                    self.pending.push(Stmt::Let {
-                        type_name: String::from("var"),
-                        name,
-                        init: Expr::Literal(Literal::Int(0)),
-                        access: Access::Default,
-                        span: start.to(self.peek_at(0).span),
-                    });
-                }
-                if self.eat(&TokenKind::Assign).is_some() {
-                    let _init = self.expression()?;
+                    let init = if self.eat(&TokenKind::Assign).is_some() {
+                        self.expression()
+                    } else {
+                        None
+                    };
+                    declarators.push((type_name.clone(), name, init));
                 }
                 // Further declarators (`, name [= expr]*) share the type.
                 while self.eat(&TokenKind::Comma).is_some() {
@@ -1505,28 +1693,34 @@ impl Parser {
                     // (fixed headers contain nothing else); a missing
                     // name still errors below, preserving diagnostics.
                     if let Some(extra) = self.expect_identifier("as fixed variable name") {
-                        self.pending.push(Stmt::Let {
-                            type_name: String::from("var"),
-                            name: extra,
-                            init: Expr::Literal(Literal::Int(0)),
-                            access: Access::Default,
-                            span: start.to(self.peek_at(0).span),
-                        });
-                    }
-                    if self.eat(&TokenKind::Assign).is_some() {
-                        let _extra_init = self.expression()?;
+                        let extra_init = if self.eat(&TokenKind::Assign).is_some() {
+                            self.expression()
+                        } else {
+                            None
+                        };
+                        declarators.push((type_name.clone(), extra, extra_init));
                     }
                 }
                 self.expect(&TokenKind::RightParen, "to close fixed statement")?;
                 // Body: either a block or a single nested statement
                 // (`fixed (a = ..) fixed (b = ..) { ... }` nests).
-                if self.peek().kind == TokenKind::LeftBrace {
-                    let _body = self.block();
-                } else if self.statement().is_none() {
+                let body = if self.peek().kind == TokenKind::LeftBrace {
+                    self.block()
+                } else if let Some(stmt) = self.statement() {
+                    Block {
+                        stmts: vec![stmt],
+                        span: start.to(self.peek_at(0).span),
+                    }
+                } else {
                     self.synchronize();
-                }
-                // For now, return a no-op statement.
-                return Some(Stmt::Break {
+                    Block {
+                        stmts: Vec::new(),
+                        span: start.to(self.peek_at(0).span),
+                    }
+                };
+                return Some(Stmt::Fixed {
+                    declarators,
+                    body,
                     span: start.to(self.peek_at(0).span),
                 });
             }
@@ -1633,6 +1827,7 @@ impl Parser {
                     Expr::Literal(Literal::Int(0))
                 };
                 self.pending.push(Stmt::Let {
+                    is_byref: false,
                     type_name: format!("{elem_type}[]"),
                     name: next,
                     init: next_init,
@@ -1642,6 +1837,7 @@ impl Parser {
             }
             self.expect(&TokenKind::Semicolon, "after array declaration")?;
             return Some(Stmt::Let {
+                is_byref: false,
                 type_name: format!("{elem_type}[]"),
                 name,
                 init,
@@ -1713,6 +1909,7 @@ impl Parser {
             self.expect(&TokenKind::Semicolon, "after function pointer declaration")?;
             let type_str = format!("delegate*<{}>", type_args.join(", "));
             return Some(Stmt::Let {
+                is_byref: false,
                 type_name: type_str,
                 name,
                 init,
@@ -1738,7 +1935,9 @@ impl Parser {
         if self.likely_type_decl() {
             // `ref` / `out` / `scoped` modifiers on the local:
             // `ref int x = ref y;`, `scoped Span<char> s = ..;`.
-            // By-ref-ness has no runtime representation here.
+            // `ref`/`out` locals alias their initializer's address
+            // (see `is_byref` on `Stmt::Let`); the rest discard.
+            let mut is_byref_local = false;
             for _ in 0..4 {
                 if matches!(
                     self.peek().kind,
@@ -1747,6 +1946,13 @@ impl Parser {
                         | TokenKind::Keyword(Keyword::Scoped)
                         | TokenKind::Keyword(Keyword::Readonly)
                 ) {
+                    if matches!(
+                        self.peek().kind,
+                        TokenKind::Keyword(Keyword::Ref_)
+                            | TokenKind::Keyword(Keyword::Out_)
+                    ) {
+                        is_byref_local = true;
+                    }
                     self.bump();
                 } else {
                     break;
@@ -1797,6 +2003,7 @@ impl Parser {
                     }
                     let _ = self.parse_lambda_body();
                     return Some(Stmt::Let {
+                        is_byref: false,
                         type_name,
                         name,
                         init: Expr::Literal(Literal::Int(0)),
@@ -1819,6 +2026,7 @@ impl Parser {
                     // neutral init so the scanner does not try to resolve
                     // the param name.
                     return Some(Stmt::Let {
+                        is_byref: false,
                         type_name,
                         name,
                         init: Expr::Literal(Literal::Int(0)),
@@ -1897,6 +2105,7 @@ impl Parser {
                     Expr::Literal(Literal::Int(0))
                 };
                 self.pending.push(Stmt::Let {
+                    is_byref: false,
                     type_name: type_name.clone(),
                     name: tname,
                     init,
@@ -1909,6 +2118,7 @@ impl Parser {
                 "rubyc.parser.rd.Parser.ctx.after_declaration",
             )?;
             return Some(Stmt::Let {
+                is_byref: is_byref_local,
                 type_name,
                 name,
                 init,
@@ -2256,6 +2466,7 @@ impl Parser {
                     self.bump(); // '='
                     let value = self.expression()?;
                     let first = Stmt::Let {
+                        is_byref: false,
                         type_name: type_name.clone(),
                         name,
                         init: value,
@@ -2270,6 +2481,7 @@ impl Parser {
                             Expr::Literal(Literal::Int(0))
                         };
                         extra_inits.push(Stmt::Let {
+                            is_byref: false,
                             type_name: type_name.clone(),
                             name: extra,
                             init: extra_init,
@@ -2449,6 +2661,9 @@ impl Parser {
             | Stmt::Return { .. }
             | Stmt::Goto { .. }
             | Stmt::Throw { .. } => true,
+            // A label is just a jump target: execution falls through
+            // to whatever follows it.
+            Stmt::Label { .. } => false,
             Stmt::Switch {
                 arms,
                 default_body,
@@ -2470,6 +2685,9 @@ impl Parser {
                 }
             }
             Stmt::Block { body, .. } => {
+                Self::last_effective_stmt(body).is_some_and(Self::stmt_never_falls_through)
+            }
+            Stmt::Fixed { body, .. } => {
                 Self::last_effective_stmt(body).is_some_and(Self::stmt_never_falls_through)
             }
             Stmt::If {
@@ -2522,7 +2740,12 @@ impl Parser {
     /// and local-function placeholders (`...; static Task F(){...}`).
     /// A block of nothing but Lets still falls through.
     fn last_effective_stmt(body: &crate::models::Block) -> Option<&Stmt> {
-        body.stmts.iter().rev().find(|s| !matches!(s, Stmt::Let { .. }))
+        body.stmts.iter().rev().find(|s| {
+            !matches!(
+                s,
+                Stmt::Let { .. } | Stmt::LocalFunction { .. }
+            )
+        })
     }
 
     /// Whether a switch arm body can never fall through: its last
@@ -2587,26 +2810,134 @@ impl Parser {
     fn using_statement(&mut self, start: Span) -> Option<Stmt> {
         self.bump(); // 'using'
         if self.peek().kind == TokenKind::LeftParen {
-            // Skip the resource declarations in the parens. depth
-            // starts at 0 (the opening `(` was already consumed by
-            // the `if peek == LeftParen` check). The post-check
-            // loop breaks when the closing `)` decrements depth back
-            // to 0.
-            let mut depth = 0i32;
-            loop {
-                if self.peek().kind == TokenKind::LeftParen {
-                    depth += 1;
-                } else if self.peek().kind == TokenKind::RightParen {
-                    depth -= 1;
-                }
+            self.bump(); // '('
+            // `using (resource) { body }`: execute the body with the
+            // resource bound (desugared to `Let`s + the body block).
+            // Disposal itself is not modeled — same posture as the
+            // `using Type name = expr;` declaration form below (fds
+            // stay open; the kernel reclaims on exit. Flushing
+            // disposables on Dispose is a known gap in both forms).
+            // Previously the whole body was SKIPPED (returned as a
+            // no-op `Break`), so `File.ReadAllBytes` — whose entire
+            // implementation sits inside `using (...)` — lowered to
+            // an empty body returning null. On any parse trouble,
+            // rewind and take the legacy skip (never fail where the
+            // old shape succeeded).
+            let mark = self.pos;
+            let err_mark = self.errors.len();
+            let mut preamble: Vec<Stmt> = Vec::new();
+            let mut ok = true;
+            if self.peek().kind == TokenKind::RightParen {
                 self.bump();
-                if depth <= 0 || self.peek().kind == TokenKind::Eof {
-                    break;
+            } else {
+                loop {
+                    // Trial declaration: `Type name =` (mirrors the
+                    // `out`-var trial in argument lists — a member or
+                    // index expression is a value, not a type).
+                    let tmark = self.pos;
+                    let terr_mark = self.errors.len();
+                    let mut decl_ty: Option<String> = None;
+                    if self.peek().kind == TokenKind::LeftParen {
+                        // Tuple-typed resource (exotic): keep the
+                        // trial simple — a bare expression fallback
+                        // covers failures below.
+                        if self.consume_tuple_type().is_some() {
+                            decl_ty = Some(String::from("tuple"));
+                        }
+                    } else {
+                        decl_ty = self.type_name_full();
+                    }
+                    let is_decl = decl_ty.is_some() && self.peek_is_name(0);
+                    if !is_decl {
+                        self.pos = tmark;
+                        self.errors.truncate(terr_mark);
+                    }
+                    if is_decl {
+                        let ty = decl_ty.unwrap_or_else(|| String::from("var"));
+                        let Some(rname) = self.expect_identifier("as using resource name") else {
+                            ok = false;
+                            break;
+                        };
+                        // C# requires an initializer; without `=`
+                        // take the legacy skip below.
+                        if self.eat(&TokenKind::Assign).is_none() {
+                            ok = false;
+                            break;
+                        }
+                        let Some(init) = self.expression() else {
+                            ok = false;
+                            break;
+                        };
+                        if !self.pre_pending.is_empty() {
+                            let pre = std::mem::take(&mut self.pre_pending);
+                            preamble.extend(pre);
+                        }
+                        preamble.push(Stmt::Let {
+                            is_byref: false,
+                            type_name: ty,
+                            name: rname,
+                            init,
+                            access: Access::Default,
+                            span: start.to(self.peek().span),
+                        });
+                        preamble.append(&mut self.pending);
+                    } else {
+                        let Some(e) = self.expression() else {
+                            ok = false;
+                            break;
+                        };
+                        if !self.pre_pending.is_empty() {
+                            let pre = std::mem::take(&mut self.pre_pending);
+                            preamble.extend(pre);
+                        }
+                        preamble.push(Stmt::Expression(e));
+                        preamble.append(&mut self.pending);
+                    }
+                    if self.eat(&TokenKind::Comma).is_none() {
+                        break;
+                    }
+                }
+                if ok {
+                    if self.expect(&TokenKind::RightParen, "to close using resources").is_none() {
+                        ok = false;
+                    }
                 }
             }
-            let _ = self.control_body();
-            return Some(Stmt::Break {
-                span: start.to(self.peek_at(0).span),
+            if !ok {
+                // Legacy skip: resource text + body, no-op Break.
+                self.pos = mark;
+                self.errors.truncate(err_mark);
+                let mut depth = 0i32;
+                loop {
+                    if self.peek().kind == TokenKind::LeftParen {
+                        depth += 1;
+                    } else if self.peek().kind == TokenKind::RightParen {
+                        depth -= 1;
+                    }
+                    self.bump();
+                    if depth <= 0 || self.peek().kind == TokenKind::Eof {
+                        break;
+                    }
+                }
+                let _ = self.control_body();
+                return Some(Stmt::Break {
+                    span: start.to(self.peek_at(0).span),
+                });
+            }
+            let body = self.control_body();
+            let end = self.peek().span;
+            let mut stmts = preamble;
+            stmts.extend(body.stmts);
+            if !self.pre_pending.is_empty() {
+                stmts.extend(std::mem::take(&mut self.pre_pending));
+            }
+            stmts.append(&mut self.pending);
+            return Some(Stmt::Block {
+                body: Block {
+                    stmts,
+                    span: start.to(end),
+                },
+                span: start.to(end),
             });
         }
         // `using Type name = expr;` (declaration). Model it as a
@@ -2625,6 +2956,7 @@ impl Parser {
             .expect(&TokenKind::Semicolon, "after using declaration")
             .map_or(self.peek().span, |token| token.span);
         Some(Stmt::Let {
+            is_byref: false,
             type_name,
             name,
             init,
@@ -2909,6 +3241,7 @@ impl Parser {
         }
         if binding != "_" {
             self.pre_pending.push(Stmt::Let {
+                is_byref: false,
                 type_name: head,
                 name: binding,
                 init: Expr::Literal(Literal::Int(0)),
@@ -2936,6 +3269,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_byref: false,
                             type_name: String::from("var"),
                             name: binding,
                             init: Expr::Literal(Literal::Int(0)),
@@ -3130,6 +3464,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_byref: false,
                             type_name: String::from("var"),
                             name: binding,
                             init: Expr::Literal(Literal::Int(0)),
@@ -3153,6 +3488,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_byref: false,
                             type_name: String::from("var"),
                             name: binding,
                             init: Expr::Literal(Literal::Int(0)),
@@ -3181,6 +3517,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_byref: false,
                             type_name: head_ty,
                             name: binding,
                             init: Expr::Literal(Literal::Int(0)),

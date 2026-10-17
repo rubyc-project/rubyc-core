@@ -110,6 +110,29 @@ pub struct IoArgs {
     /// Solution build parallelism (`--jobs N`, default 1): how many
     /// projects build concurrently. Single-project builds ignore it.
     pub jobs: usize,
+    /// Embed the library's type fragment in the built image
+    /// (default on for library outputs; `--no-embed-types` disables).
+    /// Consumers read types from the binary itself instead of an
+    /// `.rci` sidecar file. Plain C/C++ hosts take the opt-out for a
+    /// byte-identical pure-ABI image.
+    pub no_embed_types: bool,
+    /// Library set format for `install libs` (`--format
+    /// shared|static|both`, default `shared`): which image kind each
+    /// pulled library builds. `both` runs a shared pass then a static
+    /// pass (dynamic projects skip the static pass — see `build_project`).
+    pub install_format: Option<String>,
+    /// Function-level dead-code elimination (`--optimize`):
+    /// drop functions unreachable from the entry point, exports,
+    /// `@init`, and address-taken references. Off by default: output
+    /// is byte-identical to the unoptimized image.
+    pub optimize: bool,
+    /// Drop `.symtab`/`.strtab` from executable images (`--strip`).
+    /// Shared libraries always keep `.dynsym` (required for linking).
+    pub strip: bool,
+    /// Solution profile to apply (`--profile NAME`): merges the named
+    /// `[profile]` section's defines/optimize/strip into every project
+    /// of a solution build. Unset = no profile.
+    pub profile: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -132,6 +155,7 @@ pub enum Command {
 }
 
 /// A fully parsed command line.
+#[derive(Debug, Clone)]
 pub struct Invocation {
     pub command: Command,
     pub io: IoArgs,

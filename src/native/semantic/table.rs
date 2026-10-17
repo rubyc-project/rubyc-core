@@ -102,6 +102,10 @@ pub struct MethodInfo {
     /// with `param_has_default[i] == true` means null/`default`/unfoldable
     /// and materializes as zero at the call site.
     pub param_defaults: Vec<Option<ConstValue>>,
+    /// Per-param: by-reference (`ref`/`out`/`in`). Callers box the
+    /// value and pass the box address; callees dereference on access
+    /// so writes flow back (required for `out` results).
+    pub param_is_byref: Vec<bool>,
     /// Declared visibility; drives C#-style access enforcement.
     pub access: Access,
     /// `static` modifier — called on the type, not an instance.
@@ -163,6 +167,9 @@ pub struct PropertyInfo {
     /// `static` modifier: only static properties participate in
     /// `using static` bare-name imports (mirrors FieldInfo).
     pub is_static: bool,
+    /// `abstract` modifier: body-less accessors declare no storage
+    /// (never auto-property backing fields).
+    pub is_abstract: bool,
 }
 
 /// A field with its object-layout offset (in slots, after the vtable word).
@@ -182,6 +189,8 @@ pub struct FieldInfo {
     pub is_const: bool,
     /// The folded value of a `const` field; `None` for non-const fields.
     pub const_value: Option<ConstValue>,
+    /// `ref` modifier: the slot holds an address (see `FieldDecl`).
+    pub is_byref: bool,
     /// The class that declares this field. For inherited statics accessed
     /// through a derived type, this is the base class that owns the storage.
     pub declaring_class: String,
