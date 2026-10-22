@@ -5001,16 +5001,56 @@ fn emit_is_pattern(
                 b: zero,
             }));
         }
-        // A TYPE PARAMETER target needs the value's EXACT runtime type.
-        // Only a generic instance carries one (the descriptor that holds
-        // its type arguments), so the test cannot be answered for an
-        // ordinary instance: answering "no" would be a wrong answer.
-        // Say so until every instance carries its runtime type.
+        // A TYPE PARAMETER target: answer from the value's runtime
+        // type descriptor. A reference carries one in its header
+        // (RUNTIME_TYPE_SLOT); compare it to the type parameter's
+        // descriptor. A null value is never an instance of T. Value
+        // types are unboxed and carry no descriptor, so they keep
+        // failing loudly (the feature is not implemented for them).
         if ctx.is_type_var(&simple) {
-            return Err(LowerError::UnsupportedConstruct(crate::tf!(
-                "rubyc.native.ir.lower_expr.type_var_test",
-                simple.to_string()
-            )));
+            if is_value_type_spelling(ctx, subject_ty) {
+                return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                    "rubyc.native.ir.lower_expr.type_var_test",
+                    simple.to_string()
+                )));
+            }
+            let zero = b.const_i64(0);
+            let is_null = b.emit(Instr::Cmp {
+                dst: VReg(0),
+                op: CmpOp::Eq,
+                a,
+                b: zero,
+            });
+            let null_b = b.make_block();
+            let test_b = b.make_block();
+            let join_b = b.make_block();
+            let res = b.fresh();
+            b.terminate(Terminator::Branch {
+                cond: Some(is_null),
+                if_true: null_b,
+                if_false: test_b,
+            });
+            b.switch_to(null_b);
+            b.mov(res, zero);
+            b.goto(join_b);
+            b.switch_to(test_b);
+            let rt = b.fresh();
+            b.push_raw(Instr::LoadField {
+                dst: rt,
+                base: a,
+                off: (RUNTIME_TYPE_SLOT * 8) as u32,
+            });
+            let t_desc = b.type_token(&simple, ctx)?;
+            let eq = b.emit(Instr::Cmp {
+                dst: VReg(0),
+                op: CmpOp::Eq,
+                a: rt,
+                b: t_desc,
+            });
+            b.mov(res, eq);
+            b.goto(join_b);
+            b.switch_to(join_b);
+            return Ok(res);
         }
         return emit_type_test(b, ctx, a, &simple, name);
     }
@@ -5095,7 +5135,10 @@ fn body_idents(e: &Expr, out: &mut Vec<String>) {
             body_idents(then_expr, out);
             body_idents(else_expr, out);
         }
-        Expr::Call { args, .. } => {
+        Expr::Call { callee, args, .. } => {
+            if !callee.contains('.') && !callee.contains('<') {
+                out.push(callee.clone());
+            }
             for a in args {
                 body_idents(a, out);
             }
@@ -5191,6 +5234,21 @@ fn body_idents_stmt(st: &crate::models::Stmt, out: &mut Vec<String>) {
             body_idents(cond, out);
             for s in &body.stmts {
                 body_idents_stmt(s, out);
+            }
+        }
+        Stmt::Try { body, catches, finally_block, .. } => {
+            for s in &body.stmts {
+                body_idents_stmt(s, out);
+            }
+            for c in catches {
+                for s in &c.body.stmts {
+                    body_idents_stmt(s, out);
+                }
+            }
+            if let Some(fb) = finally_block {
+                for s in &fb.stmts {
+                    body_idents_stmt(s, out);
+                }
             }
         }
         Stmt::For {
