@@ -1,6 +1,6 @@
 //! AST to IR body lowering.
 
-use super::super::{BlockId, CmpOp, Instr, IrFunction, LowerError, Terminator, VReg};
+use super::super::{BlockId, CmpOp, FCmpOp, FBinOp, Instr, IrFunction, LowerError, Terminator, VReg};
 use crate::native::ir::{ReceiverKind, StringArena};
 use crate::models::symbols::ScopeStack;
 use crate::models::{Expr, Stmt};
@@ -1769,6 +1769,155 @@ impl<'a> Body<'a> {
                 self.push_raw(Instr::StoreField { base: s, off: 8, src: sref });
                 self.push_raw(Instr::StoreField { base: s, off: 16, src: v });
                 Some(s)
+            }
+            "float" | "Single" | "double" | "Double" => {
+                // NaN.
+                let is_nan = self.emit(Instr::FCmp { dst: VReg(0), op: FCmpOp::Ne, a: v, b: v });
+                let nan_b = self.make_block();
+                let not_nan_b = self.make_block();
+                let join_b = self.make_block();
+                let home = self.fresh();
+                self.terminate(Terminator::Branch {
+                    cond: Some(is_nan),
+                    if_true: nan_b,
+                    if_false: not_nan_b,
+                });
+                self.switch_to(nan_b);
+                let ns = self.utf16_literal("NaN");
+                let nss = self.build_utf16_string(ns.0, ns.1);
+                self.mov(home, nss);
+                self.goto(join_b);
+                self.switch_to(not_nan_b);
+                // Infinity: finite iff (v - v) == 0 (NaN/Inf produce NaN).
+                let diff = self.fresh();
+                self.push_raw(Instr::FBin { dst: diff, op: FBinOp::Sub, a: v, b: v });
+                let diff_i = self.fresh();
+                self.push_raw(Instr::Mov { dst: diff_i, a: diff });
+                let zero_i = self.const_i64(0);
+                let is_finite = self.emit(Instr::Cmp { dst: VReg(0), op: CmpOp::Eq, a: diff_i, b: zero_i });
+                let inf_b = self.make_block();
+                let fin_b = self.make_block();
+                self.terminate(Terminator::Branch {
+                    cond: Some(is_finite),
+                    if_true: fin_b,
+                    if_false: inf_b,
+                });
+                self.switch_to(inf_b);
+                let v_i = self.fresh();
+                self.push_raw(Instr::Mov { dst: v_i, a: v });
+                let is_neg_inf = self.emit(Instr::Cmp { dst: VReg(0), op: CmpOp::Lt, a: v_i, b: zero_i });
+                let pos_inf = self.utf16_literal("Infinity");
+                let pos_infs = self.build_utf16_string(pos_inf.0, pos_inf.1);
+                let neg_inf = self.utf16_literal("-Infinity");
+                let neg_infs = self.build_utf16_string(neg_inf.0, neg_inf.1);
+                let inf_home = self.fresh();
+                let pi_b = self.make_block();
+                let ni_b = self.make_block();
+                let ij_b = self.make_block();
+                self.terminate(Terminator::Branch {
+                    cond: Some(is_neg_inf),
+                    if_true: ni_b,
+                    if_false: pi_b,
+                });
+                self.switch_to(pi_b);
+                self.mov(inf_home, pos_infs);
+                self.goto(ij_b);
+                self.switch_to(ni_b);
+                self.mov(inf_home, neg_infs);
+                self.goto(ij_b);
+                self.switch_to(ij_b);
+                self.mov(home, inf_home);
+                self.goto(join_b);
+                self.switch_to(fin_b);
+                // Zero.
+                let z0 = self.fresh();
+                self.push_raw(Instr::FConst { dst: z0, bits: 0u64 });
+                let abs_check = self.emit(Instr::FCmp { dst: VReg(0), op: FCmpOp::Eq, a: v, b: z0 });
+                let zero_b = self.make_block();
+                let nonzero_b = self.make_block();
+                self.terminate(Terminator::Branch {
+                    cond: Some(abs_check),
+                    if_true: zero_b,
+                    if_false: nonzero_b,
+                });
+                self.switch_to(zero_b);
+                let zs = self.utf16_literal("0");
+                let zss = self.build_utf16_string(zs.0, zs.1);
+                self.mov(home, zss);
+                self.goto(join_b);
+                self.switch_to(nonzero_b);
+                // Sign.
+                let z1 = self.fresh();
+                self.push_raw(Instr::FConst { dst: z1, bits: 0u64 });
+                let is_neg = self.emit(Instr::FCmp { dst: VReg(0), op: FCmpOp::Lt, a: v, b: z1 });
+                // abs value
+                let abs_v = self.fresh();
+                let neg_b2 = self.make_block();
+                let pos_b2 = self.make_block();
+                let ab_join2 = self.make_block();
+                self.terminate(Terminator::Branch {
+                    cond: Some(is_neg),
+                    if_true: neg_b2,
+                    if_false: pos_b2,
+                });
+                self.switch_to(neg_b2);
+                let nv = self.fresh();
+                self.push_raw(Instr::FNeg { dst: nv, a: v });
+                self.mov(abs_v, nv);
+                self.goto(ab_join2);
+                self.switch_to(pos_b2);
+                self.mov(abs_v, v);
+                self.goto(ab_join2);
+                self.switch_to(ab_join2);
+                // scale by 1e9
+                let scale = self.fresh();
+                self.push_raw(Instr::FConst { dst: scale, bits: 1e9f64.to_bits() });
+                let scaled = self.fresh();
+                self.push_raw(Instr::FBin { dst: scaled, op: FBinOp::Mul, a: abs_v, b: scale });
+                let scaled_i = self.fresh();
+                self.push_raw(Instr::F2I { dst: scaled_i, src: scaled });
+                // integer part and fractional part
+                let ten9 = self.const_i64(1_000_000_000);
+                let int_part = self.fresh();
+                // int_part = scaled_i / 1e9
+                // use a bin Div? IR has Bin with Div? BinOp::Div exists for i64
+                self.push_raw(Instr::Bin { dst: int_part, op: IrBinOp::Div, a: scaled_i, b: ten9 });
+                let frac_part = self.fresh();
+                self.push_raw(Instr::Bin { dst: frac_part, op: IrBinOp::Rem, a: scaled_i, b: ten9 });
+                // format
+                let int_str = self.int_to_string(int_part, true);
+                let frac_str = self.int_to_string_min(frac_part, false, 9);
+                let dot = self.utf16_literal(".");
+                let dots = self.build_utf16_string(dot.0, dot.1);
+                // sign
+                let minus = self.utf16_literal("-");
+                let minuss = self.build_utf16_string(minus.0, minus.1);
+                let empty = self.utf16_literal("");
+                let emptys = self.build_utf16_string(empty.0, empty.1);
+                let sign_str = self.fresh();
+                let sn_b = self.make_block();
+                let sp_b = self.make_block();
+                let sj_b = self.make_block();
+                self.terminate(Terminator::Branch {
+                    cond: Some(is_neg),
+                    if_true: sn_b,
+                    if_false: sp_b,
+                });
+                self.switch_to(sn_b);
+                self.mov(sign_str, minuss);
+                self.goto(sj_b);
+                self.switch_to(sp_b);
+                self.mov(sign_str, emptys);
+                self.goto(sj_b);
+                self.switch_to(sj_b);
+                // concatenate: sign + int + "." + frac
+                let t1 = self.concat_strings(sign_str, int_str);
+                let t2 = self.concat_strings(t1, dots);
+                let t3 = self.concat_strings(t2, frac_str);
+                self.mov(home, t3);
+                self.goto(join_b);
+                self.switch_to(join_b);
+                Some(home)
             }
             _ => None,
         }
