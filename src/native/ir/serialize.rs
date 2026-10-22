@@ -17,7 +17,7 @@ use super::{
 /// v1: full portable IR — functions, blocks, terminators, vtable rows,
 /// `Program.statics` table, and the `LoadStaticAddr` instruction
 /// (static field storage).
-pub const IR_FORMAT_VERSION: u16 = 2;
+pub const IR_FORMAT_VERSION: u16 = 4;
 
 /// Node tags. One byte per node, children follow recursively.
 pub mod tag {
@@ -71,6 +71,11 @@ pub mod tag {
     pub const CALL_STATIC: u8 = 0x34;
     // v4 static-field tag: load the absolute address of static slot `idx`
     // into `dst` (the slot lives in the data section).
+    /// `CallFnAddr { dst, target, args }` — call through an address.
+    pub const CALL_FN_ADDR: u8 = 0x40;
+    /// `FnAddr { dst, fidx }` — address of a function, used to build a
+    /// delegate object (a function pointer plus its captures).
+    pub const FN_ADDR: u8 = 0x41;
     pub const LOAD_STATIC_ADDR: u8 = 0x35;
     // String/memory primitives: first-class string support.
     pub const LOAD_STR_ADDR: u8 = 0x36;
@@ -416,6 +421,17 @@ impl<'a> Writer<'a> {
                 self.vreg(*dst);
                 self.u32(*row);
             }
+            Instr::CallFnAddr { dst, target, args } => {
+                self.byte(tag::CALL_FN_ADDR);
+                self.vreg(*dst);
+                self.vreg(*target);
+                self.vreg_list(args);
+            }
+            Instr::FnAddr { dst, fidx } => {
+                self.byte(tag::FN_ADDR);
+                self.vreg(*dst);
+                self.u32(*fidx);
+            }
             Instr::LoadStaticAddr { dst, idx } => {
                 self.byte(tag::LOAD_STATIC_ADDR);
                 self.vreg(*dst);
@@ -596,6 +612,8 @@ fn binop_byte(op: BinOp) -> u8 {
         BinOp::Shr => 11,
         BinOp::ShrShr => 12,
         BinOp::Is => 13,
+        BinOp::UDiv => 14,
+        BinOp::URem => 15,
     }
 }
 
@@ -967,6 +985,17 @@ impl<'a> Reader<'a> {
                 let row = self.u32()?;
                 Ok(Instr::VTableAddr { dst, row })
             }
+            tag::CALL_FN_ADDR => {
+                let dst = self.vreg()?;
+                let target = self.vreg()?;
+                let args = self.vreg_list()?;
+                Ok(Instr::CallFnAddr { dst, target, args })
+            }
+            tag::FN_ADDR => {
+                let dst = self.vreg()?;
+                let fidx = self.u32()?;
+                Ok(Instr::FnAddr { dst, fidx })
+            }
             tag::LOAD_STATIC_ADDR => {
                 let dst = self.vreg()?;
                 let idx = self.u32()?;
@@ -1126,6 +1155,8 @@ fn binop_from_byte(b: u8) -> Result<BinOp, DecodeError> {
         11 => Ok(BinOp::Shr),
         12 => Ok(BinOp::ShrShr),
         13 => Ok(BinOp::Is),
+        14 => Ok(BinOp::UDiv),
+        15 => Ok(BinOp::URem),
         b => Err(DecodeError::UnknownNodeTag(b)),
     }
 }

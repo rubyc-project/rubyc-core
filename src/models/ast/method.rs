@@ -6,6 +6,17 @@ use super::statement::{Access, Stmt};
 use crate::models::Span;
 use crate::models::compare::StructuralEq;
 
+/// One `where T : IFoo<T, int>` clause. A type parameter's members
+/// resolve through its constraint, so the clauses are recorded rather
+/// than discarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeConstraint {
+    /// The constrained type parameter.
+    pub param: String,
+    /// The constraint types (an interface or class per clause).
+    pub types: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodDecl {
     pub access: Access,
@@ -15,6 +26,10 @@ pub struct MethodDecl {
     /// Needed so later passes (scan, lowering) resolve `T` in signatures
     /// and bodies — mirroring `DelegateDecl.generic_params`.
     pub generic_params: Vec<String>,
+    /// `where T : ...` clauses. A member or indexer on a type-parameter
+    /// receiver binds through them (C#: `x[i]` uses the constraint's
+    /// indexer), so they are recorded.
+    pub constraints: Vec<TypeConstraint>,
     /// Name of the return type; a richer type tree once the type system grows.
     pub ret_type: String,
     pub name: String,
@@ -25,6 +40,21 @@ pub struct MethodDecl {
     pub body: Option<Block>,
     pub span: Span,
     pub is_override: bool,
+    /// `virtual` modifier — the call binds to the RECEIVER's runtime
+    /// type, not the static one.
+    ///
+    /// Recorded, not inferred: a method is dispatch-virtual only when it
+    /// says so (or overrides one that did). Treating every call as
+    /// virtual makes `new`-hiding indistinguishable from overriding —
+    /// `((B)d).M()` runs `D.M` when C# calls `B.M`.
+    pub is_virtual: bool,
+    /// `sealed` modifier — the method may not be overridden, so its
+    /// dispatch target is fixed at the declaring type.
+    pub is_sealed: bool,
+    /// `new` modifier — this declaration HIDES an inherited member of
+    /// the same name instead of overriding it. A call through the base
+    /// type must reach the base member.
+    pub is_hiding: bool,
     /// `static` modifier — method is called on the type, not an instance.
     pub is_static: bool,
     /// `abstract` modifier — bodyless methods are valid in abstract classes.
@@ -93,6 +123,14 @@ pub struct Param {
     /// back. Without this, `out` results (TryParse, GetBytesFast's
     /// `charsConsumed`, …) are silently lost.
     pub is_byref: bool,
+    /// Attributes on the parameter (`[UnsafeAccessorType("...")]`).
+    pub attrs: Vec<super::attribute::Attribute>,
+}
+
+impl StructuralEq for TypeConstraint {
+    fn structural_eq(&self, other: &Self) -> bool {
+        self.param == other.param && self.types == other.types
+    }
 }
 
 impl StructuralEq for Param {
@@ -115,6 +153,16 @@ impl StructuralEq for Param {
 pub struct SwitchArm {
     /// Constant integer label expressions (patterns arrive in A11).
     pub labels: Vec<Expr>,
+    /// `case X when cond:` — one optional guard per label, parallel to
+    /// `labels`. A false guard means the label does NOT select the arm;
+    /// dropping it made `case 1 when false:` match anyway.
+    pub guards: Vec<Option<Expr>>,
+    /// `case RuntimeMethodBuilder mb:` — the designation bound to the
+    /// switch SUBJECT when this arm is selected, with its declared type.
+    /// Held on the arm (not the label) because the lowering enters one
+    /// block per arm and C# requires a section's labels to bind the same
+    /// variables.
+    pub binding: Option<(String, String)>,
     pub body: Block,
 }
 

@@ -92,7 +92,7 @@ pub fn jit_run_with_libs<B: CodeGenBackend + ?Sized, M: MemoryManager + ?Sized>(
     // Link imports into the code blob before relocation; Sym::Import
     // resolves through import_bases during mc.relocate below.
     if !mc.import_names.is_empty() {
-        crate::native::linker::resolve_imports(&mut mc, libs).map_err(JitError::Link)?;
+        crate::native::linker::resolve_imports(&mut mc, libs, true).map_err(JitError::Link)?;
     }
     jit_execute(mc, memory, Vec::new())
 }
@@ -114,7 +114,7 @@ pub fn jit_run_with_dyn_libs<B: CodeGenBackend + ?Sized, M: MemoryManager + ?Siz
     let mut mc = backend.lower(&program).map_err(JitError::Target)?;
 
     if !mc.import_names.is_empty() {
-        crate::native::linker::resolve_imports(&mut mc, libs).map_err(JitError::Link)?;
+        crate::native::linker::resolve_imports(&mut mc, libs, true).map_err(JitError::Link)?;
         let _handles = crate::native::linker::resolve_dep_imports_into(&mut mc, dyn_dir)
             .map_err(JitError::Link)?;
         return jit_execute(mc, memory, _handles);
@@ -143,7 +143,7 @@ pub fn jit_run_with_owners<B: CodeGenBackend + ?Sized, M: MemoryManager + ?Sized
     let mut mc = backend.lower(&program).map_err(JitError::Target)?;
 
     if !mc.import_names.is_empty() {
-        crate::native::linker::resolve_imports(&mut mc, libs).map_err(JitError::Link)?;
+        crate::native::linker::resolve_imports(&mut mc, libs, true).map_err(JitError::Link)?;
         let _handles = crate::native::linker::resolve_dep_imports_into(&mut mc, dyn_dir)
             .map_err(JitError::Link)?;
         return jit_execute(mc, memory, _handles);
@@ -200,6 +200,13 @@ fn jit_execute<M: MemoryManager + ?Sized>(
             // [+8] bump pointer starting past a 4 KiB reserve.
             (heap_base as *mut u64).write_unaligned(0);
             ((heap_base + 8) as *mut u64).write_unaligned(heap_base + 4096);
+            // The JIT is not a process entry, so there is no kernel argv
+            // stack above rsp. Pre-seed the startup slot with a block whose
+            // first word (argc) is 0 — the heap header qualifies — so the
+            // `@start` stub keeps it instead of saving the host rsp.
+            if let Some(off) = mc.helper_argv {
+                ((data_base + off as u64) as *mut u64).write_unaligned(heap_base);
+            }
         }
     }
     memory.protect_exec(page, code_r).map_err(JitError::Mmap)?;

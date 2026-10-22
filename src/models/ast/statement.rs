@@ -28,6 +28,11 @@ pub enum Stmt {
         /// `ref`/`out`/`in` local (`ref char x = ref y`): the home
         /// holds the aliased address, not a value copy.
         is_byref: bool,
+        /// Local `const` declaration. The value is materialized like
+        /// any local; the flag lets a static local function inherit the
+        /// enclosing method's constants (C# forbids capturing
+        /// variables, but a constant is not a variable).
+        is_const: bool,
         span: Span,
     },
     /// `x = expr;`
@@ -45,6 +50,15 @@ pub enum Stmt {
     },
     /// An expression evaluated for its effect, followed by `;`.
     Expression(Expr),
+    /// `checked { ... }` — a region where integer arithmetic and narrowing
+    /// conversions raise `System.OverflowException` instead of wrapping.
+    /// A distinct statement (not a flag on `Block`) so the region cannot be
+    /// lost by a rewrite, and so the closing brace restores the enclosing
+    /// mode exactly.
+    CheckedBlock {
+        body: crate::models::Block,
+        span: Span,
+    },
     /// A standalone `{ ... }` block: its statements execute in their own
     /// scope (declarations vanish at the closing brace).
     Block {
@@ -116,6 +130,17 @@ pub enum Stmt {
         body: crate::models::Block,
         span: Span,
     },
+    /// `using Type name = expr;` (the declaration form). Only the
+    /// parser produces it: `block()` rewrites it into a `Let` plus a
+    /// try/finally that disposes the resource at the end of the
+    /// enclosing block, which is what C# compiles the declaration to.
+    /// Nothing downstream should ever see one.
+    UsingDecl {
+        type_name: String,
+        name: String,
+        init: Expr,
+        span: Span,
+    },
     /// `try { … } catch (T e) { … } … finally { … }`.
     /// At least one of `catches` or `finally_block` is present.
     Try {
@@ -140,6 +165,13 @@ pub enum Stmt {
         ret_type: String,
         body: crate::models::Block,
         is_static: bool,
+        /// `extern` modifier: the local function has no body of its
+        /// own. With an `[UnsafeAccessor]` attribute it names a
+        /// target method in another type (the attribute carries the
+        /// target type and method name).
+        is_extern: bool,
+        /// Attributes on the declaration (`[UnsafeAccessor(...)]`).
+        attrs: Vec<super::attribute::Attribute>,
         span: Span,
     },
 }
@@ -151,6 +183,9 @@ pub struct CatchClause {
     pub ty: Option<String>,
     /// The bound exception variable. `None` if the clause binds no name.
     pub name: Option<String>,
+    /// `when (filter)` — the clause applies only if the filter is true.
+    /// Evaluated AFTER the type test, and only for that clause.
+    pub filter: Option<Expr>,
     /// The catch body.
     pub body: crate::models::Block,
     pub span: Span,

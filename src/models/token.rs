@@ -176,6 +176,8 @@ pub enum TokenKind {
         verbatim: bool,
     },
     IntLiteral(u64),
+    /// A character literal; the `u32` is the UTF-16 code unit.
+    CharLiteral(u32),
     /// Floating-point literal; the `u64` is the IEEE 754 bit pattern of the
     /// `f64` value (kept as bits so the token stays `Eq`).
     FloatLiteral(u64),

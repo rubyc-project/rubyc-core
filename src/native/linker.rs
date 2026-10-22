@@ -173,6 +173,18 @@ fn exported_functions(img: &[u8]) -> Result<Vec<(String, std::ops::Range<usize>)
     Ok(syms)
 }
 
+/// True for a RubyC shared image (the 🐕🇨 container preamble sits right
+/// after the 64-byte ELF header). Such a library is a RUNTIME dependency:
+/// its exports are SysV→internal trampolines (`call body` is relative to
+/// the home image), so copying the bytes into an executable is invalid.
+/// C libraries do not carry the preamble and stay copy-linkable.
+fn is_rubyc_shared_image(bytes: &[u8]) -> bool {
+    use crate::native::container::{JUMP_OVER_MAGIC, MAGIC};
+    bytes.len() >= 74
+        && bytes[64..66] == JUMP_OVER_MAGIC
+        && bytes[66..74] == MAGIC
+}
+
 /// Resolve dependency-image imports at LOAD time: for each `.so`-hinted
 /// entry of `import_names`, `dlopen` the installed dep `.so` under
 /// `dyn_dir` and `dlsym` the entry, writing the absolute address into
@@ -931,13 +943,6 @@ pub fn dead_code_eliminate(mc: &mut crate::native::target::MachineCode) {
             }
         }
     }
-    // TEMP-DCEKEEPALL: keep everything (still rebuilds/remaps) to
-    // split drop-bugs from remap-bugs. Removed before close.
-    if std::env::var("RUBYC_DCE_KEEP_ALL").is_ok() {
-        for l in live.iter_mut() {
-            *l = true;
-        }
-    }
 
     // Rebuild: live ranges concatenated in offset order (16-aligned like
     // link-time appends), every index space remapped. Computed fully
@@ -970,36 +975,6 @@ pub fn dead_code_eliminate(mc: &mut crate::native::target::MachineCode) {
         }
         fn_remap[i] = Some(new_fn_bases.len());
         new_fn_bases.push(new_off[g].expect("live group has an offset"));
-    }
-    // TEMP-DCEAUDIT: report drops with data-reloc (vtable) references.
-    if std::env::var("RUBYC_DCEAUDIT").is_ok() {
-        let mut dropped_data_refd = 0usize;
-        for (ri, r) in mc.relocs.iter().enumerate() {
-            if r.section != Section::Data {
-                continue;
-            }
-            if let Sym::Fn(j) = &r.sym {
-                if *j < fn_remap.len() && fn_remap[*j].is_none() {
-                    dropped_data_refd += 1;
-                    let _ = ri;
-                }
-            }
-        }
-        let dropped: Vec<usize> = fn_remap
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| x.is_none())
-            .map(|(i, _)| i)
-            .collect();
-        eprintln!(
-            "[rubyc] TEMP-DCEAUDIT fns={} dropped={} dropped_with_data_ref={}",
-            fn_remap.len(),
-            dropped.len(),
-            dropped_data_refd
-        );
-        if std::env::var("RUBYC_DCEAUDIT").unwrap_or_default().contains("list") {
-            eprintln!("[rubyc] TEMP-DCEAUDIT dropped idx={dropped:?}");
-        }
     }
     // Every export names a live function (exports are roots); anything
     // else is an internal contradiction — bail untouched.
@@ -1131,9 +1106,15 @@ pub fn dead_code_eliminate(mc: &mut crate::native::target::MachineCode) {
 /// Copy-link `[LibraryImport]` bodies from `--lib` ELF files into
 /// the code blob and filling `import_bases`. Fails with a readable message
 /// listing any missing symbols.
+///
+/// `allow_loader_imports` is true only when the caller resolves
+/// `.so`-hinted slots with a loader afterwards (the JIT's dlopen pass).
+/// Executables and produced shared images have no loader: they pass false
+/// and get a loud error instead of an image that calls a null slot.
 pub fn resolve_imports(
     mc: &mut crate::native::target::MachineCode,
     libs: &[PathBuf],
+    allow_loader_imports: bool,
 ) -> Result<(), String> {
     // Slots the static link step already resolved keep their bodies;
     // only null slots are (re)resolved here.
@@ -1156,29 +1137,43 @@ pub fn resolve_imports(
     // image's DATA section and point the import slot at that address.
     type SymbolTable = Vec<(String, std::ops::Range<usize>)>;
     let mut images: Vec<(PathBuf, Vec<u8>, SymbolTable, SymbolTable)> = Vec::new();
+    let mut runtime_only: Vec<PathBuf> = Vec::new();
     for lib in libs {
         let bytes = std::fs::read(lib)
             .map_err(|e| format!("cannot read library {}: {e}", lib.display()))?;
+        if is_rubyc_shared_image(&bytes) {
+            runtime_only.push(lib.clone());
+            continue;
+        }
         let syms = exported_functions(&bytes).map_err(|e| format!("{}: {e}", lib.display()))?;
         let objs = object_symbols(&bytes).map_err(|e| format!("{}: {e}", lib.display()))?;
         images.push((lib.clone(), bytes, syms, objs));
     }
 
     let mut missing: Vec<(String, usize)> = Vec::new();
+    let mut missing_dep: Vec<(String, String)> = Vec::new();
     for (i, (lib_hint, entry)) in mc.import_names.iter().enumerate() {
         // Slots the static link step already resolved keep their bodies.
         // Absent sidecar entries count as null (unresolved), never as
         // resolved: backends may leave them empty.
-        if matches!(mc.import_bases.get(i).copied(), Some(b) if b != usize::MAX) {
+        if matches!(mc.import_bases.get(i).copied(), Some(b) if b != usize::MAX)
+            || matches!(mc.import_abs.get(i).copied(), Some(a) if a != u64::MAX)
+        {
             continue;
         }
         // Dependency-image imports (`lib_hint` is a `.so` file name, e.g.
         // `System.Private.CoreLib.so`): the callee's body stays in its
-        // home image and is resolved by the loader at load time
-        // (dlopen + dlsym). Extracting (copy-linking) the body here
-        // would break its absolute references to the home image, so the
-        // slot stays null — like shared-library builds with no `--lib`.
+        // home image and is resolved by a loader at load time (dlopen +
+        // dlsym). Extracting (copy-linking) the body here would break its
+        // absolute references to the home image. Only a host with a
+        // loader (the JIT) may leave the slot null; an executable or a
+        // produced shared image has none, so it must report instead of
+        // shipping a null call.
         if lib_hint.ends_with(".so") {
+            if allow_loader_imports {
+                continue;
+            }
+            missing_dep.push((entry.clone(), lib_hint.clone()));
             continue;
         }
         // Prefer an image whose file name contains the library hint
@@ -1218,36 +1213,46 @@ pub fn resolve_imports(
         mc.import_bases[i] = mc.code.len();
         mc.code.extend_from_slice(&bytes[range]);
     }
-    if !missing.is_empty() {
-        // Fail-open linking (opt-in via RUBYC_ALLOW_MISSING_IMPORTS):
-        // imports that may never execute. With the flag, missing
-        // imports resolve to a zero-returning stub (documented
-        // fail-open: called ones return 0, matching the old
-        // silent-miss behavior) and warn loudly. Lib builds keep the
-        // strict error (unset flag) so stub authoring still has its
-        // signal.
-        if std::env::var("RUBYC_ALLOW_MISSING_IMPORTS").is_ok() {
-            eprintln!(
-                "[rubyc] warning: {} imports not found, stubbed zero: {}",
-                missing.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().len(),
-                missing.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().join(", ")
-            );
-            for (_, i) in &missing {
-                // Zero stub: xor eax, eax; ret. Aligned like real bodies.
-                while !mc.code.len().is_multiple_of(16) {
-                    mc.code.push(0xCC);
-                }
-                mc.import_bases[*i] = mc.code.len();
-                mc.code.extend_from_slice(&[0x31, 0xC0, 0xC3]); // xor eax, eax; ret
-            }
-        } else {
-            let provided: Vec<String> =
-                libs.iter().map(|p| p.display().to_string()).collect();
-            return Err(format!(
+    if !missing.is_empty() || !missing_dep.is_empty() {
+        // A missing import is always an error. It used to be possible
+        // to opt into fail-open linking (RUBYC_ALLOW_MISSING_IMPORTS),
+        // which emitted a `xor eax,eax; ret` stub so every uncalled
+        // symbol linked cleanly — and any *called* one silently
+        // returned 0 at runtime instead of failing.
+        let provided: Vec<String> = libs.iter().map(|p| p.display().to_string()).collect();
+        let mut msg = String::new();
+        if !missing.is_empty() {
+            msg.push_str(&format!(
                 "imports not found in provided libraries {provided:?}: {}",
                 missing.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().join(", ")
             ));
         }
+        if !missing_dep.is_empty() {
+            if !msg.is_empty() {
+                msg.push_str("; ");
+            }
+            msg.push_str(&format!(
+                "dependency-image imports need a loader, and this image has none: {} — run it in the JIT, link the matching .a archive, or build the dependency from sources",
+                missing_dep
+                    .iter()
+                    .map(|(entry, hint)| format!("{entry} from {hint}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !runtime_only.is_empty() {
+            // .NET semantics: an assembly is a runtime dependency, not a
+            // body donor. Say so instead of emitting a crashing copy.
+            msg.push_str(&format!(
+                "; RubyC shared libraries are runtime dependencies and are not copy-linked: {} — link the matching .a archive or build a dynamic consumer",
+                runtime_only
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Err(msg);
     }
     Ok(())
 }
@@ -1375,7 +1380,7 @@ mod tests {
         mc.import_names = vec![
             ("DepLib.so".to_owned(), "Ns.Class::Method#0".to_owned()),
         ];
-        resolve_imports(&mut mc, &[]).expect("dep imports never fail link");
+        resolve_imports(&mut mc, &[], true).expect("dep imports never fail link");
         assert_eq!(mc.import_bases, vec![usize::MAX]);
         assert!(mc.code.is_empty(), "no body extracted for dep imports");
     }
@@ -1911,5 +1916,51 @@ mod tests {
             "survivor remapped: {:?}",
             mc.relocs[0].sym
         );
+    }
+
+    #[test]
+    fn rubyc_shared_library_reports_runtime_dependency() {
+        // A RubyC `.so` export is a trampoline whose `call body` is
+        // image-relative; copying it crashed the consumer. The linker must
+        // classify it as a runtime dependency, not a body donor.
+        let dir = std::env::temp_dir().join(format!(
+            "rubyc-shared-img-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = vec![0u8; 80];
+        img[64..66].copy_from_slice(&crate::native::container::JUMP_OVER_MAGIC);
+        img[66..74].copy_from_slice(&crate::native::container::MAGIC);
+        let so = dir.join("Lib.so");
+        std::fs::write(&so, &img).unwrap();
+        let mut mc = empty_mc();
+        mc.import_names = vec![("Lib".to_owned(), "answer".to_owned())];
+        let err = resolve_imports(&mut mc, &[so], false).expect_err("runtime dependency, not a body");
+        assert!(
+            err.contains("runtime dependencies") && err.contains("dynamic consumer"),
+            "the error must explain the model: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dep_so_import_without_a_loader_is_reported() {
+        // A `.so`-hinted import used to be skipped unconditionally, so a
+        // static executable linked with a null call. Only the JIT (which
+        // dlopens afterwards) may leave it for load time.
+        let mut mc = empty_mc();
+        mc.import_names = vec![("Lib.so".to_owned(), "Lib::F#0".to_owned())];
+        let err = resolve_imports(&mut mc, &[], false).expect_err("no loader in a static image");
+        assert!(
+            err.contains("need a loader")
+                && err.contains("Lib::F#0")
+                && err.contains("Lib.so"),
+            "the error must name the slot and its image: {err}"
+        );
+
+        let mut mc = empty_mc();
+        mc.import_names = vec![("Lib.so".to_owned(), "Lib::F#0".to_owned())];
+        resolve_imports(&mut mc, &[], true).expect("the JIT resolves it with dlopen");
     }
 }

@@ -293,6 +293,55 @@ impl Reader<'_> {
         })
     }
 
+    /// One indexer declaration (shared by class members and an
+    /// interface's own indexers).
+    fn indexer_decl(&mut self) -> Result<IndexerDecl, DecodeError> {
+        let access = match self.byte()? {
+            1 => Access::Public,
+            2 => Access::Private,
+            3 => Access::Protected,
+            4 => Access::Internal,
+            _ => Access::Default,
+        };
+        let is_settable = self.byte()? != 0;
+        let attrs = self.attrs()?;
+        let type_name = self.string()?;
+        let param_count = self.u32()?;
+        let _reserved = self.count(param_count)?;
+        let mut params = Vec::with_capacity(param_count as usize);
+        for _ in 0..params.capacity() {
+            params.push(self.param()?);
+        }
+        let init = self.expr()?;
+        let get = if self.byte()? == format::tag::PRESENT {
+            Some(self.block()?)
+        } else {
+            None
+        };
+        let set = if self.byte()? == format::tag::PRESENT {
+            Some(self.block()?)
+        } else {
+            None
+        };
+        let get_expr = if self.byte()? == format::tag::PRESENT {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(IndexerDecl {
+            access,
+            attrs,
+            type_name,
+            params,
+            init,
+            get,
+            set,
+            get_expr,
+            is_settable,
+            span: Span::default(),
+        })
+    }
+
     fn interface(&mut self) -> Result<InterfaceDecl, DecodeError> {
         let name = self.string()?;
         let mut generic_params = {
@@ -310,6 +359,14 @@ impl Reader<'_> {
         };
         for _ in 0..bases.capacity() {
             bases.push(self.string()?);
+        }
+        let mut indexers = {
+            let n = self.u32()?;
+            self.count(n)?;
+            Vec::with_capacity(n)
+        };
+        for _ in 0..indexers.capacity() {
+            indexers.push(self.indexer_decl()?);
         }
         let mut methods = {
             let n = self.u32()?;
@@ -367,6 +424,7 @@ impl Reader<'_> {
             name,
             generic_params,
             methods,
+            indexers,
             bases,
             arity: 0,
             is_partial: false,
@@ -417,7 +475,7 @@ impl Reader<'_> {
             span: Span::default(),
             is_partial: false,
             // Not carried by the v1 AST contract (same as `is_partial`).
-            is_struct: false,
+            is_struct: false, is_record: false,
             // Cross-assembly unions never cross a bytecode boundary
             // (linking merges sources, not images).
             union_cross_assembly: false,
@@ -476,6 +534,9 @@ impl Reader<'_> {
                 let is_init = flags & 0b10 != 0;
                 let is_static = flags & 0b100 != 0;
                 let is_abstract = flags & 0b1000 != 0;
+                let is_override = flags & 0b1_0000 != 0;
+                let is_virtual = flags & 0b10_0000 != 0;
+                let is_hiding = flags & 0b100_0000 != 0;
                 let attrs = self.attrs()?;
                 let type_name = self.string()?;
                 let name = self.string()?;
@@ -496,6 +557,9 @@ impl Reader<'_> {
                     None
                 };
                 Ok(ClassMember::Property(PropertyDecl {
+                    is_override,
+                    is_virtual,
+                    is_hiding,
                     access,
                     attrs,
                     type_name,
@@ -513,50 +577,8 @@ impl Reader<'_> {
             }
             format::tag::INDEXER => {
                 self.byte()?;
-                let access = match self.byte()? {
-                    1 => Access::Public,
-                    2 => Access::Private,
-                    3 => Access::Protected,
-                    4 => Access::Internal,
-                    _ => Access::Default,
-                };
-                let is_settable = self.byte()? != 0;
-                let attrs = self.attrs()?;
-                let type_name = self.string()?;
-                let param_count = self.u32()?;
-                let _reserved = self.count(param_count)?;
-                let mut params = Vec::with_capacity(param_count as usize);
-                for _ in 0..params.capacity() {
-                    params.push(self.param()?);
-                }
-                let init = self.expr()?;
-                let get = if self.byte()? == format::tag::PRESENT {
-                    Some(self.block()?)
-                } else {
-                    None
-                };
-                let set = if self.byte()? == format::tag::PRESENT {
-                    Some(self.block()?)
-                } else {
-                    None
-                };
-                let get_expr = if self.byte()? == format::tag::PRESENT {
-                    Some(self.expr()?)
-                } else {
-                    None
-                };
-                Ok(ClassMember::Indexer(IndexerDecl {
-                    access,
-                    attrs,
-                    type_name,
-                    params,
-                    init,
-                    get,
-                    set,
-                    get_expr,
-                    is_settable,
-                    span: Span::default(),
-                }))
+                let idx = self.indexer_decl()?;
+                Ok(ClassMember::Indexer(idx))
             }
             format::tag::EVENT => {
                 self.byte()?;
@@ -687,11 +709,15 @@ impl Reader<'_> {
             access,
             attrs,
             generic_params,
+            constraints: Vec::new(),
             ret_type,
             name,
             params,
             body,
             is_override,
+            is_virtual: is_override,
+            is_sealed: false,
+            is_hiding: false,
             is_static,
             is_abstract: false,
             is_partial: false,
@@ -716,6 +742,8 @@ impl Reader<'_> {
             format::tag::ABSENT => false,
             tag => return Err(DecodeError::UnknownNodeTag(tag)),
         };
+        // Parameter attributes (see encode).
+        let attrs = self.attrs()?;
         // By-reference marker (see encode).
         let is_byref = match self.byte()? {
             format::tag::PRESENT => true,
@@ -731,6 +759,7 @@ impl Reader<'_> {
             // Not carried by the v1 AST contract (same as `is_struct`).
             is_params: false,
             is_byref,
+            attrs,
         })
     }
 
@@ -776,8 +805,14 @@ impl Reader<'_> {
                     format::tag::ABSENT => false,
                     tag => return Err(DecodeError::UnknownNodeTag(tag)),
                 };
+                let is_const = match self.byte()? {
+                    format::tag::PRESENT => true,
+                    format::tag::ABSENT => false,
+                    tag => return Err(DecodeError::UnknownNodeTag(tag)),
+                };
                 let init = self.expr()?;
                 Ok(Stmt::Let {
+                    is_const,
                     type_name,
                     name,
                     init,
@@ -830,6 +865,14 @@ impl Reader<'_> {
                 let body = self.block()?;
                 Ok(Stmt::While {
                     cond,
+                    body,
+                    span: Span::default(),
+                })
+            }
+            format::tag::stmt::CHECKED_BLOCK => {
+                self.byte()?;
+                let body = self.block()?;
+                Ok(Stmt::CheckedBlock {
                     body,
                     span: Span::default(),
                 })
@@ -890,7 +933,8 @@ impl Reader<'_> {
                         labels.push(self.expr()?);
                     }
                     let body = self.block()?;
-                    arms.push(crate::models::SwitchArm { labels, body });
+                    let guards = vec![None; labels.len()];
+                    arms.push(crate::models::SwitchArm { labels, guards, binding: None, body });
                 }
                 let default_body = if self.byte()? == format::tag::PRESENT {
                     Some(self.block()?)
@@ -982,6 +1026,7 @@ impl Reader<'_> {
                     };
                     let cbody = self.block()?;
                     catches.push(CatchClause {
+                        filter: None,
                         ty,
                         name,
                         body: cbody,
@@ -1023,7 +1068,11 @@ impl Reader<'_> {
                 let ret_type = self.string()?;
                 let body = self.block()?;
                 let is_static = self.byte()? != 0;
+                let is_extern = self.byte()?;
+                let attrs = self.attrs()?;
                 Ok(Stmt::LocalFunction {
+                    is_extern: is_extern != 0,
+                    attrs,
                     name,
                     params,
                     ret_type,
@@ -1121,6 +1170,7 @@ impl Reader<'_> {
             }
             format::tag::STR => Ok(Expr::Literal(Literal::Str(self.string()?))),
             format::tag::INT => Ok(Expr::Literal(Literal::Int(self.u64()? as i64))),
+            format::tag::CHAR => Ok(Expr::Literal(Literal::Char(self.u32()? as u32))),
             format::tag::FLOAT => Ok(Expr::Literal(Literal::Float(
                 f64::from_bits(self.u64()?),
             ))),
@@ -1139,6 +1189,7 @@ impl Reader<'_> {
                     let name = self.string()?;
                     let value = self.expr()?;
                     init.push(crate::models::ast::MemberInit {
+                        index: None,
                         name,
                         value,
                         span: Span::default(),
@@ -1178,7 +1229,7 @@ impl Reader<'_> {
                 let object = Box::new(self.expr()?);
                 let index = Box::new(self.expr()?);
                 let is_range = self.byte()? != 0;
-                Ok(Expr::Index { object, index, is_range, span: Span::default() })
+                Ok(Expr::Index { object, index, extra: Vec::new(), is_range, span: Span::default() })
             }
             format::tag::TERNARY => {
                 let cond = Box::new(self.expr()?);
@@ -1210,10 +1261,15 @@ impl Reader<'_> {
                     self.count(label_count)?;
                     let mut labels = Vec::with_capacity(label_count);
                     for _ in 0..label_count {
-                        labels.push(self.string()?);
+                        labels.push(self.expr()?);
                     }
+                    let guard = if self.byte()? == format::tag::PRESENT {
+                        Some(self.expr()?)
+                    } else {
+                        None
+                    };
                     let body = Box::new(self.expr()?);
-                    arms.push(SwitchExprArm { labels, body });
+                    arms.push(SwitchExprArm { labels, guard, body });
                 }
                 Ok(Expr::SwitchExpr {
                     subject,
@@ -1275,6 +1331,19 @@ impl Reader<'_> {
                 let type_name = self.string()?;
                 Ok(Expr::Default {
                     type_name,
+                    span: Span::default(),
+                })
+            }
+            format::tag::LAMBDA => {
+                // Written by the encoder purely so the round-trip fails
+                // loudly. Decoding cannot reconstruct a closure, and
+                // guessing one would be worse than refusing.
+                return Err(DecodeError::UnknownNodeTag(format::tag::LAMBDA));
+            }
+            format::tag::CHECKED => {
+                let inner = self.expr()?;
+                Ok(Expr::Checked {
+                    inner: Box::new(inner),
                     span: Span::default(),
                 })
             }

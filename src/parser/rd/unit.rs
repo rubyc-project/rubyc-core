@@ -1,7 +1,8 @@
 //! Entry points: compilation units, namespaces, member dispatch.
 
 use crate::models::{
-    Access, CompilationUnit, Keyword, Member, NamespaceDecl, TokenKind, UsingAlias,
+    Access, CompilationUnit, Diagnostic, Keyword, Member, NamespaceDecl, Severity, TokenKind,
+    UsingAlias,
 };
 
 use super::Parser;
@@ -369,9 +370,9 @@ impl Parser {
             }
             self.bump();
         }
-        // `closed` modifier (C# 14, contextual like `safe` above — see
-        // class_member's identical arm): consumed and ignored here too
-        // so top-level `closed class` parses.
+        // `closed` (C# 14): the restriction is not enforced, so the
+        // type is parsed and a warning says so — the same treatment as
+        // the nested-type arm in `class_member`.
         if matches!(self.peek().kind, TokenKind::Identifier(ref n) if n == "closed")
             && matches!(
                 self.peek_at(1).kind,
@@ -381,12 +382,22 @@ impl Parser {
                     | TokenKind::Keyword(Keyword::Record_)
             )
         {
+            let span = self.peek().span;
             self.bump();
+            self.errors.push(
+                Diagnostic::new(
+                    "W0004",
+                    Severity::Warning,
+                    crate::t!("rubyc.parser.rd.declaration.closed_not_enforced"),
+                )
+                .at(span)
+                .in_context(self.context.clone()),
+            );
         }
         match &self.peek().kind {
             TokenKind::Keyword(Keyword::Interface) => self.interface_decl(is_partial).map(Member::Interface),
             TokenKind::Keyword(Keyword::Class) => {
-                self.class_decl_impl(access, false, is_partial, false).map(Member::Class)
+                self.class_decl_impl(access, false, is_partial, false, false).map(Member::Class)
             }
             TokenKind::Keyword(Keyword::Enum_) => self.enum_decl().map(Member::Enum),
             TokenKind::Keyword(Keyword::Struct_) => {
@@ -394,7 +405,7 @@ impl Parser {
                 // arrive with A6, but constructor rules already differ
                 // (a struct keeps its implicit parameterless ctor even
                 // with explicit ctors).
-                self.class_decl_impl(access, false, is_partial, true).map(Member::Class)
+                self.class_decl_impl(access, false, is_partial, true, false).map(Member::Class)
             }
             TokenKind::Keyword(Keyword::Delegate_) => {
                 self.delegate_decl(access).map(Member::Delegate)
@@ -414,11 +425,11 @@ impl Parser {
                     );
                     self.bump(); // 'record'
                     self.bump(); // 'struct' or 'class'
-                    self.class_decl_impl(access, true, is_partial, record_is_struct)
+                    self.class_decl_impl(access, true, is_partial, record_is_struct, true) // `record` keyword seen
                         .map(Member::Class)
                 } else {
                     // `record Name(...)` — parsed as a class.
-                    self.class_decl_impl(access, false, is_partial, false).map(Member::Class)
+                    self.class_decl_impl(access, false, is_partial, false, true).map(Member::Class)
                 }
             }
             other => {

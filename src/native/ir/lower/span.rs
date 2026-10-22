@@ -148,17 +148,6 @@ pub(super) fn vtable_row_for(
     vi
 }
 
-/// Synthetic placeholder-type row (see `ir/mod.rs`): appended after
-/// every class row, so its index is exactly the table-backed
-/// declaration count. `typeof(X)` boxes carry this row — never X's
-/// own — so virtual calls on placeholders land on zero stubs.
-pub(super) fn placeholder_row(ctx: &Ctx<'_>) -> u32 {
-    ctx.classes
-        .iter()
-        .filter(|c| ctx.table.class(&c.name).is_some())
-        .count() as u32
-}
-
 /// Resolve the class entry backing a span spelling (exact hit,
 /// else same-base entry carrying the inner type). Span spellings
 /// arrive short (`ReadOnlySpan<byte>`) while keys are full paths.
@@ -422,15 +411,6 @@ pub(super) fn span_index(
         a: r,
         b: off,
     });
-    // TEMP-SPANDIAG4: dump span read base + index (pairs with
-    // SPANDIAG3 pack prints). Removed before close.
-    if std::env::var("RUBYC_SPANDIAG3").is_ok() {
-        let (nl_off, nl_len) = b.string_literal("\n");
-        b.push_raw(Instr::EWriteInt { src: r });
-        b.push_raw(Instr::EWriteStr { off: nl_off, len: nl_len });
-        b.push_raw(Instr::EWriteInt { src: idx });
-        b.push_raw(Instr::EWriteStr { off: nl_off, len: nl_len });
-    }
     let dst = b.fresh();
     if w == 1 {
         b.push_raw(Instr::LoadByte {
@@ -676,12 +656,6 @@ pub(super) fn coerce_span_return(
     val_ty: &str,
     ret_ty: &str,
 ) -> Result<VReg, LowerError> {
-    // TEMP-SPANDIAG2: trace the coerce decision. Removed before close.
-    if std::env::var("RUBYC_SPANDIAG").is_ok() {
-        let sv = span_view(ret_ty);
-        let scp = span_class_path(ctx, ret_ty);
-        eprintln!("[rubyc] TEMP-SPANDIAG2 val_ty={val_ty} ret_ty={ret_ty} view={sv:?} path={scp:?}");
-    }
     if let Some(nv) = coerce_span_arg(b, ctx, v, val_ty, ret_ty)? {
         return Ok(nv);
     }
@@ -1358,15 +1332,6 @@ pub(super) fn pack_span_from_array(
         dst: data,
         bytes: total,
     });
-    // TEMP-SPANDIAG3: dump span-pack len + buffer (hunt for the wild
-    // data pointer faulting Log2DeBruijn). Removed before close.
-    if std::env::var("RUBYC_SPANDIAG3").is_ok() {
-        let (nl_off, nl_len) = b.string_literal("\n");
-        b.push_raw(Instr::EWriteInt { src: len });
-        b.push_raw(Instr::EWriteStr { off: nl_off, len: nl_len });
-        b.push_raw(Instr::EWriteInt { src: data });
-        b.push_raw(Instr::EWriteStr { off: nl_off, len: nl_len });
-    }
     let sixteen = b.const_i64(16);
     let src = b.emit(Instr::Bin {
         dst: VReg(0),

@@ -439,3 +439,24 @@ fn named_out_var_in_field_initializer() {
     crate::native::ir::lower_with_defines(&unit, true, &[])
         .expect("out-vars in field initializers lower");
 }
+
+#[test]
+fn derives_from_prefers_an_exact_path_over_any_same_named_entry() {
+    // A qualified path names exactly one type, so the walk decides on
+    // its own. A bare name cannot: members record `declaring_class` as
+    // a NAME, so by the time the question is asked the spelling may
+    // denote two real types. The bare-name case now says so in the
+    // code, reports the collision (W0005), and its exact fix —
+    // carrying the member's TypeKey — is tracked as 2.7.13.
+    let src = "namespace A { class Base { protected int P() { return 1; } } } namespace B { class Base { } } namespace Use { class D : A.Base { int M() { return P(); } } class K { int Main() { return 0; } } }";
+    let unit = crate::parser::parse(src).unwrap();
+    crate::native::ir::lower_with_defines(&unit, true, &[])
+        .expect("a qualified derivation grants protected access");
+
+    // The ambiguous bare name is reported rather than silently resolved.
+    let diags = crate::diagnostics_semantic::scan(&unit);
+    assert!(
+        diags.iter().any(|d| d.code == "W0005"),
+        "the same-named `Base` is reported: {diags:?}"
+    );
+}

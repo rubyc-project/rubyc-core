@@ -14,6 +14,11 @@ pub struct InterfaceDecl {
     /// (`arity` below stays in sync: always `generic_params.len()`.)
     pub generic_params: Vec<String>,
     pub methods: Vec<MethodSig>,
+    /// Indexers declared by the interface (`TElement this[int i]`).
+    /// A member or indexer on a type-parameter receiver binds through
+    /// the constraint, so an interface's indexers must be recorded —
+    /// they were discarded, leaving `x[i]` untyped.
+    pub indexers: Vec<super::class::IndexerDecl>,
     /// Inherited interfaces (`interface A : B, C`): member lookup
     /// walks these transitively (`IAsyncEnumerator<T>` inherits
     /// `DisposeAsync` from `IAsyncDisposable`).

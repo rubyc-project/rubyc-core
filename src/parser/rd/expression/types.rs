@@ -1,8 +1,10 @@
 //! Expressions: precedence climbing, unary, postfix chains, primaries.
 
-use crate::models::{Access, BinOp, Expr, Keyword, Literal, Span, Stmt, TokenKind};
+use crate::models::{
+    Access, BinOp, Diagnostic, Expr, Keyword, Literal, Severity, Span, Stmt, TokenKind,
+};
 
-use super::super::{Parser, expr_span_last};
+use super::super::{Parser, expr_span_last, expr_span};
 impl Parser {
     pub(in crate::parser::rd) fn argument_list(&mut self) -> Vec<Expr> {
         let mut args = Vec::new();
@@ -14,13 +16,26 @@ impl Parser {
             // argument name from the value; the value is what we
             // record in the AST. The label may be an identifier or a
             // contextual keyword (e.g. `required:`).
+            let mut arg_name: Option<(String, Span)> = None;
             if matches!(
                 self.peek().kind,
                 TokenKind::Identifier(_) | TokenKind::Keyword(_)
             ) && self.peek_at(1).kind == TokenKind::Colon
             {
+                let tok = self.peek().clone();
+                let name_span = tok.span;
+                // The name as written (the token is an identifier or a
+                // contextual keyword; `@name` keeps its spelling minus
+                // the marker).
+                let name = std::str::from_utf8(
+                    &self.source[tok.span.start as usize..tok.span.end as usize],
+                )
+                .unwrap_or("")
+                .trim_start_matches('@')
+                .to_owned();
                 self.bump(); // name
                 self.bump(); // ':'
+                arg_name = Some((name, name_span));
             }
             // Modifier-prefixed parameter: `out int x`, `ref int x`,
             // `in int x`. Consume the modifier and the type identifier;
@@ -115,6 +130,7 @@ impl Parser {
                         std::str::from_utf8(bytes).unwrap_or("").to_owned();
                     let ty = declared_ty.unwrap_or_else(|| String::from("var"));
                     self.pre_pending.push(Stmt::Let {
+                        is_const: false,
                         is_byref: false,
                         type_name: ty.clone(),
                         name: var_name.clone(),
@@ -125,6 +141,7 @@ impl Parser {
                     out_default = Some((ty, var_name, mod_span.to(name_span)));
                 }
             }
+            let arg_start = args.len();
             match out_default {
                 Some((_ty, var_name, span)) => {
                     self.bump(); // consume the out-var name
@@ -167,6 +184,17 @@ impl Parser {
                     None => return args,
                 },
             }
+            if let Some((name, name_span)) = arg_name {
+                if args.len() > arg_start {
+                    let value = args.pop().expect("argument just pushed");
+                    let end = self.peek().span;
+                    args.push(Expr::NamedArg {
+                        name,
+                        value: Box::new(value),
+                        span: name_span.to(end),
+                    });
+                }
+            }
             if self.eat(&TokenKind::Comma).is_none() {
                 return args;
             }
@@ -187,78 +215,131 @@ impl Parser {
         // Generic argument list: `A<int, string>`. Note: the lexer may
         // produce `Shl`/`Shr` for `<<`/`>>` (shift operators), which
         // represent TWO `<` or TWO `>`.
-        if matches!(self.peek().kind, TokenKind::Less | TokenKind::Shl) {
-            let opening_depth = match self.peek().kind {
-                TokenKind::Less => 1,
-                TokenKind::Shl => 2,
-                _ => unreachable!(),
-            };
-            name.push('<');
-            if opening_depth == 2 {
-                name.push('<');
-            }
-            self.bump();
-            let mut depth = opening_depth;
-            while depth > 0 {
-                match self.peek().kind {
-                    TokenKind::Eof => break,
-                    TokenKind::Less => {
-                        depth += 1;
-                        name.push('<');
-                        self.bump();
+        if !matches!(self.peek().kind, TokenKind::Less | TokenKind::Shl) {
+            return;
+        }
+        let open_span = self.peek().span;
+        let (opening_depth, text) = match self.peek().kind {
+            TokenKind::Less => (1, "<"),
+            TokenKind::Shl => (2, "<<"),
+            _ => unreachable!(),
+        };
+        name.push_str(text);
+        self.bump();
+        let mut depth = opening_depth;
+        // The list must close exactly. Tokens that cannot appear in a
+        // type argument list used to be swallowed silently and a
+        // `>>` at depth 1 used to "tolerate" the surplus `>`, both
+        // ending a type name the source never wrote.
+        let mut closed = false;
+        while depth > 0 {
+            match self.peek().kind {
+                TokenKind::Eof => break,
+                TokenKind::Less => {
+                    depth += 1;
+                    name.push('<');
+                    self.bump();
+                }
+                TokenKind::Shl => {
+                    depth += 2;
+                    name.push_str("<<");
+                    self.bump();
+                }
+                TokenKind::Greater => {
+                    depth -= 1;
+                    name.push('>');
+                    self.bump();
+                    if depth == 0 {
+                        closed = true;
                     }
-                    TokenKind::Shl => {
-                        depth += 2;
-                        name.push_str("<<");
-                        self.bump();
-                    }
-                    TokenKind::Greater => {
-                        depth -= 1;
-                        if depth == 0 {
-                            name.push('>');
-                            self.bump();
-                            break;
-                        }
+                }
+                TokenKind::Shr => {
+                    if depth < 2 {
+                        // Only one `>` belongs to this list and the
+                        // second is a comparison — exactly how C#
+                        // splits `A<X> > y`, so the list ends here and
+                        // the `>` stays for the expression parser.
                         name.push('>');
                         self.bump();
+                        closed = true;
+                        break;
                     }
-                    TokenKind::Shr => {
-                        // Both `>` belong to this list at depth>=2;
-                        // shallower depths tolerate junk.
-                        // (Dropping one here stranded names like
-                        // `A<X<T>>` as `A<X<T>`.)
+                    name.push_str(">>");
+                    depth -= 2;
+                    self.bump();
+                    // `>>` can close the list exactly (`A<B<C>>` must not
+                    // be reported as unterminated): the flag is what the
+                    // reporting at the bottom reads.
+                    if depth == 0 {
+                        closed = true;
+                    }
+                }
+                TokenKind::ShrShr => {
+                    if depth < 3 {
                         name.push_str(">>");
-                        depth -= 2;
                         self.bump();
-                        if depth <= 0 {
-                            break;
-                        }
+                        closed = true;
+                        break;
                     }
-                    TokenKind::ShrShr => {
-                        // All three, same rule.
-                        name.push_str(">>>");
-                        depth -= 3;
-                        self.bump();
-                        if depth <= 0 {
-                            break;
-                        }
+                    name.push_str(">>>");
+                    depth -= 3;
+                    self.bump();
+                    if depth <= 0 {
+                        closed = true;
                     }
-                    TokenKind::Comma => {
-                        name.push(',');
-                        self.bump();
-                    }
-                    TokenKind::Identifier(ref s) => {
-                        name.push_str(s);
-                        self.bump();
-                    }
-                    _ => {
-                        // Consume any other token (keywords, literals, etc.)
-                        // that may appear in generic arguments.
-                        self.bump();
-                    }
+                }
+                TokenKind::Comma => {
+                    name.push(',');
+                    self.bump();
+                }
+                TokenKind::Identifier(ref s) => {
+                    name.push_str(s);
+                    self.bump();
+                }
+                // Type arguments may nest (`A<B.C>`, `int[]`, `(int,
+                // string)` for tuple element types) and carry a
+                // nullable marker.
+                TokenKind::Dot
+                | TokenKind::Question
+                | TokenKind::Star
+                | TokenKind::LeftBracket
+                | TokenKind::RightBracket
+                | TokenKind::LeftParen
+                | TokenKind::RightParen => {
+                    let t = format!("{:?}", self.peek().kind);
+                    name.push_str(t.trim_matches('\''));
+                    self.bump();
+                }
+                TokenKind::Keyword(_) => {
+                    let t = format!("{:?}", self.peek().kind);
+                    name.push_str(t.trim_matches('\''));
+                    self.bump();
+                }
+                _ => {
+                    self.report_unterminated_generic(open_span, &name.clone());
+                    return;
                 }
             }
         }
+        if !closed {
+            self.report_unterminated_generic(open_span, name);
+        }
+    }
+
+    /// A generic argument list that never closed (or held a token that
+    /// cannot appear in one). Reported: silently ending the type name
+    /// turned `List<int` or `Dict<K,;` into a plausible-looking type
+    /// that resolved against whatever happened to share the name.
+    fn report_unterminated_generic(&mut self, open_span: Span, name: &str) {
+        let mut diag = Diagnostic::new(
+            "E0037",
+            Severity::Error,
+            crate::t!("rubyc.parser.rd.expression.types.unterminated_generic"),
+        )
+        .at(open_span.to(self.peek_at(0).span))
+        .in_context(self.context.clone());
+        diag.help = Some(format!("close the argument list of `{name}` with `>`"));
+        self.errors.push(diag);
     }
 
     /// Parses a type name that may be dot-qualified and generic:
@@ -764,11 +845,98 @@ impl Parser {
         if saw_generics { Some(expr) } else { None }
     }
 
+    /// Report a pattern whose test the compiler cannot evaluate, and
+    /// yield the placeholder the error path uses. A type pattern
+    /// selects by RUNTIME TYPE; the old placeholder made the test false
+    /// (`Int(0)` / `Ident("<pattern>")`), so the arm or guard never
+    /// fired and the program took the else path as if the check had
+    /// passed.
+    pub(in crate::parser::rd) fn report_unsupported_pattern(
+        &mut self,
+        start: Span,
+        subject: &str,
+        verb: &str,
+    ) -> Expr {
+        let mut diag = Diagnostic::new(
+            "E0036",
+            Severity::Error,
+            crate::t!("rubyc.parser.rd.expression.types.unsupported_pattern"),
+        )
+        .at(start.to(expr_span_last(&self.tokens[..self.pos])))
+        .in_context(self.context.clone());
+        diag.help = Some(format!(
+            "{subject} {verb} not implemented; the test could not be evaluated"
+        ));
+        self.errors.push(diag);
+        Expr::Literal(Literal::Int(0))
+    }
+
+    /// Parse a full `is` pattern: one primary, then any `and`/`or`
+    /// chain. Shared by the expression parser and by parenthesized
+    /// patterns so both build the same shape.
+    pub(in crate::parser::rd) fn parse_is_pattern_chain(
+        &mut self,
+        subject: Option<&Expr>,
+    ) -> Option<Expr> {
+        let mut pattern = self.parse_is_pattern_primary(subject)?;
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::Keyword(Keyword::And_) => BinOp::And,
+                TokenKind::Keyword(Keyword::Or_) => BinOp::Or,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_is_pattern_primary(subject)?;
+            let span = expr_span(&pattern).to(expr_span_last(&self.tokens[..self.pos]));
+            pattern = Expr::Binary {
+                op,
+                lhs: Box::new(pattern),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Some(pattern)
+    }
+
     /// Parse one primary C# pattern for the `is` operator's rhs. Mirrors
     /// [`super::statement::Parser::parse_pattern_primary`] but only the
     /// shape needed inside an expression (no `and`/`or` chaining here).
-    pub(in crate::parser::rd) fn parse_is_pattern_primary(&mut self) -> Option<Expr> {
+    pub(in crate::parser::rd) fn parse_is_pattern_primary(
+        &mut self,
+        subject: Option<&Expr>,
+    ) -> Option<Expr> {
         let start = self.peek().span;
+        // Parenthesized pattern: `is not (A or B)`. The group holds a
+        // full or/and chain, so it must be parsed as a pattern — not as
+        // a positional pattern, which has no lowering. A CAST
+        // (`is not (byte)'\t'`) also starts with `(` and is
+        // distinguished by what follows the closing paren: an operand
+        // means the parens belonged to the type.
+        if self.peek().kind == TokenKind::LeftParen && !self.paren_holds_comma() {
+            let mark = self.pos;
+            let errs = self.errors.len();
+            self.bump(); // '('
+            let inner = self.parse_is_pattern_chain(subject);
+            let closed = self.eat(&TokenKind::RightParen).is_some();
+            let next_is_operand = matches!(
+                self.peek().kind,
+                TokenKind::IntLiteral(_)
+                    | TokenKind::CharLiteral(_)
+                    | TokenKind::FloatLiteral(_)
+                    | TokenKind::StringLiteral(_)
+                    | TokenKind::Minus
+                    | TokenKind::Identifier(_)
+                    | TokenKind::LeftParen
+                    | TokenKind::Minus
+            );
+            if let (Some(inner), true) = (inner, closed) {
+                if !next_is_operand {
+                    return Some(inner);
+                }
+            }
+            self.pos = mark;
+            self.errors.truncate(errs);
+        }
         // `sizeof(T)` / `typeof(T)` / `nameof(X)` in pattern position
         // (`is sizeof(char) or sizeof(byte)`): consume the name plus
         // balanced parens as one constant-ish pattern. Without this
@@ -780,10 +948,56 @@ impl Parser {
             _ => false,
         };
         if is_size_name && self.peek_at(1).kind == TokenKind::LeftParen {
+            // `sizeof(T)` / `typeof(T)` / `nameof(X)` in pattern
+            // position is a CONSTANT pattern, not a type test:
+            // `sizeof(TChar) is sizeof(char)` compares two integers.
+            // Build the ordinary call node so the same `sizeof`/`typeof`
+            // lowering answers it, and the `is` lowering compares.
+            let callee = match &self.peek().kind {
+                TokenKind::Identifier(n) => n.clone(),
+                TokenKind::Keyword(k) => format!("{k:?}").to_lowercase(),
+                _ => "sizeof".to_owned(),
+            };
             self.bump(); // 'sizeof' / 'typeof' / 'nameof'
-            self.skip_balanced_bracket();
-            return Some(Expr::Ident {
-                name: "<pattern>".to_owned(),
+            self.bump(); // '('
+            let mut args: Vec<Expr> = Vec::new();
+            let mut depth = 1usize;
+            let mut current: Vec<TokenKind> = Vec::new();
+            while depth > 0 && self.peek().kind != TokenKind::Eof {
+                match self.peek().kind.clone() {
+                    TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => {
+                        depth += 1;
+                        current.push(self.peek().kind.clone());
+                        self.bump();
+                    }
+                    TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        current.push(self.peek().kind.clone());
+                        self.bump();
+                    }
+                    TokenKind::Comma if depth == 1 => {
+                        if let Some(e) = tokens_to_type_expr(&current) {
+                            args.push(e);
+                        }
+                        current.clear();
+                        self.bump();
+                    }
+                    _ => {
+                        current.push(self.peek().kind.clone());
+                        self.bump();
+                    }
+                }
+            }
+            if let Some(e) = tokens_to_type_expr(&current) {
+                args.push(e);
+            }
+            self.bump(); // ')'
+            return Some(Expr::Call {
+                callee,
+                args,
                 span: start.to(self.peek_at(0).span),
             });
         }
@@ -804,6 +1018,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_const: false,
                             is_byref: false,
                             type_name: String::from("var"),
                             name: binding,
@@ -899,30 +1114,215 @@ impl Parser {
         // `(...) x`, `[...] x`). A trailing binding identifier
         // declares a value in the enclosing scope (`is { } state`) —
         // expose it like type-pattern bindings below.
+        // Empty property pattern `{}`: "not null", with an optional
+        // designation (`x is {} info` binds `info` to `x`). It carries
+        // no members, so it is the null test and nothing else.
         if self.peek().kind == TokenKind::LeftBrace
-            || self.peek().kind == TokenKind::LeftParen
+            && self.peek_at(1).kind == TokenKind::RightBrace
+        {
+            self.bump(); // '{'
+            self.bump(); // '}'
+            if let Some((binding, span)) = self.take_pattern_binding() {
+                if binding != "_" {
+                    let init = match subject {
+                        Some(e) => e.clone(),
+                        None => Expr::Literal(Literal::Int(0)),
+                    };
+                    self.pre_pending.push(Stmt::Let {
+                        is_const: false,
+                        is_byref: false,
+                        type_name: "object".to_owned(),
+                        name: binding,
+                        init,
+                        access: Access::Default,
+                        span: start.to(span),
+                    });
+                }
+            }
+            return Some(Expr::Call {
+                callee: "__rubyc_nonnull".to_owned(),
+                args: Vec::new(),
+                span: start.to(self.peek_at(0).span),
+            });
+        }
+        // Property pattern `{ P: pattern, ... }`: "not null, and each
+        // member matches its pattern". Each member becomes an
+        // `__rubyc_prop` marker carrying the member name and the
+        // sub-pattern; the lowering has the subject value, reads the
+        // member and tests it. Members are ANDed.
+        if self.peek().kind == TokenKind::LeftBrace {
+            self.bump(); // '{'
+            let mut acc: Option<Expr> = None;
+            while self.peek().kind != TokenKind::RightBrace
+                && self.peek().kind != TokenKind::Eof
+            {
+                if self.eat(&TokenKind::Comma).is_some() {
+                    continue;
+                }
+                // A bare pattern (positional member) is not modelled.
+                if !matches!(self.peek().kind, TokenKind::Identifier(_)) {
+                    let mark = self.pos;
+                    let _ = self.parse_is_pattern_chain(subject);
+                    if self.pos == mark {
+                        self.bump();
+                    }
+                    continue;
+                }
+                let member = self.expect_identifier("as property name")?;
+                self.expect(&TokenKind::Colon, "after property name")?;
+                let sub = self.parse_is_pattern_chain(subject)?;
+                let span = start.to(self.peek_at(0).span);
+                let test = Expr::Call {
+                    callee: "__rubyc_prop".to_owned(),
+                    args: vec![
+                        Expr::Literal(Literal::Str(member)),
+                        sub,
+                    ],
+                    span,
+                };
+                acc = Some(match acc {
+                    None => test,
+                    Some(prev) => Expr::Binary {
+                        op: BinOp::And,
+                        lhs: Box::new(prev),
+                        rhs: Box::new(test),
+                        span,
+                    },
+                });
+            }
+            self.expect(&TokenKind::RightBrace, "to close property pattern")?;
+            // Optional designation: `is { P: 1 } x`.
+            if let Some((binding, bspan)) = self.take_pattern_binding() {
+                if binding != "_" {
+                    let init = match subject {
+                        Some(e) => e.clone(),
+                        None => Expr::Literal(Literal::Int(0)),
+                    };
+                    self.pre_pending.push(Stmt::Let {
+                        is_const: false,
+                        is_byref: false,
+                        type_name: "object".to_owned(),
+                        name: binding,
+                        init,
+                        access: Access::Default,
+                        span: start.to(bspan),
+                    });
+                }
+            }
+            return acc.or_else(|| {
+                Some(Expr::Call {
+                    callee: "__rubyc_nonnull".to_owned(),
+                    args: Vec::new(),
+                    span: start.to(self.peek_at(0).span),
+                })
+            });
+        }
+        // Tuple pattern `(p1, p2, ...)`: each element is tested against
+        // the corresponding slot of the tuple value (tuples lower as
+        // arrays). A parenthesised SINGLE pattern is grouping, not a
+        // tuple, and is handled by the paren branch above.
+        if self.peek().kind == TokenKind::LeftParen && self.paren_holds_comma() {
+            self.bump(); // '('
+            let mut elems: Vec<Expr> = Vec::new();
+            loop {
+                if self.peek().kind == TokenKind::RightParen
+                    || self.peek().kind == TokenKind::Eof
+                {
+                    break;
+                }
+                if self.eat(&TokenKind::Comma).is_some() {
+                    continue;
+                }
+                match self.parse_is_pattern_chain(subject) {
+                    Some(p) => elems.push(p),
+                    None => {
+                        if self.peek().kind != TokenKind::RightParen
+                            && self.peek().kind != TokenKind::Eof
+                        {
+                            self.bump();
+                        }
+                    }
+                }
+            }
+            self.expect(&TokenKind::RightParen, "to close tuple pattern")?;
+            // Optional designation after the tuple: `(a, b) x`.
+            if let Some((binding, bspan)) = self.take_pattern_binding() {
+                if binding != "_" {
+                    let init = match subject {
+                        Some(e) => e.clone(),
+                        None => Expr::Literal(Literal::Int(0)),
+                    };
+                    self.pre_pending.push(Stmt::Let {
+                        is_const: false,
+                        is_byref: false,
+                        type_name: "object".to_owned(),
+                        name: binding,
+                        init,
+                        access: Access::Default,
+                        span: start.to(bspan),
+                    });
+                }
+            }
+            return Some(Expr::Call {
+                callee: "__rubyc_tuple".to_owned(),
+                args: elems,
+                span: start.to(self.peek_at(0).span),
+            });
+        }
+        // List pattern `[p0, p1, ..]`: length test plus element tests.
+        // A `..` slice marker means "the rest" (length >= fixed count).
+        if self.peek().kind == TokenKind::LeftBracket {
+            self.bump(); // '['
+            let mut elems: Vec<Expr> = Vec::new();
+            let mut has_rest = false;
+            loop {
+                if self.peek().kind == TokenKind::RightBracket
+                    || self.peek().kind == TokenKind::Eof
+                {
+                    break;
+                }
+                if self.eat(&TokenKind::Comma).is_some() {
+                    continue;
+                }
+                if self.peek().kind == TokenKind::DotDot {
+                    self.bump();
+                    has_rest = true;
+                    continue;
+                }
+                match self.parse_is_pattern_chain(subject) {
+                    Some(p) => elems.push(p),
+                    None => {
+                        if self.peek().kind != TokenKind::RightBracket
+                            && self.peek().kind != TokenKind::Eof
+                        {
+                            self.bump();
+                        }
+                    }
+                }
+            }
+            self.expect(&TokenKind::RightBracket, "to close list pattern")?;
+            let mut args: Vec<Expr> = Vec::new();
+            args.push(Expr::Literal(Literal::Bool(has_rest)));
+            args.extend(elems);
+            return Some(Expr::Call {
+                callee: "__rubyc_list".to_owned(),
+                args,
+                span: start.to(self.peek_at(0).span),
+            });
+        }
+        // Positional patterns are still not modelled.
+        if self.peek().kind == TokenKind::LeftParen
             || self.peek().kind == TokenKind::LeftBracket
         {
             let open = self.pos;
             self.skip_balanced_bracket();
-            // Designations nested in the pattern (`{ P: Type x }`,
-            // `(int x, string y)`) bind in the enclosing scope too —
-            // without them the uses fail downstream (`E0025`).
             self.queue_inner_designations(open);
-            // A trailing binding identifier declares a value in the
-            // enclosing scope — it may be a contextual keyword
-            // (`is (...) record`).
-            if let Some((binding, span)) = self.take_pattern_binding() {
-                self.pre_pending.push(Stmt::Let {
-                    is_byref: false,
-                    type_name: String::from("var"),
-                    name: binding,
-                    init: Expr::Literal(Literal::Int(0)),
-                    access: Access::Default,
-                    span: start.to(span),
-                });
-            }
-            return Some(Expr::Literal(Literal::Int(0)));
+            self.take_pattern_binding();
+            return Some(self.report_unsupported_pattern(
+                start,
+                "positional and list patterns",
+                "are",
+            ));
         }
         // Type pattern: `Type`, `Type var` — an identifier followed by an
         // optional binding identifier. Also handles `Type { ... }` (property
@@ -930,11 +1330,84 @@ impl Parser {
         // plus array-suffixed types (`T[] x`, `T[,] x`), plus dotted
         // constant paths (`State.None`, `A.B.C` in `or` chains).
         if matches!(self.peek().kind, TokenKind::Identifier(_)) {
+            // A CONSTANT pattern may be a full constant EXPRESSION
+            // (`VarEnum.A | VarEnum.B`): the dotted path below returns a
+            // member expression, which cannot continue through `|`. Keep
+            // the entry position so a binary operator after a path falls
+            // back to the ordinary expression parser.
+            let expr_entry = self.pos;
             let type_name = self.expect_identifier("as type")?.to_string();
             // Generic arguments: `IList<string?>`, `Dictionary<K,V>`.
             // Consumed (not recorded) to match the compact type model;
-            // without this the `<` misparses as less-than.
+            // without this the `<` misparses as less-than. Only when a
+            // matching `>` closes them, though: `a < b => ...` in a
+            // switch arm is a COMPARISON pattern, and treating its `<`
+            // as generics consumed the rest of the arm.
             if matches!(self.peek().kind, TokenKind::Less | TokenKind::Shl) {
+                let mut depth = 0i32;
+                let mut k = 0usize;
+                let mut closed = false;
+                let mut ok = true;
+                loop {
+                    match self.peek_at(k).kind {
+                        TokenKind::Less | TokenKind::Shl => {
+                            depth += 1;
+                            k += 1;
+                        }
+                        // `>>` closes TWO nested argument lists
+                        // (`ICollection<KeyValuePair<K,V>>`): the
+                        // lexer emits one Shr token, and counting it as
+                        // a single close left the scan unbalanced and
+                        // derailed the arm.
+                        TokenKind::Greater => {
+                            depth -= 1;
+                            k += 1;
+                            if depth <= 0 {
+                                closed = true;
+                                break;
+                            }
+                        }
+                        TokenKind::Shr => {
+                            depth -= 2;
+                            k += 1;
+                            if depth <= 0 {
+                                closed = true;
+                                break;
+                            }
+                        }
+                        TokenKind::ShrShr => {
+                            depth -= 3;
+                            k += 1;
+                            if depth <= 0 {
+                                closed = true;
+                                break;
+                            }
+                        }
+                        TokenKind::FatArrow
+                        | TokenKind::Comma
+                        | TokenKind::Semicolon
+                        | TokenKind::Eof
+                        | TokenKind::RightParen
+                        | TokenKind::RightBrace
+                        | TokenKind::RightBracket
+                            if depth == 0 =>
+                        {
+                            ok = false;
+                            break;
+                        }
+                        _ => k += 1,
+                    }
+                    if k > 64 {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !closed || !ok {
+                    // A binary `<`: the whole label is a constant
+                    // expression.
+                    self.pos = expr_entry;
+                    return self.expression();
+                }
                 self.skip_generic_parameter_list();
             }
             // Nullable suffix on the pattern type itself: `string? x`.
@@ -978,17 +1451,71 @@ impl Parser {
                 if self.peek().kind == TokenKind::Question && self.question_is_nullable() {
                     self.bump();
                 }
-                if matches!(self.peek().kind, TokenKind::Identifier(_)) || matches!(self.peek().kind, TokenKind::Keyword(_)) {
+                // `is State.None` is a CONSTANT pattern and keeps its
+                // expression form; `is Ns.T x` binds a variable, which
+                // makes it a type test.
+                // A connective (`or`, `and`, `is`, `not`, `when`) is
+                // NOT a binding: `is A.B or C.D` is two constant
+                // patterns, and treating `or` as a designation reported
+                // the first one as an unsupported type pattern.
+                let bound = matches!(self.peek().kind, TokenKind::Identifier(_))
+                    || matches!(
+                        self.peek().kind,
+                        TokenKind::Keyword(k)
+                            if !matches!(
+                                k,
+                                Keyword::And_
+                                    | Keyword::Or_
+                                    | Keyword::Is_
+                                    | Keyword::Not_
+                                    | Keyword::When_
+                            )
+                    );
+                if bound {
+                    // `x is Ns.Type v` — a QUALIFIED TYPE with a
+                    // designation. The binding receives the subject, so
+                    // the test is the type name itself.
                     if let Some((binding, span)) = self.take_pattern_binding() {
-                        self.pre_pending.push(Stmt::Let {
-                            is_byref: false,
-                            type_name: full,
-                            name: binding,
-                            init: Expr::Literal(Literal::Int(0)),
-                            access: Access::Default,
-                            span: start.to(span),
-                        });
+                        if binding != "_" {
+                            let init = match subject {
+                                Some(e) => e.clone(),
+                                None => Expr::Literal(Literal::Int(0)),
+                            };
+                            self.pre_pending.push(Stmt::Let {
+                                is_const: false,
+                                is_byref: false,
+                                type_name: full.clone(),
+                                name: binding,
+                                init,
+                                access: Access::Default,
+                                span: start.to(span),
+                            });
+                        }
                     }
+                    return Some(Expr::Ident {
+                        name: full,
+                        span: start.to(self.peek_at(0).span),
+                    });
+                }
+                if matches!(
+                    self.peek().kind,
+                    TokenKind::Pipe
+                        | TokenKind::Amp
+                        | TokenKind::Plus
+                        | TokenKind::Minus
+                        | TokenKind::Star
+                        | TokenKind::Slash
+                        | TokenKind::Percent
+                        | TokenKind::Caret
+                        | TokenKind::Shl
+                        | TokenKind::Shr
+                        | TokenKind::PlusAssign
+                        | TokenKind::Question
+                ) {
+                    // `A | B`, `A & B`, `A + 1` — a constant expression
+                    // whose left side happens to be a dotted path.
+                    self.pos = expr_entry;
+                    return self.expression();
                 }
                 return Some(p);
             }
@@ -1021,22 +1548,71 @@ impl Parser {
                 self.queue_inner_designations(open);
             }
             // A trailing binding identifier declares the pattern value in
-            // the enclosing scope; expose it to the semantic scan as a
-            // zero-init `Let` (drained by `block`). The type is the
-            // pattern's type name so that member access on the binding
-            // var resolves. The binding may be a contextual keyword
-            // (`is T record`).
-            if let Some((binding, span)) = self.take_pattern_binding() {
-                self.pre_pending.push(Stmt::Let {
-                    is_byref: false,
-                    type_name: type_name.clone(),
-                    name: binding,
-                    init: Expr::Literal(Literal::Int(0)),
-                    access: Access::Default,
-                    span: start.to(span),
+            // the enclosing scope. That needs capture-on-match, which is
+            // not modelled, so it is still reported.
+            let had_binding =
+                matches!(self.peek().kind, TokenKind::Identifier(_))
+                    || (matches!(self.peek().kind, TokenKind::Keyword(_))
+                        && self.peek_is_name(0));
+            if had_binding {
+                // `x is T v` — the binding receives the value being
+                // tested. The initializer is the SUBJECT, which the
+                // caller has (this function is called from the `is`
+                // operator, where the left side is in hand); it used to
+                // be a zero placeholder, so `v` was always 0.
+                let init = match subject {
+                    Some(e) => e.clone(),
+                    None => Expr::Literal(Literal::Int(0)),
+                };
+                if let Some((binding, span)) = self.take_pattern_binding() {
+                    if binding != "_" {
+                        self.pre_pending.push(
+                            crate::models::Stmt::Let {
+                                is_const: false,
+                                is_byref: false,
+                                type_name: type_name.clone(),
+                                name: binding,
+                                init,
+                                access: crate::models::Access::Default,
+                                span: start.to(span),
+                            },
+                        );
+                    }
+                }
+                return Some(Expr::Ident {
+                    name: type_name,
+                    span: expr_span_last(&self.tokens[..self.pos]),
                 });
             }
-            return Some(Expr::Literal(Literal::Int(0)));
+            // A binary operator here means a CONSTANT EXPRESSION
+            // pattern (`A >> B`, `X + 1`), not a type: rewind so the
+            // expression parser takes the whole label. (A `,`/`=>`/`)`
+            // ends the label and never reaches this check.)
+            if matches!(
+                self.peek().kind,
+                TokenKind::Shl
+                    | TokenKind::Shr
+                    | TokenKind::ShrShr
+                    | TokenKind::Plus
+                    | TokenKind::Minus
+                    | TokenKind::Star
+                    | TokenKind::Slash
+                    | TokenKind::Percent
+                    | TokenKind::Amp
+                    | TokenKind::Pipe
+                    | TokenKind::Caret
+            ) {
+                self.pos = expr_entry;
+                return self.expression();
+            }
+            // A BARE type test (`x is T`) has a real lowering now: the
+            // receiver's vtable row is compared against T's row and every
+            // deriving class's. Checked before the property-pattern skip
+            // above so `{}` still takes the pattern path.
+            return Some(Expr::Ident {
+                name: type_name,
+                span: expr_span_last(&self.tokens[..self.pos]),
+            })
         }
         // Fallback: a constant pattern (`null`, `5`, `"x"`,
         // `SomeEnum.Value`, `-1`). Parsed at unary level — NEVER a
@@ -1217,4 +1793,39 @@ pub(in crate::parser::rd) fn read_unicode_escape(bytes: &[u8], from: usize) -> O
         return None;
     }
     Some((char::from_u32(value)?, k))
+}
+
+
+/// Turn the tokens of a `sizeof(...)`/`typeof(...)`/`nameof(...)`
+/// argument into a type expression. The compiler's `sizeof` lowering
+/// reads an `Ident` naming the type, so a dotted or generic spelling is
+/// joined back together here.
+fn tokens_to_type_expr(parts: &[TokenKind]) -> Option<Expr> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for t in parts {
+        match t {
+            TokenKind::Identifier(n) => out.push_str(n),
+            TokenKind::Keyword(k) => out.push_str(&format!("{k:?}").to_lowercase()),
+            TokenKind::Dot => out.push('.'),
+            TokenKind::Less | TokenKind::Shl => out.push('<'),
+            TokenKind::Greater => out.push('>'),
+            TokenKind::Shr => out.push_str(">>"),
+            TokenKind::Comma => out.push(','),
+            TokenKind::Star => out.push('*'),
+            TokenKind::Question => out.push('?'),
+            TokenKind::LeftBracket => out.push('['),
+            TokenKind::RightBracket => out.push(']'),
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(Expr::Ident {
+        name: out,
+        span: Span::default(),
+    })
 }

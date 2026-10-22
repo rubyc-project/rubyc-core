@@ -73,6 +73,15 @@ pub struct PropertyDecl {
     /// `CanRead`/`CanWrite` pushed MemoryStream's `_buffer` out of
     /// reach and faulted `WriteByte`).
     pub is_abstract: bool,
+    /// `override` modifier: this declaration overrides a virtual base
+    /// member. Only an override takes part in virtual dispatch; a
+    /// declaration that merely repeats the name HIDES the base member,
+    /// and the base's implementation serves a base-typed receiver.
+    pub is_override: bool,
+    /// `virtual` modifier: the member may be overridden.
+    pub is_virtual: bool,
+    /// `new` modifier: the declaration hides a base member.
+    pub is_hiding: bool,
     pub span: Span,
 }
 
@@ -134,6 +143,11 @@ pub struct ClassDecl {
     /// their implicit parameterless constructor even with explicit
     /// ctors; classes do not. Parsed uniformly as classes otherwise.
     pub is_struct: bool,
+    /// `record` declaration. A record is a class with VALUE semantics:
+    /// `==` compares by value, not by reference. The keyword used to be
+    /// discarded here, so nothing downstream could tell a record from a
+    /// plain class and `new R(1) == new R(1)` was false.
+    pub is_record: bool,
     /// Cross-assembly union provenance (set by the driver's dep-member
     /// union, never by the parser): this declaration absorbed members
     /// from another assembly's same-path class. Same-assembly partial

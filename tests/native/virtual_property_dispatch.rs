@@ -827,3 +827,71 @@ fn object_initializer_writes_run_after_construction() {
         f.blocks.iter().flat_map(|b| b.instrs.iter()).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn self_referential_property_read_is_reported() {
+    // `int P => P` has no terminating inline: lowering used to break
+    // the cycle by answering 0, so the read ran like a property that
+    // legitimately held zero. It must be a diagnostic instead
+    //.
+    let r = crate::native::ir::lower_with(
+        &crate::parser::parse(
+            r#"namespace t;
+class C {
+    public int P { get { return P; } set { } }
+    public int Read() { return P; }
+    int main() { return Read(); }
+}"#,
+        )
+        .unwrap(),
+        false,
+    );
+    let err = r.expect_err("a self-referential property read must not answer 0");
+    assert!(
+        err.to_string().contains("cycles"),
+        "expected the cycle diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn property_read_without_a_getter_body_is_reported() {
+    // An accessor with no modelled body has no value to read. The
+    // const-0 answer was indistinguishable from a property holding
+    // default(T).
+    let r = crate::native::ir::lower_with(
+        &crate::parser::parse(
+            r#"namespace t;
+abstract class Shape {
+    public abstract int Sides { get; set; }
+}
+class C {
+    public int Read(Shape s) { return s.Sides; }
+    int main() { return 0; }
+}"#,
+        )
+        .unwrap(),
+        false,
+    );
+    let err = r.expect_err("a property with no getter body must not answer 0");
+    assert!(
+        err.to_string().contains("no getter body"),
+        "expected the no-body diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn object_initializer_member_writes_still_run() {
+    // `Key = Value` initializers ARE implemented (they become member
+    // writes after construction) — that pass removed only the shapes whose
+    // elements were being dropped, and this is the guard that they were
+    // not collateral damage.
+    let p = lower(INIT_SRC);
+    let f = find_fn(&p, "Make");
+    let stores = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.instrs.iter())
+        .filter(|i| matches!(i, Instr::StoreField { .. }))
+        .count();
+    assert!(stores >= 2, "member writes still emitted: {stores}");
+}

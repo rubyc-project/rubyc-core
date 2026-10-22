@@ -6,11 +6,19 @@
 //! Locals declared with `let` become visible AFTER their initializer
 //! (C# definite-assignment style).
 
-use crate::models::{ClassMember, CompilationUnit, Diagnostic, Expr, Member, Severity, Span, Stmt};
+use crate::models::{
+    ClassMember, CompilationUnit, Diagnostic, Expr, Member, ScopeContext, Severity, Span, Stmt,
+};
 use crate::utilities::suggest::did_you_mean;
 
 /// Names callable without a receiver, everywhere.
 const BUILTINS: &[&str] = &["printf", "print", "put_str", "eprintf", "scan_int", "null", "sizeof", "typeof",
+    // Parser markers for pattern shapes the `is` lowering expands; they
+    // are never real calls.
+    "__rubyc_nonnull",
+    "__rubyc_prop",
+    "__rubyc_tuple",
+    "__rubyc_list",
     // Undocumented TypedReference keywords (`__reftype(tr)` takes a
     // value, like `typeof` takes a type): always resolvable.
     "__reftype", "__makeref", "__refvalue",
@@ -18,14 +26,7 @@ const BUILTINS: &[&str] = &["printf", "print", "put_str", "eprintf", "scan_int",
     // always resolvable, mirroring `this`.
     "field",
     "Keyword(Checked)", "Keyword(Unchecked)", "base", "this",
-    // Placeholder the parser emits for lambda expressions (whose bodies
-    // are skipped, not modeled): it is a value by construction, never an
-    // unresolved name.
-    "lambda",
-    // Placeholder the parser emits for `sizeof(T)` / `typeof(T)` /
-    // `nameof(X)` in pattern position (skipped as one constant-ish
-    // pattern): a value by construction, never an unresolved name.
-    "<pattern>"];
+];
 
 /// Primitive type names usable as value references (`int.MaxValue`,
 /// `typeof(int)`, `sizeof(double)`, etc.). These are identifiers, not
@@ -213,6 +214,61 @@ pub fn scan_with_fragments(
         any_member.extend(info.methods.iter().cloned());
     }
 
+    // A bare name two types declare is resolved by scope, then by
+    // declaration order — a guess the user cannot see. C# rejects such
+    // a reference outright (CS0104). The choice is still made (so
+    // qualified spellings and single-name code keep building), but each
+    // ambiguous name is now reported with the entries it could mean.
+    {
+        let mut by_name: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        {
+            let mut collect = |members: &[Member], ns: &str| {
+                for m in members {
+                    let Member::Class(c) = m else { continue };
+                    let path = if ns.is_empty() {
+                        c.name.clone()
+                    } else {
+                        format!("{ns}.{}", c.name)
+                    };
+                    by_name.entry(c.name.clone()).or_default().push(path.clone());
+                    for nested in &c.members {
+                        if let ClassMember::Nested(n) = nested {
+                            by_name
+                                .entry(n.name().to_string())
+                                .or_default()
+                                .push(format!("{path}.{}", n.name()));
+                        }
+                    }
+                }
+            };
+            // Declaration sites, NOT `all_members()`: that flattens
+            // namespaced types to the top level, so each one would be
+            // counted twice and every class would look ambiguous.
+            collect(&unit.members, "");
+            for ns in &unit.namespaces {
+                collect(&ns.members, &ns.name);
+            }
+        }
+        for (name, mut paths) in by_name {
+            paths.sort();
+            paths.dedup();
+            if paths.len() < 2 {
+                continue;
+            }
+            diags.push(
+                Diagnostic::new(
+                    "W0005",
+                    Severity::Warning,
+                    format!(
+                        "'{name}' is declared more than once ({}) — an unqualified reference to it is resolved by scope, then by declaration order",
+                        paths.join(", ")
+                    ),
+                )
+                .in_context(ScopeContext::default()),
+            );
+        }
+    }
+
     // Every named type declared in the unit (class/enum/interface/delegate)
     // is a valid value reference (static access, enum members, delegates).
     let mut type_names: Vec<&str> = classes.iter().map(|(n, _)| n.as_str()).collect();
@@ -280,6 +336,7 @@ pub fn scan_with_fragments(
                 .map(|(_, i)| i.clone())
                 .unwrap_or_else(|| empty.clone());
             let mut scope = Scope {
+                context: String::new(),
                 names: {
                     let mut v = vec!["this".to_owned()];
                     v.extend(own.fields.iter().cloned());
@@ -293,6 +350,7 @@ pub fn scan_with_fragments(
             let eff_fields = effective(&class.name, &classes, &class_bases, 0);
             let eff_methods = effective(&class.name, &classes, &class_bases, 1);
             let mut scope = Scope {
+                context: String::new(),
                 names: {
                     let mut v = vec!["this".to_owned()];
                     v.extend(eff_fields.iter().cloned());
@@ -345,6 +403,7 @@ pub fn scan_with_fragments(
                     && let Some(body) = &m.body
                 {
                     let mut method_scope = scope.clone();
+                    method_scope.context = format!("{}.{}", class.name, m.name);
                     // The method's own generic type parameters
                     // (`TResult M<TDecimal>(...)`).
                     for tp in &m.generic_params {
@@ -353,7 +412,10 @@ pub fn scan_with_fragments(
                     for p in &m.params {
                         method_scope.declare(&p.name);
                     }
-                    let member_guard = MemberGuard { any: &any_member };
+                    let member_guard = MemberGuard {
+                        any: &any_member,
+                        own: &eff_methods,
+                    };
                     walk_block(body, &method_scope, &candidates, &mut diags, &member_guard);
                 }
             }
@@ -365,6 +427,8 @@ pub fn scan_with_fragments(
 #[derive(Clone)]
 struct Scope {
     names: Vec<String>,
+    /// Enclosing `Class.Method`, for diagnostics only.
+    context: String,
 }
 
 impl Scope {
@@ -427,12 +491,24 @@ fn effective(
 }
 
 struct MemberGuard<'a> {
+    /// Every field/method declared anywhere in the unit.
     any: &'a [String],
+    /// Effective methods of the class whose bodies are being walked
+    /// (own + inherited). `this.M()` is checked against this set.
+    own: &'a [String],
 }
 
 impl MemberGuard<'_> {
     fn known(&self, n: &str) -> bool {
         self.any.iter().any(|x| x == n)
+    }
+
+    /// Whether `name` is a method of the enclosing class. Bare
+    /// `M(...)` inside a body is handled by the scope check (the
+    /// enclosing class's members are in scope); only the `this.`
+    /// form needs the member set.
+    fn own_has_method(&self, n: &str) -> bool {
+        self.own.iter().any(|x| x == n)
     }
 }
 
@@ -445,6 +521,30 @@ fn walk_expr(
     guard: &MemberGuard,
 ) {
     match expr {
+        Expr::NamedArg { value, .. } => walk_expr(value, scope, candidates, out, guard),
+        // `checked(x)` runs `x` in the same scope with the same names.
+        Expr::Checked { inner, .. } => walk_expr(inner, scope, candidates, out, guard),
+        Expr::Lambda { params, body, .. } => {
+            // A lambda body is code that runs later, but it IS code: walk
+            // it so `arg => OnX(arg)` resolves `arg` and reports a real
+            // unknown name instead of hiding one behind the closure. The
+            // parameters are declared first — without them the body's own
+            // `x` reads as an unknown name.
+            let mut inner = scope.clone();
+            for p in params {
+                inner.declare(p);
+            }
+            match body {
+                crate::models::ast::expression::LambdaBody::Expr(e) => {
+                    walk_expr(e, &inner, candidates, out, guard)
+                }
+                crate::models::ast::expression::LambdaBody::Block(b) => {
+                    for st in &b.stmts {
+                        walk_stmt(st, &mut inner, candidates, out, guard);
+                    }
+                }
+            }
+        }
         Expr::NewArray { size, .. } => walk_expr(size, scope, candidates, out, guard),
         Expr::Index { object, index, .. } => {
             walk_expr(object, scope, candidates, out, guard);
@@ -453,6 +553,9 @@ fn walk_expr(
         Expr::Ident { name, span } => {
             if !scope.has(name) && !is_known_name(name) {
                 let mut d = unknown_name(name, *span);
+                if !scope.context.is_empty() {
+                    d.message = format!("{} [in {}]", d.message, scope.context);
+                }
                 if let Some(hint) = did_you_mean(name, candidates) {
                     d.help = Some(hint);
                 }
@@ -476,7 +579,14 @@ fn walk_expr(
                 let mut d = Diagnostic::new(
                     "E0026",
                     Severity::Error,
-                    format!("unknown function '{callee}'"),
+                    format!(
+                        "unknown function '{callee}'{}",
+                        if scope.context.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [in {}]", scope.context)
+                        }
+                    ),
                 )
                 .at(*span);
                 if let Some(hint) = did_you_mean(callee, candidates) {
@@ -488,9 +598,15 @@ fn walk_expr(
                 walk_expr(a, scope, candidates, out, guard);
             }
         }
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { op, lhs, rhs, .. } => {
             walk_expr(lhs, scope, candidates, out, guard);
-            walk_expr(rhs, scope, candidates, out, guard);
+            // The right side of `is` is a PATTERN, not a name: a type
+            // (`is Ns.Type v`) or a constant (`is State.None`) is
+            // resolved by the lowering, so the value-name scan must not
+            // report it as an unknown variable.
+            if !matches!(op, crate::models::BinOp::Is) {
+                walk_expr(rhs, scope, candidates, out, guard);
+            }
         }
         Expr::Unary { inner, .. } => walk_expr(inner, scope, candidates, out, guard),
         Expr::Ternary {
@@ -515,23 +631,30 @@ fn walk_expr(
             span,
         } => {
             walk_expr(object, scope, candidates, out, guard);
-            // Receiver-typed resolution needs the type table; flag only
-            // when the receiver is literally `this` (name resolvable here)
-            // and nothing in the unit declares it.
+            // A `this.M()` call resolves against the enclosing class:
+            // its effective method set (own + inherited) is the
+            // contract, so anything outside it is a real typo.
+            // Interface members count too (an unimplemented member is
+            // the implementation's error, not the caller's).
+            //
+            // Unit-wide names count too: `this.M()` may target an
+            // EXTENSION method declared on another type (legal C#), and
+            // a base the scan has no ClassInfo for (`object`) still
+            // contributes its methods. Same philosophy as bare calls:
+            // only names absent from the entire unit are typos.
             if matches!(object.as_ref(), Expr::Ident { name: n, .. } if n == "this")
                 && !is_known_callee(bare_callee(name))
+                && !guard.own_has_method(bare_callee(name))
+                && !guard.known(bare_callee(name))
             {
-                let known = unit_has_method(expr, bare_callee(name));
-                if !known {
-                    out.push(
-                        Diagnostic::new(
-                            "E0026",
-                            Severity::Error,
-                            format!("unknown function '{name}'"),
-                        )
-                        .at(*span),
-                    );
-                }
+                out.push(
+                    Diagnostic::new(
+                        "E0026",
+                        Severity::Error,
+                        format!("unknown function '{name}'"),
+                    )
+                    .at(*span),
+                );
             }
             for a in args {
                 walk_expr(a, scope, candidates, out, guard);
@@ -582,12 +705,7 @@ fn walk_expr(
     }
 }
 
-/// Placeholder hook: `this.method()` resolution needs the class member set.
-/// Kept permissive (returns true) to avoid false positives until the
-/// scanner carries the declaring class through.
-fn unit_has_method(_expr: &Expr, _name: &str) -> bool {
-    true
-}
+
 
 /// True when any segment of a member-access chain resolves in scope:
 /// `System.Array.Copy` (via `Array`), `this.x` (via `this`),

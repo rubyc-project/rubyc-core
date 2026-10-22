@@ -159,6 +159,29 @@ impl ScopeStack {
         }
     }
 
+    /// Re-bind an existing local as a BY-REFERENCE local.
+    ///
+    /// Used when its address is taken (`&x`): the local stops holding a
+    /// value copy and starts holding the ADDRESS of a cell, which makes
+    /// a write through that pointer visible to later reads of `x` —
+    /// the aliasing C# requires. Reads dereference and writes store
+    /// through, both already implemented for `ref`/`out` parameters.
+    ///
+    /// Returns the slot so the caller can replace the binding with the
+    /// cell address, or `None` when no such local is in scope.
+    pub fn make_byref(&mut self, name: &str) -> Option<usize> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(sym) = scope.symbols.iter_mut().find(|x| x.name == name) {
+                if sym.is_byref {
+                    return Some(sym.slot);
+                }
+                sym.is_byref = true;
+                return Some(sym.slot);
+            }
+        }
+        None
+    }
+
     /// Total slots used — drives the native frame size.
     pub fn slot_count(&self) -> usize {
         self.next_slot

@@ -23,8 +23,12 @@ fn sample_unit(span_start: u32) -> CompilationUnit {
                 bases: vec![],
                  members: vec![ClassMember::Method(MethodDecl {
                      generic_params: vec![],
+                     constraints: Vec::new(),
                      is_override: false,
-                     is_static: false,
+                    is_virtual: false,
+                    is_sealed: false,
+                    is_hiding: false,
+                    is_static: false,
                      is_abstract: false,
                      is_partial: false,
                      is_async: false,
@@ -47,7 +51,7 @@ fn sample_unit(span_start: u32) -> CompilationUnit {
                 })],
                 span: sp(20),
                 is_partial: false,
-                is_struct: false,
+                is_struct: false, is_record: false,
                 union_cross_assembly: false,
             })],
             span: sp(10),
@@ -214,6 +218,7 @@ mod structural_eq {
             init,
             access: Access::Default,
             is_byref: false,
+            is_const: false,
             span: Span::default(),
         }
     }
@@ -221,7 +226,11 @@ mod structural_eq {
     fn method(name: &str) -> MethodDecl {
         MethodDecl {
             generic_params: vec![],
+            constraints: Vec::new(),
             is_override: false,
+            is_virtual: false,
+            is_sealed: false,
+            is_hiding: false,
             is_static: false,
             is_abstract: false,
             is_partial: false,
@@ -250,7 +259,7 @@ mod structural_eq {
             members: vec![ClassMember::Method(method("main"))],
             span: Span::default(),
             is_partial: false,
-            is_struct: false,
+            is_struct: false, is_record: false,
             union_cross_assembly: false,
         }
     }
@@ -403,6 +412,7 @@ mod structural_eq {
             init: expr_int(1),
             access: Access::Default,
             is_byref: false,
+            is_const: false,
             span: Span::default(),
         };
         assert!(!a.structural_eq(&c));
@@ -466,6 +476,7 @@ mod structural_eq {
             default_value: None,
             is_this: false,
             is_params: false,
+            attrs: Vec::new(),
             is_byref: false,
         };
         assert!(p == p.clone());

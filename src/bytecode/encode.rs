@@ -125,6 +125,10 @@ impl Writer {
                 for b in &iface.bases {
                     self.string(b);
                 }
+                self.u32(iface.indexers.len());
+                for idx in &iface.indexers {
+                    self.indexer_decl(idx);
+                }
                 self.u32(iface.methods.len());
                 for sig in &iface.methods {
                     let access_byte = match sig.access {
@@ -239,6 +243,15 @@ impl Writer {
                     if prop.is_abstract {
                         flags |= 0b1000;
                     }
+                    if prop.is_override {
+                        flags |= 0b1_0000;
+                    }
+                    if prop.is_virtual {
+                        flags |= 0b10_0000;
+                    }
+                    if prop.is_hiding {
+                        flags |= 0b100_0000;
+                    }
                     self.byte(flags);
                     self.attrs(&prop.attrs);
                     self.string(&prop.type_name);
@@ -268,43 +281,7 @@ impl Writer {
                 }
                 ClassMember::Indexer(idx) => {
                     self.byte(format::tag::INDEXER);
-                    let access_byte = match idx.access {
-                        crate::models::Access::Public => 1,
-                        crate::models::Access::Private => 2,
-                        crate::models::Access::Protected => 3,
-                        crate::models::Access::Internal => 4,
-                        _ => 0,
-                    };
-                    self.byte(access_byte);
-                    self.byte(if idx.is_settable { 1 } else { 0 });
-                    self.attrs(&idx.attrs);
-                    self.string(&idx.type_name);
-                    self.u32(idx.params.len());
-                    for param in &idx.params {
-                        self.param(param);
-                    }
-                    self.expr(&idx.init);
-                    match &idx.get {
-                        Some(block) => {
-                            self.byte(format::tag::PRESENT);
-                            self.block(block);
-                        }
-                        None => self.byte(format::tag::ABSENT),
-                    }
-                    match &idx.set {
-                        Some(block) => {
-                            self.byte(format::tag::PRESENT);
-                            self.block(block);
-                        }
-                        None => self.byte(format::tag::ABSENT),
-                    }
-                    match &idx.get_expr {
-                        Some(expr) => {
-                            self.byte(format::tag::PRESENT);
-                            self.expr(expr);
-                        }
-                        None => self.byte(format::tag::ABSENT),
-                    }
+                    self.indexer_decl(idx);
                 }
                 ClassMember::Event(evt) => {
                     self.byte(format::tag::EVENT);
@@ -434,6 +411,8 @@ impl Writer {
         } else {
             format::tag::ABSENT
         });
+        // Parameter attributes (`[UnsafeAccessorType("...")]`).
+        self.attrs(&param.attrs);
         // By-reference marker (`ref`/`out`/`in`): load-bearing for
         // lowering (callers box, callees dereference), unlike
         // `is_params` which the v1 contract drops.
@@ -480,12 +459,29 @@ impl Writer {
                 self.string(name);
                 self.expr(value);
             }
+            // The parser rewrites using declarations into a Let plus a
+            // try/finally before any backend sees them; encoding the
+            // declaration shape as its Let keeps the encoder total.
+            Stmt::UsingDecl {
+                type_name,
+                name,
+                init,
+                ..
+            } => {
+                self.byte(format::tag::LET);
+                self.string(type_name);
+                self.string(name);
+                self.byte(crate::models::Access::Default as u8);
+                self.byte(format::tag::ABSENT);
+                self.expr(init);
+            }
             Stmt::Let {
                 type_name,
                 name,
                 init,
                 access,
                 is_byref,
+                is_const,
                 ..
             } => {
                 self.byte(format::tag::LET);
@@ -493,6 +489,11 @@ impl Writer {
                 self.string(name);
                 self.byte(*access as u8);
                 self.byte(if *is_byref {
+                    format::tag::PRESENT
+                } else {
+                    format::tag::ABSENT
+                });
+                self.byte(if *is_const {
                     format::tag::PRESENT
                 } else {
                     format::tag::ABSENT
@@ -519,6 +520,10 @@ impl Writer {
             Stmt::While { cond, body, .. } => {
                 self.byte(format::tag::stmt::WHILE);
                 self.expr(cond);
+                self.block(body);
+            }
+            Stmt::CheckedBlock { body, .. } => {
+                self.byte(format::tag::stmt::CHECKED_BLOCK);
                 self.block(body);
             }
             Stmt::Block { body, .. } => {
@@ -680,6 +685,8 @@ impl Writer {
                 ret_type,
                 body,
                 is_static,
+                is_extern,
+                attrs,
                 ..
             } => {
                 self.byte(format::tag::stmt::LOCAL_FUNCTION);
@@ -691,7 +698,51 @@ impl Writer {
                 self.string(ret_type);
                 self.block(body);
                 self.byte(if *is_static { 1 } else { 0 });
+                self.byte(if *is_extern { 1 } else { 0 });
+                self.attrs(attrs);
             }
+        }
+    }
+
+    /// One indexer declaration (shared by class members and an
+    /// interface's own indexers).
+    fn indexer_decl(&mut self, idx: &crate::models::IndexerDecl) {
+        let access_byte = match idx.access {
+            crate::models::Access::Public => 1,
+            crate::models::Access::Private => 2,
+            crate::models::Access::Protected => 3,
+            crate::models::Access::Internal => 4,
+            _ => 0,
+        };
+        self.byte(access_byte);
+        self.byte(if idx.is_settable { 1 } else { 0 });
+        self.attrs(&idx.attrs);
+        self.string(&idx.type_name);
+        self.u32(idx.params.len());
+        for param in &idx.params {
+            self.param(param);
+        }
+        self.expr(&idx.init);
+        match &idx.get {
+            Some(block) => {
+                self.byte(format::tag::PRESENT);
+                self.block(block);
+            }
+            None => self.byte(format::tag::ABSENT),
+        }
+        match &idx.set {
+            Some(block) => {
+                self.byte(format::tag::PRESENT);
+                self.block(block);
+            }
+            None => self.byte(format::tag::ABSENT),
+        }
+        match &idx.get_expr {
+            Some(expr) => {
+                self.byte(format::tag::PRESENT);
+                self.expr(expr);
+            }
+            None => self.byte(format::tag::ABSENT),
         }
     }
 
@@ -723,6 +774,24 @@ impl Writer {
 
     fn expr(&mut self, expr: &Expr) {
         match expr {
+            // The parser's named-argument marker: the value is what the
+            // encoder sees once the argument list is positional.
+            Expr::NamedArg { value, .. } => self.expr(value),
+            // A lambda cannot be represented in this model. Writing a
+            // tag the decoder REJECTS is the honest option: the
+            // alternative is picking some shape that decodes into a
+            // different expression, which would make a round-trip silently
+            // change the program.
+            Expr::Lambda { .. } => {
+                self.byte(format::tag::LAMBDA);
+            }
+            // Overflow control is a real part of the expression: dropping
+            // the wrapper would make a round-trip silently turn checked
+            // arithmetic into wrapping arithmetic.
+            Expr::Checked { inner, .. } => {
+                self.byte(format::tag::CHECKED);
+                self.expr(inner);
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 self.byte(format::tag::BIN);
                 self.binop(*op);
@@ -757,6 +826,10 @@ impl Writer {
             Expr::Literal(Literal::Int(value)) => {
                 self.byte(format::tag::INT);
                 self.u64(*value as u64);
+            }
+            Expr::Literal(Literal::Char(value)) => {
+                self.byte(format::tag::CHAR);
+                self.u32(*value as usize);
             }
             Expr::Literal(Literal::Float(value)) => {
                 self.byte(format::tag::FLOAT);
@@ -868,7 +941,14 @@ impl Writer {
                 for arm in arms {
                     self.u32(arm.labels.len());
                     for label in &arm.labels {
-                        self.string(label);
+                        self.expr(label);
+                    }
+                    match &arm.guard {
+                        Some(g) => {
+                            self.byte(format::tag::PRESENT);
+                            self.expr(g);
+                        }
+                        None => self.byte(format::tag::ABSENT),
                     }
                     self.expr(&arm.body);
                 }

@@ -431,12 +431,16 @@ class Box {
 }
 
 #[test]
-fn interface_member_found_across_same_named_arity() {
-    // `IEnumerator<T>` inherits `MoveNext` from `IEnumerator` without
-    // redeclaring; whichever entry matches first, the member resolves
-    // through a same-named sibling instead of erroring.
-    let p = lower(
-        r#"namespace t;
+fn interface_member_with_no_implementer_uses_the_shared_interface_slot() {
+    // `IEnumerator<T>` sits beside a non-generic `IEnumerator`, and the
+    // call is made on the non-generic one. Nothing in this unit
+    // implements either interface, so no class row can supply a slot.
+    // Interface members live in a range ABOVE every class slot, shared
+    // by all implementers, so the call has a defined index even with no
+    // implementer in the unit; the null receiver faults at run time,
+    // exactly as C# does. Dispatching to a class slot (the old
+    // fallback) would jump into whatever function held that index.
+    let src = r#"namespace t;
 interface IEnumerator<T> {
     T Current();
 }
@@ -449,20 +453,29 @@ class C {
         bool b = e.MoveNext();
         return 0;
     }
-}"#,
-    );
+}"#;
+    let unit = crate::parser::parse(src).unwrap();
+    let table = crate::native::semantic::analyze(&unit).unwrap();
+    let slot = crate::native::semantic::iface_slot_by_name(&table, "IEnumerator", "MoveNext")
+        .expect("a declared interface member has a slot");
     assert!(
-        has(&p, |i| matches!(i, Instr::CallVirt { .. })),
-        "expected virtual dispatch through inherited interface member"
+        slot >= crate::native::semantic::iface_slot_base(&table),
+        "interface slots live above the class range (slot {slot})"
+    );
+    let p = crate::native::ir::lower(&unit).expect("interface call lowers");
+    assert!(
+        has(&p, |i| matches!(i, Instr::CallVirt { slot: s, .. } if *s as usize == slot)),
+        "MoveNext must dispatch through interface slot {slot}"
     );
 }
 
 #[test]
-fn interface_member_found_through_base_interface() {
-    // `IAsyncEnum : IDisposable` inherits `Dispose` transitively
-    // (the `IAsyncEnumerator.DisposeAsync` shape).
-    let p = lower(
-        r#"namespace t;
+fn interface_member_through_base_interface_uses_the_declaring_slot() {
+    // `IAsyncEnum : IDisposable` inherits `Dispose` (the
+    // `IAsyncEnumerator.DisposeAsync` shape). The member is declared on
+    // the base, so the slot comes from there; the call must still lower
+    // through the shared interface range.
+    let src = r#"namespace t;
 interface IDisposable {
     void Dispose();
 }
@@ -475,23 +488,53 @@ class C {
         e.Dispose();
         return 0;
     }
-}"#,
-    );
+}"#;
+    let unit = crate::parser::parse(src).unwrap();
+    let table = crate::native::semantic::analyze(&unit).unwrap();
+    let slot = crate::native::semantic::iface_slot_by_name(&table, "IAsyncEnum", "Dispose")
+        .expect("an inherited interface member has a slot");
+    let p = crate::native::ir::lower(&unit).expect("inherited interface call lowers");
     assert!(
-        has(&p, |i| matches!(i, Instr::CallVirt { .. })),
-        "expected virtual dispatch through base interface member"
+        has(&p, |i| matches!(i, Instr::CallVirt { slot: s, .. } if *s as usize == slot)),
+        "Dispose must dispatch through interface slot {slot}"
     );
 }
 
 #[test]
-fn field_held_delegate_invocation_placeholders() {
-    // `m_action()` where `m_action` is an `Action` field: delegates
-    // are not wired into the runtime yet, so invocation yields zero
-    // instead of erroring as an unknown call.
+fn interface_member_with_an_implementer_dispatches_virtually() {
+    // The real case the fallback was standing in for: a class implements
+    // the interface, so a call through the interface-typed receiver has
+    // an actual row to dispatch through.
+    let p = lower(
+        r#"namespace t;
+interface IShape {
+    int Area();
+}
+class Square : IShape {
+    public int Area() { return 4; }
+}
+class C {
+    int main() {
+        IShape s = new Square();
+        return s.Area();
+    }
+}"#,
+    );
+    assert!(
+        has(&p, |i| matches!(i, Instr::CallVirt { .. })),
+        "expected virtual dispatch to the implementing class"
+    );
+}
+
+#[test]
+fn field_held_delegate_invocation_dispatches() {
+    // `m_action()` where `m_action` is an `Action` field used to be a
+    // diagnostic; the invoke body is now shared with the local path, so
+    // the call lowers to a function-address call (single or combined).
     let p = lower(
         r#"namespace t;
 class A {
-    Action _cb;
+    System.Action _cb;
     public A() { }
     public void Run() {
         _cb();
@@ -500,8 +543,8 @@ class A {
 }"#,
     );
     assert!(
-        has(&p, |i| matches!(i, Instr::Const { imm: 0, .. })),
-        "expected zero placeholder for delegate-field call"
+        has(&p, |i| matches!(i, Instr::CallFnAddr { .. })),
+        "field delegate invocation must dispatch through the delegate"
     );
 }
 

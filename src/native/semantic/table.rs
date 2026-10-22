@@ -89,6 +89,10 @@ pub struct MethodInfo {
     pub name: String,
     pub ret_type: String,
     pub param_types: Vec<String>,
+    /// Declared parameter names, in parameter order. Named arguments
+    /// (`M(b: 1, a: 2)`) are rewritten into this order before anything
+    /// evaluates them.
+    pub param_names: Vec<String>,
     /// Per-param: whether the parameter declares a default value
     /// (`void M(int x = 5)`). Calls omitting trailing defaulted params
     /// are filled from `param_defaults` at lowering (C# optional args).
@@ -196,6 +200,29 @@ pub struct FieldInfo {
     pub declaring_class: String,
 }
 
+/// Slots at the head of a class instance, before its fields.
+///
+/// Slot 0 holds the vtable address, slot 1 the reference count, and
+/// slot 2 the instance's RUNTIME TYPE — the descriptor of the
+/// instantiation, which is what carries a generic class's type
+/// arguments (a `ReadOnlyMemory<byte>` instance knows its `byte`).
+/// The runtime type is a pointer, so it is one slot wide like the
+/// other two.
+///
+/// Every layout site reads the size from here: the field slots start
+/// at `INSTANCE_HEADER_SLOTS`, and the instance is that many slots
+/// plus the fields. A base constructor writes at its own class's
+/// offsets and the receiver it gets is adjusted by the difference
+/// between the derived layout's first field slot and this one, so the
+/// adjustment stays right when the header grows.
+pub const INSTANCE_HEADER_SLOTS: usize = 3;
+
+/// The slot the instance's runtime type lives in.
+pub const RUNTIME_TYPE_SLOT: usize = 2;
+
+/// The first slot a class instance's fields occupy.
+pub const FIRST_FIELD_SLOT: usize = INSTANCE_HEADER_SLOTS;
+
 /// Everything known about one class after semantic analysis.
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
@@ -241,9 +268,17 @@ pub struct ClassInfo {
     /// (`new WeakGCHandle<NativeObjectWrapper>(wrapper)` binds `T`),
     /// mirroring how method-level `generic_params` already work.
     pub generic_params: Vec<String>,
+    /// Index of each of this class's OWN type parameters inside the
+    /// instantiation's type-argument list (the base chain's arguments
+    /// come first, .NET order). `typeof(T)` inside a method of a
+    /// generic class reads the argument at this index from the
+    /// instance's runtime type.
+    pub type_arg_index: Vec<u32>,
     /// `struct` declaration: keeps its implicit parameterless
     /// constructor even with explicit ctors (classes do not).
     pub is_struct: bool,
+    /// `record` declaration: `==` compares by VALUE, field by field.
+    pub is_record: bool,
     /// Declaring library (project name) for dynamic-linking ownership:
     /// calls into methods whose declaring entry has a different owner
     /// than the main project become runtime imports instead of
@@ -387,6 +422,41 @@ impl TypeTable {
         // partially-qualified spellings (`Matrix3x2.Impl` for
         // `System.Numerics.Matrix3x2.Impl`) by suffix — first suffix hit
         // wins (documented ambiguity limitation).
+        // A BARE spelling that has a non-generic declaration must bind to
+        // it, even when a generic same-named type was declared first:
+        // `Box<int>` and `Box` are different types with different layouts,
+        // and first-match put both spellings on one entry, so
+        // `Box<int> x; x.A = 5;` and `Box y; y.B = 3;` wrote into the same
+        // slots and read zero back.
+        //
+        // Strictly additive on purpose — it changes an answer ONLY when a
+        // non-generic declaration exists. Code that writes `Span` for an
+        // argument-erased `Span<T>` keeps resolving as before, which a
+        // broader "prefer arity 0" rule broke.
+        // A spelling WITH arguments names that arity — but ONLY when the
+        // name is genuinely ambiguous, i.e. a same-named declaration of
+        // another arity also exists. Applying it unconditionally changed
+        // the answer for spellings like `Span<T>` whose only declaration
+        // is generic, which broke calls that rely on the old resolution.
+        if name.contains('<') {
+            let (bare, arity) = split_arity(name);
+            let same_name = |c: &&ClassInfo| c.name == bare || c.key.path == bare;
+            if self.classes.iter().any(|c| same_name(&c) && c.key.arity != arity) {
+                if let Some(c) = self.classes.iter().find(|c| {
+                    same_name(&c)
+                        && (c.key.arity == arity || c.generic_params.len() == arity)
+                }) {
+                    return Some(c);
+                }
+            }
+        }
+        if !name.contains('<')
+            && let Some(zero) = self.classes.iter().find(|c| {
+                (c.name == name || c.key.path == name) && c.generic_params.is_empty()
+            })
+        {
+            return Some(zero);
+        }
         self.classes
             .iter()
             .find(|c| c.name == name || c.key.path == name)
@@ -477,6 +547,11 @@ impl TypeTable {
         candidates.into_iter().next()
     }
 
+    /// The entries a bare simple name could mean, when more than one
+    /// declares it with the same arity and the referrer's scope cannot
+    /// decide (no context). C# reports CS0104 here; the compiler used
+    /// to take the first and say nothing, so a reader had no way to know
+    /// the choice was arbitrary.
     pub fn interface(&self, name: &str) -> Option<&InterfaceDecl> {
         self.interfaces.iter().find(|i| i.name == name)
     }
@@ -510,16 +585,31 @@ impl TypeTable {
             return false;
         }
         seen.push(class_name.to_owned());
-        // ALL same-named entries, not just first-match: simple names
-        // collide across families (`System.ComponentModel.ArrayConverter`
-        // vs `System.Text.Json.…ArrayConverter<TCollection, TElement>`,
-        // both in one closure via TypeConverter), and first-match alone
-        // walks the wrong family's bases — denying legal protected
-        // access (or mis-scoring inheritance). Any deriving path grants;
-        // the seen-guard still bounds the walk.
+        // An exact qualified path decides on its own — no ambiguity is
+        // possible there.
+        if let Some(info) = self.classes.iter().find(|c| c.key.path == class_name) {
+            return info
+                .bases
+                .iter()
+                .any(|b| self.derives_from_seen(b, ancestor, seen));
+        }
+        // A BARE name is the unresolved case, and it is inherent to the
+        // data model rather than a choice made here: `MethodInfo` /
+        // `FieldInfo` record `declaring_class` as a NAME, so by the time
+        // an access question is asked, `ArrayConverter` could be either
+        // of two real types. Walking every same-named entry and asking
+        // which of them actually derives from the declaring type answers
+        // the question "is there a type called `ArrayConverter` that
+        // derives from it?" — which is the most that can be known here.
+        //
+        // It can grant access that C# would refuse, when a same-named
+        // type in another family happens to derive from the ancestor.
+        // Making it exact means carrying the member's TypeKey instead of
+        // its name; ambiguous bare names are
+        // reported by W0005 in the meantime.
         self.classes
             .iter()
-            .filter(|c| c.name == class_name || c.key.path == class_name)
+            .filter(|c| c.name == class_name)
             .any(|info| {
                 info.bases
                     .iter()

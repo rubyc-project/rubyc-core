@@ -234,7 +234,7 @@ pub fn compile_to_bytes_with_libs_preamble_opts<
         eprintln!("[rubyc] timing: dce {:.1}s", t.elapsed().as_secs_f64());
     }
     if !mc.import_names.is_empty() {
-        linker::resolve_imports(&mut mc, &elf_libs).map_err(Error::Link)?;
+        linker::resolve_imports(&mut mc, &elf_libs, false).map_err(Error::Link)?;
     }
     mc.strip_symbols = opts.strip;
 
@@ -243,9 +243,8 @@ pub fn compile_to_bytes_with_libs_preamble_opts<
     // null by the linker for load-time resolution) cannot resolve in
     // a standalone executable — fail loudly instead of the writer's
     // unlinked-import panic. Run with `rubyc run` (the host process
-    // resolves dep imports at load time) or build as a shared
-    // library instead. Shared libraries keep null slots by design
-    // (resolved when the final image loads).
+    // resolves dep imports at load time), or build the dependency
+    // from sources so the import has nothing left to resolve.
     let unlinked_dep: Vec<String> = mc
         .import_names
         .iter()
@@ -257,7 +256,7 @@ pub fn compile_to_bytes_with_libs_preamble_opts<
         .collect();
     if !unlinked_dep.is_empty() {
         return Err(Error::Link(format!(
-            "executable cannot consume dependency images (standalone images carry no loader): {} — run with `rubyc run` or build as a shared library / from sources",
+            "executable cannot consume dependency images (standalone images carry no loader): {} — run with `rubyc run`, or build the dependency from sources",
             unlinked_dep.join(", ")
         )));
     }
@@ -289,8 +288,9 @@ pub fn compile_to_bytes_with_libs_preamble_opts<
 /// resolved by the dynamic loader via `R_X86_64_RELATIVE` records, so the
 /// artifact loads at any base a C host's `dlopen` chooses.
 ///
-/// Note: libraries that themselves declare `[LibraryImport]` stubs are not
-/// supported yet — imports resolve at executable link time only.
+/// Note: a library that declares `[LibraryImport]` stubs must be given the
+/// shared objects those stubs resolve against — the same rule as an
+/// executable. Imports are never left null.
 pub fn compile_shared_library<B: CodeGenBackend + ?Sized, W: ImageWriter + ?Sized>(
     unit: &CompilationUnit,
     backend: &B,
@@ -341,18 +341,24 @@ pub fn compile_shared_library_with_owners<
     let mut mc = backend.lower(&program).map_err(Error::Target)?;
     eprintln!("[rubyc] timing: backend {:.1}s", t.elapsed().as_secs_f64());
     if !mc.import_names.is_empty() {
-        if libs.is_empty() {
-            // Shared libraries routinely carry undefined symbols (resolved
-            // by the host at load — e.g. CoreLib QCalls satisfied by the
-            // runtime). Like `ld -shared`, warn and emit with null import
-            // slots instead of refusing the artifact.
-            eprintln!(
-                "[rubyc] warning: library declares {} [LibraryImport] stub(s) but no --lib files were given; imports will be null until linked at load",
+        // An import the linker cannot resolve is a build failure, not a
+        // null slot to discover at load time. The warn-and-emit path
+        // ("like `ld -shared`") let a library ship `[LibraryImport]`
+        // stubs that jumped through address 0 — the same
+        // fabrication removed for executables. `.so`-hinted
+        // imports are the exception: they are runtime dependencies the
+        // loader resolves (DT_NEEDED + GLOB_DAT), so no --lib is needed.
+        let needs_build_time = mc
+            .import_names
+            .iter()
+            .any(|(hint, _)| !hint.ends_with(".so"));
+        if libs.is_empty() && needs_build_time {
+            return Err(Error::Link(crate::tf!(
+                "rubyc.native.missing_lib_for_imports",
                 mc.import_names.len()
-            );
-        } else {
-            linker::resolve_imports(&mut mc, libs).map_err(Error::Link)?;
+            )));
         }
+        linker::resolve_imports(&mut mc, libs, true).map_err(Error::Link)?;
     }
     if opts.optimize {
         linker::dead_code_eliminate(&mut mc);

@@ -2,8 +2,8 @@
 
 use crate::models::{
     Access, Attribute, AttributeArg, AttributeValue, BinOp, Block, ClassDecl, ClassMember,
-    DelegateDecl, EventDecl, Expr, FieldDecl, IndexerDecl, InterfaceDecl, Keyword, Literal,
-    MethodDecl, MethodSig, Param, PropertyDecl, Span, TokenKind, UnOp,
+    DelegateDecl, Diagnostic, EventDecl, Expr, FieldDecl, IndexerDecl, InterfaceDecl, Keyword,
+    Literal, MethodDecl, MethodSig, Param, PropertyDecl, Severity, Span, TokenKind, UnOp,
 };
 
 /// Fold an enum initializer to a constant: integer literals, references
@@ -193,6 +193,7 @@ impl Parser {
         self.skip_type_constraints();
 
         let mut methods = Vec::new();
+        let mut indexers = Vec::new();
         if self
             .expect(&TokenKind::LeftBrace, "to open interface body")
             .is_some()
@@ -203,6 +204,17 @@ impl Parser {
                 // carries no attrs, like Param.)
                 if self.peek().kind == TokenKind::LeftBracket {
                     let _ = self.attribute_lists();
+                    continue;
+                }
+                // An indexer (`TElement this[int i] { get; }`): the
+                // interface AST kept only method signatures, so the
+                // indexer was discarded and a type-parameter receiver
+                // constrained to this interface had nothing to bind.
+                if self.interface_indexer_ahead() {
+                    match self.class_member() {
+                        Some(ClassMember::Indexer(d)) => indexers.push(d),
+                        _ => self.synchronize(),
+                    }
                     continue;
                 }
                 if self.skip_non_method_interface_member() {
@@ -221,11 +233,35 @@ impl Parser {
             name,
             generic_params,
             methods,
+            indexers,
             bases,
             arity,
             is_partial,
             span: start.to(self.peek().span),
         })
+    }
+
+    /// Whether the next interface member is an indexer (`RetType
+    /// this[P]`): a `this` token followed by `[` before the member's
+    /// body. The scan stops at `{`/`;` so a `this` inside a default
+    /// value is not mistaken for one.
+    fn interface_indexer_ahead(&self) -> bool {
+        let mut i = self.pos;
+        while i < self.tokens.len() {
+            match &self.tokens[i].kind {
+                TokenKind::Keyword(Keyword::This) => {
+                    return matches!(
+                        self.tokens.get(i + 1).map(|t| &t.kind),
+                        Some(TokenKind::LeftBracket)
+                    );
+                }
+                TokenKind::LeftBrace | TokenKind::Semicolon | TokenKind::Eof => {
+                    return false;
+                }
+                _ => i += 1,
+            }
+        }
+        false
     }
 
     /// Consume interface properties and operators that have no AST node yet.
@@ -494,8 +530,9 @@ impl Parser {
         self.expect(&TokenKind::LeftParen, "to open parameter list")?;
         let params = self.param_list();
         self.expect(&TokenKind::RightParen, "to close parameter list")?;
-        // Type constraints: `where T : ...` (consumed, not recorded).
-        self.skip_type_constraints();
+        // Type constraints: `where T : ...` — recorded, because a
+        // member on a type-parameter receiver binds through them.
+        let constraints = self.parse_type_constraints();
 
         let body = if self.eat(&TokenKind::LeftBrace).is_some() {
             let mut stmts = Vec::new();
@@ -547,7 +584,7 @@ impl Parser {
     /// `[modifiers] class Name[(bases...)] { class-members }`
     #[allow(dead_code)]
     pub(super) fn class_decl(&mut self, access: Access) -> Option<ClassDecl> {
-        self.class_decl_impl(access, false, false, false)
+        self.class_decl_impl(access, false, false, false, false)
     }
 
     pub(super) fn class_decl_impl(
@@ -556,6 +593,7 @@ impl Parser {
         keyword_consumed: bool,
         is_partial: bool,
         is_struct: bool,
+        is_record: bool,
     ) -> Option<ClassDecl> {
         let _ = access; // enforcement deferred to semantic analysis
         let kw = if keyword_consumed {
@@ -578,13 +616,18 @@ impl Parser {
         // names are recorded (attributes/defaults/modifiers handled by
         // `param_list`); they are in scope for the whole body (.NET).
         let mut primary_ctor_params = Vec::new();
+        // The full parameter list is kept for RECORDS: a positional record
+        // parameter becomes a public field with a constructor storing it
+        // (`record R(int V)` ⇒ field `V` + `R(int V)`). Only the names are
+        // needed for the primary-constructor scoping used elsewhere.
+        let mut primary_ctor_specs: Vec<Param> = Vec::new();
         if self.peek().kind == TokenKind::LeftParen {
             self.bump();
             if self.peek().kind != TokenKind::RightParen {
-                primary_ctor_params = self
-                    .param_list()
-                    .into_iter()
-                    .map(|p| p.name)
+                primary_ctor_specs = self.param_list();
+                primary_ctor_params = primary_ctor_specs
+                    .iter()
+                    .map(|p| p.name.clone())
                     .collect();
             }
             self.expect(&TokenKind::RightParen, "to close class name parens");
@@ -650,7 +693,19 @@ impl Parser {
         let mut members = Vec::new();
         // Struct-style declaration: `struct Name(int Id);` — no body.
         if self.eat(&TokenKind::Semicolon).is_some() {
+            // `record R(int V);` takes this path, so the positional
+            // members are synthesised here too (the body path below does
+            // the same for `record R(int V) { ... }`).
+            if is_record || !primary_ctor_specs.is_empty() {
+                members.extend(synthesize_record_members(
+                    &name,
+                    &primary_ctor_specs,
+                    if is_record { Access::Public } else { Access::Private },
+                    start,
+                ));
+            }
             return Some(ClassDecl {
+                is_record,
                 name,
                 generic_params: generic_params.clone(),
                 primary_ctor_params: primary_ctor_params.clone(),
@@ -685,7 +740,19 @@ impl Parser {
         );
         self.eat(&TokenKind::Semicolon);
         self.context.class = saved_class;
+        // A positional RECORD (or a class with primary-constructor
+        // parameters, which C# captures into the instance) synthesises
+        // its members here too.
+        if is_record || !primary_ctor_specs.is_empty() {
+            members.extend(synthesize_record_members(
+                &name,
+                &primary_ctor_specs,
+                if is_record { Access::Public } else { Access::Private },
+                start,
+            ));
+        }
         Some(ClassDecl {
+            is_record,
             name,
             generic_params,
             primary_ctor_params,
@@ -802,6 +869,14 @@ impl Parser {
             span: start.to(self.peek_at(0).span),
         }))
     }
+
+/// Positional-record members: one public field per parameter plus a
+/// constructor that stores each one (`record R(int V)` ⇒ field `V` and
+/// `R(int V) { this.V = V; }`).
+///
+/// Without this a positional record had a parameter and NO field, so
+/// `new R(7).V` read 0 and value equality compared zero fields and
+/// answered true for any two instances.
 
     /// Split an extension receiver parameter (`MethodInfo method`,    /// `Dictionary<string, int> d`, `scoped ReadOnlySpan<byte> span`)
     /// into (type, name) on the last top-level whitespace
@@ -1013,7 +1088,7 @@ impl Parser {
             span: start.to(self.peek_at(0).span),
             is_partial: false,
             // Synthetic extension holder: reference semantics.
-            is_struct: false,
+            is_struct: false, is_record: false,
             union_cross_assembly: false,
         })
     }
@@ -1039,6 +1114,9 @@ impl Parser {
         // Declaration modifiers apply to both fields and methods. Consume
         // them before deciding which member shape follows.
         let mut is_override = false;
+        let mut is_virtual = false;
+        let mut is_sealed = false;
+        let mut is_hiding = false;
         let mut is_const = false;
         let mut is_static = false;
         let mut is_abstract = false;
@@ -1082,17 +1160,32 @@ impl Parser {
                     access = Access::Public;
                     self.bump();
                 }
-                TokenKind::Keyword(Keyword::Virtual)
-                | TokenKind::Keyword(Keyword::Sealed)
-                | TokenKind::Keyword(Keyword::Readonly)
+                // `virtual` / `sealed` / `new` decide how a call
+                // binds: whether it follows the receiver's runtime type,
+                // whether it is fixed to the declaring type, and whether
+                // it hides rather than overrides. Recorded for the
+                // dispatch decision; the remaining modifiers
+                // here carry no runtime meaning for a method.
+                TokenKind::Keyword(Keyword::Virtual) => {
+                    is_virtual = true;
+                    self.bump();
+                }
+                TokenKind::Keyword(Keyword::Sealed) => {
+                    is_sealed = true;
+                    self.bump();
+                }
+                TokenKind::Keyword(Keyword::New) => {
+                    is_hiding = true;
+                    self.bump();
+                }
+                TokenKind::Keyword(Keyword::Readonly)
                 | TokenKind::Keyword(Keyword::Out_)
                 | TokenKind::Keyword(Keyword::In_)
-                | TokenKind::Keyword(Keyword::New)
                 | TokenKind::Keyword(Keyword::Required)
                 | TokenKind::Keyword(Keyword::Unsafe)
                 | TokenKind::Keyword(Keyword::File)
                 | TokenKind::Keyword(Keyword::Fixed)
-                |                 TokenKind::Keyword(Keyword::Volatile) => {
+                | TokenKind::Keyword(Keyword::Volatile) => {
                     self.bump();
                 }
                 // `ref` modifier is meaningful (ref fields hold
@@ -1109,13 +1202,14 @@ impl Parser {
                     is_extern = true;
                     self.bump();
                 }
-                // `safe` modifier (safe-critical annotations, e.g.
-                // `public safe object? Object;`, `private static safe
-                // partial int _Foo(...)`). Deliberately NOT a
-                // lexer keyword — a variable may legally be named
-                // `safe` — so accept the identifier only when a type
-                // or `partial` follows it (member/type position, never
-                // `safe =`, `safe(`, `safe.`, ...).
+                // `safe` (safe-context declarations). It is a
+                // compile-time escape-analysis annotation with no
+                // runtime meaning, so consuming it changes nothing
+                // about the program — the same treatment `scoped` gets.
+                // Deliberately NOT a lexer keyword: a variable may
+                // legally be named `safe`, so the identifier is only
+                // taken as a modifier when a type or `partial`
+                // follows it.
                 TokenKind::Identifier(ref n)
                     if n == "safe"
                         && matches!(
@@ -1126,12 +1220,12 @@ impl Parser {
                 {
                     self.bump();
                 }
-                // `closed` modifier (C# 14 closed hierarchies, e.g.
-                // `private closed class TraditionalKem`). Deliberately
-                // NOT a lexer keyword — a variable may legally be named
-                // `closed` — so accept the identifier only when a type
-                // declaration keyword follows it. Consumed and ignored
-                // (derivation-restriction enforcement is future work).
+                // `closed` (C# 14 closed hierarchies). The spelling
+                // gate is the same idea as `safe` above. Unlike `safe`
+                // this one DOES change what the language accepts —
+                // nobody may derive from a closed type — and nothing
+                // here enforces it. Silently dropping it means a
+                // program C# rejects compiles here, so say so instead.
                 TokenKind::Identifier(ref n)
                     if n == "closed"
                         && matches!(
@@ -1142,7 +1236,17 @@ impl Parser {
                                 | TokenKind::Keyword(Keyword::Record_)
                         ) =>
                 {
+                    let span = self.peek().span;
                     self.bump();
+                    self.errors.push(
+                        Diagnostic::new(
+                            "W0004",
+                            Severity::Warning,
+                            crate::t!("rubyc.parser.rd.declaration.closed_not_enforced"),
+                        )
+                        .at(span)
+                        .in_context(self.context.clone()),
+                    );
                 }
                 _ => break,
             }
@@ -1350,11 +1454,15 @@ impl Parser {
                 attrs,
                 // Operators cannot declare type parameters.
                 generic_params: Vec::new(),
+                constraints: Vec::new(),
                 ret_type,
                 name: op_name,
                 params,
                 body,
                 is_override,
+                is_virtual: true,
+                is_sealed: false,
+                is_hiding: false,
                 is_static,
                 is_abstract: false,
                 is_partial: false,
@@ -1667,6 +1775,9 @@ impl Parser {
                 is_settable,
                 is_static,
                 is_abstract,
+                is_override,
+                is_virtual,
+                is_hiding,
                 span: start.to(end),
             }));
             }
@@ -1711,11 +1822,15 @@ impl Parser {
                 attrs,
                 // Destructors cannot declare type parameters.
                 generic_params: Vec::new(),
+                constraints: Vec::new(),
                 ret_type: String::new(),
                 name: format!("~{name}"),
                 params: Vec::new(),
                 body,
                 is_override: false,
+                is_virtual: false,
+                is_sealed: false,
+                is_hiding: false,
                 is_static: false,
                 is_abstract: false,
                 is_partial: false,
@@ -1733,6 +1848,9 @@ impl Parser {
             attrs,
             start,
             is_override,
+            is_virtual,
+            is_sealed,
+            is_hiding,
             is_static,
             is_abstract,
             is_partial,
@@ -1929,6 +2047,12 @@ impl Parser {
                 self.bump();
                 Some((AttributeValue::Int(*v as i64), token.span))
             }
+            // A char attribute argument (`[DefaultValue(' ')]`): the code
+            // unit is the value, and the parameter's declared type is char.
+            TokenKind::CharLiteral(v) => {
+                self.bump();
+                Some((AttributeValue::Int(*v as i64), token.span))
+            }
             // Float literal (`DefaultValue(100d)` in Timer sources).
             TokenKind::FloatLiteral(bits) => {
                 self.bump();
@@ -2030,7 +2154,6 @@ impl Parser {
                 if self.peek().kind == TokenKind::Less {
                     self.skip_generic_parameter_list();
                 }
-                // Call arguments: `A(x, y)`.
                 if self.eat(&TokenKind::LeftParen).is_some() {
                     let mut depth = 1usize;
                     while depth > 0 && self.peek().kind != TokenKind::Eof {
@@ -2740,6 +2863,120 @@ impl Parser {
 
     /// Consume one or more C# `where T : ...` clauses. Constraints do not yet
     /// affect lowering, but must not prevent the enclosing declaration parsing.
+    /// Parse `where T : IFoo<T, int>, U : class` into the recorded
+    /// constraints. The clauses are what a type parameter's members
+    /// resolve against (C# binds `x[i]` through the constraint), so
+    /// they are kept instead of discarded.
+    pub(super) fn parse_type_constraints(
+        &mut self,
+    ) -> Vec<crate::models::ast::method::TypeConstraint> {
+        let mut out = Vec::new();
+        while self.peek().kind == TokenKind::Keyword(Keyword::Where_) {
+            // A clause shape the parser does not recognize (the C# 13
+            // `allows ref struct` form, for one) must not break the
+            // parse: rewind and skip the constraints the old way.
+            let mark = self.pos;
+            let err_mark = self.errors.len();
+            self.bump();
+            loop {
+                if !matches!(self.peek().kind, TokenKind::Identifier(_))
+                    || !matches!(self.peek_at(1).kind, TokenKind::Colon)
+                {
+                    self.pos = mark;
+                    self.errors.truncate(err_mark);
+                    self.skip_type_constraints();
+                    return out;
+                }
+                let Some(param) = self.expect_identifier("type parameter name") else {
+                    break;
+                };
+                if self.expect(&TokenKind::Colon, "in a type constraint").is_none() {
+                    break;
+                }
+                let mut types = Vec::new();
+                loop {
+                    // The `ref struct` / `allows ref struct` constraint
+                    // modifiers (C# 13/14) are not type names.
+                    let is_allows = matches!(&self.peek().kind, TokenKind::Identifier(n) if n == "allows");
+                    if (is_allows
+                        && matches!(self.peek_at(1).kind, TokenKind::Keyword(Keyword::Ref_))
+                        && matches!(self.peek_at(2).kind, TokenKind::Keyword(Keyword::Struct_)))
+                        || (matches!(self.peek().kind, TokenKind::Keyword(Keyword::Ref_))
+                            && matches!(self.peek_at(1).kind, TokenKind::Keyword(Keyword::Struct_)))
+                    {
+                        if is_allows {
+                            self.bump();
+                        }
+                        self.bump();
+                        self.bump();
+                        types.push("ref struct".to_owned());
+                        if !matches!(self.peek().kind, TokenKind::Comma) {
+                            break;
+                        }
+                        self.bump();
+                        continue;
+                    }
+                    // The special constraints (`class`, `struct`) are
+                    // keywords, not type names.
+                    if let TokenKind::Keyword(k) = self.peek().kind {
+                        let special = match k {
+                            Keyword::Class => Some("class"),
+                            Keyword::Struct_ => Some("struct"),
+                            _ => None,
+                        };
+                        if let Some(sp) = special {
+                            self.bump();
+                            // `class?` / `struct?`: the nullable
+                            // annotation belongs to the constraint.
+                            if matches!(self.peek().kind, TokenKind::Question) {
+                                self.bump();
+                            }
+                            types.push(sp.to_owned());
+                            if !matches!(self.peek().kind, TokenKind::Comma) {
+                                break;
+                            }
+                            if matches!(self.peek_at(1).kind, TokenKind::Identifier(_))
+                                && matches!(self.peek_at(2).kind, TokenKind::Colon)
+                            {
+                                break;
+                            }
+                            self.bump();
+                            continue;
+                        }
+                    }
+                    let Some(t) = self.type_name_full() else {
+                        self.pos = mark;
+                        self.errors.truncate(err_mark);
+                        self.skip_type_constraints();
+                        return out;
+                    };
+                    types.push(t);
+                    // A comma may separate the next PARAMETER clause
+                    // (`where T : IFoo, U : IBar`): an identifier
+                    // followed by `:` starts a new clause, and that
+                    // comma belongs to the clause, not to the type list.
+                    if !matches!(self.peek().kind, TokenKind::Comma) {
+                        break;
+                    }
+                    if matches!(self.peek_at(1).kind, TokenKind::Identifier(_))
+                        && matches!(self.peek_at(2).kind, TokenKind::Colon)
+                    {
+                        break;
+                    }
+                    self.bump();
+                }
+                out.push(crate::models::ast::method::TypeConstraint {
+                    param,
+                    types,
+                });
+                if self.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     pub(super) fn skip_type_constraints(&mut self) {
         while self.peek().kind == TokenKind::Keyword(Keyword::Where_) {
             self.bump();
@@ -2767,6 +3004,9 @@ impl Parser {
         attrs: Vec<Attribute>,
         _start: Span,
         is_override: bool,
+        is_virtual: bool,
+        is_sealed: bool,
+        is_hiding: bool,
         is_static: bool,
         is_abstract: bool,
         is_partial: bool,
@@ -2857,7 +3097,9 @@ impl Parser {
         self.expect(&TokenKind::RightParen, "to close parameter list")?;
 
         // Generic constraints: `where T : Constraint, U : Constraint`.
-        self.skip_type_constraints();
+        // Type constraints: `where T : ...` — recorded, because a
+        // member on a type-parameter receiver binds through them.
+        let constraints = self.parse_type_constraints();
 
         // Constructor chain: `: this(args)` or `: base(args)`.
         let mut base_call = None;
@@ -2924,11 +3166,15 @@ impl Parser {
             access,
             attrs,
             generic_params: method_generics,
+            constraints,
             ret_type,
             name,
             params,
             body,
             is_override,
+            is_virtual,
+            is_sealed,
+            is_hiding,
             is_static,
             is_abstract,
             is_partial,
@@ -2958,7 +3204,7 @@ impl Parser {
 
     pub(super) fn param(&mut self) -> Option<Param> {
         // Attributes may precede the parameter (`[Foo] string name`).
-        let _ = self.attribute_lists();
+        let attrs = self.attribute_lists();
         let mut saw_ref_like = false;
         // Extension-method receiver (`this Span<T> span`): recorded on
         // the first parameter (lowering rewrites `recv.Ext(args)` to
@@ -3043,6 +3289,7 @@ impl Parser {
             is_this,
             is_params,
             is_byref: saw_ref_like,
+            attrs,
         })
     }
     /// `{ get; set; }` / `{ get { … } set { … } }` accessor list.
@@ -3300,4 +3547,70 @@ impl Parser {
             span: start.to(self.peek_at(0).span),
         })
     }
+}
+
+fn synthesize_record_members(
+    name: &str,
+    specs: &[Param],
+    field_access: Access,
+    span: crate::models::Span,
+) -> Vec<ClassMember> {
+    let mut out: Vec<ClassMember> = Vec::new();
+    if specs.is_empty() {
+        return out;
+    }
+    for spec in specs {
+        out.push(ClassMember::Field(FieldDecl {
+            access: field_access,
+            attrs: Vec::new(),
+            type_name: spec.type_name.clone(),
+            name: spec.name.clone(),
+            init: Expr::Literal(Literal::Int(0)),
+            init_pre: Vec::new(),
+            is_const: false,
+            is_static: false,
+            is_byref: false,
+            span,
+        }));
+    }
+    let mut body: Vec<crate::models::Stmt> = Vec::new();
+    for spec in specs {
+        body.push(crate::models::Stmt::Expression(Expr::Assign {
+            target: Box::new(Expr::Member {
+                object: Box::new(Expr::Ident {
+                    name: "this".to_owned(),
+                    span,
+                }),
+                name: spec.name.clone(),
+                span,
+            }),
+            value: Box::new(Expr::Ident {
+                name: spec.name.clone(),
+                span,
+            }),
+            span,
+        }));
+    }
+    out.push(ClassMember::Method(MethodDecl {
+        access: Access::Public,
+        attrs: Vec::new(),
+        generic_params: Vec::new(),
+        constraints: Vec::new(),
+        ret_type: String::new(),
+        name: name.to_owned(),
+        params: specs.to_vec(),
+        body: Some(Block { stmts: body, span }),
+        span,
+        is_override: false,
+        is_virtual: false,
+        is_sealed: false,
+        is_hiding: false,
+        is_static: false,
+        is_abstract: false,
+        is_partial: false,
+        is_async: false,
+        is_extern: false,
+        base_call: None,
+    }));
+    out
 }

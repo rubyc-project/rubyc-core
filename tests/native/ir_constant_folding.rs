@@ -38,7 +38,7 @@ fn local_reads_are_runtime_values_soundly() {
     // Neither may fold — folding here was unsound with loops in the
     // language — but the two literals themselves are direct Consts.
     assert_eq!(
-        count_bins(main),
+        count_arith(main),
         2,
         "exactly Mul(a,7) and Sub(b,1) remain:\n{main:#?}"
     );
@@ -71,7 +71,7 @@ fn non_constant_operands_are_not_folded() {
         int main() { printf("{0}", Get(2) * 3); } } }"#,
     );
     // A call result is a runtime value: the multiply must SURVIVE.
-    assert_eq!(count_bins(&program_main(&p).clone()), 1);
+    assert_eq!(count_arith(&program_main(&p).clone()), 1);
     assert!(f_blocks(program_main(&p)).iter().any(|i| matches!(
         i,
         Instr::Bin {
@@ -159,6 +159,28 @@ fn program_main(p: &Program) -> &crate::native::ir::IrFunction {
 fn f_blocks(f: &crate::native::ir::IrFunction) -> &[Instr] {
     &f.blocks[0].instrs
 }
+/// Arithmetic Bins only (Add/Sub/Mul/Div/Rem): `int` results now carry a
+/// narrowing `Shl`/`Shr` pair, which these shape tests must not count as
+/// a second arithmetic operation.
+fn count_arith(main: &crate::native::ir::IrFunction) -> usize {
+    f_blocks(main)
+        .iter()
+        .filter(|i| {
+            matches!(
+                i,
+                Instr::Bin {
+                    op: crate::native::ir::BinOp::Add
+                        | crate::native::ir::BinOp::Sub
+                        | crate::native::ir::BinOp::Mul
+                        | crate::native::ir::BinOp::Div
+                        | crate::native::ir::BinOp::Rem,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
 fn count_bins(f: &crate::native::ir::IrFunction) -> usize {
     f_blocks(f)
         .iter()
@@ -193,8 +215,11 @@ class C {
 fn unqualified_same_class_const_folds_not_instance_read() {
     // Bare `X` (no `this.`, no `c.`) must fold like the qualified
     // spelling — previously it lowered to a vtable-slot read.
+    // No printf here: its argument spill introduces legitimate
+    // LoadFields from the temporary box, which the no-storage assertion
+    // would misread as a const storage read.
     let p = lower(
-        "namespace t; class c { const int X = 42; int main() { printf(\"{0}\", X); } }",
+        "namespace t; class c { const int X = 42; int main() { int y = X; return y; } }",
     );
     let main = program_main(&p);
     assert!(

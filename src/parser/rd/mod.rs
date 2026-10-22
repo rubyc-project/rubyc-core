@@ -36,6 +36,7 @@ pub fn parse_lenient(source: &str) -> (CompilationUnit, Vec<SyntaxError>) {
         pending: Vec::new(),
         pending_members: Vec::new(),
         pre_pending: Vec::new(),
+            case_binding: None,
         in_base_init: false,
         enum_values: Vec::new(),
         aliases: Vec::new(),
@@ -75,6 +76,11 @@ pub(super) struct Parser {
     /// Bindings that must be declared BEFORE the statement that uses them
     /// (e.g. an `is`-pattern binding var used in the same expression).
     /// Drained before each statement in `block()`.
+    /// Binding a `case T x:` label is carrying for the switch
+    /// lowering: the parser sees the designation but not the subject,
+    /// so it records the name+type here and the switch attaches it to
+    /// the arm it belongs to.
+    pub(super) case_binding: Option<(String, String)>,
     pub(super) pre_pending: Vec<crate::models::Stmt>,
     /// Resolved `(enum, variant, value)` triples from enums already parsed
     /// in this file. Lets later enum initializers reference them
@@ -129,6 +135,7 @@ impl Parser {
             pending: Vec::new(),
             pending_members: Vec::new(),
             pre_pending: Vec::new(),
+            case_binding: None,
         in_base_init: false,
             enum_values: Vec::new(),
             aliases: Vec::new(),
@@ -159,24 +166,79 @@ impl Parser {
     /// `with`, `and`, `or`, `not`, `when`). Lookahead positions must
     /// use this everywhere `expect_identifier` (which accepts the same
     /// set) will consume.
-    pub(super) fn peek_is_name(&self, offset: usize) -> bool {
-        match &self.peek_at(offset).kind {
-            TokenKind::Identifier(_) => true,
-            TokenKind::Keyword(
-                kw @ (Keyword::File
-                | Keyword::Required
-                | Keyword::Scoped
-                | Keyword::Record_
-                | Keyword::Async
+    /// Contextual keywords C# lets you use as ordinary names
+    /// (`file.Length`, `record` as a designation, `with` as a variable,
+    /// `not` as a local in `bool not = !true;`). One list, deliberately:
+    /// it was copy-pasted into five position checks that had already
+    /// drifted apart.
+    ///
+    /// Deliberately NOT here: `operator`, `base`, `partial`, `unsafe`,
+    /// `fixed`, `stackalloc` — those are reserved wherever they appear,
+    /// and widening the list to include them broke real declarations.
+    pub(super) fn is_contextual_name(kw: Keyword) -> bool {
+        matches!(
+            kw,
+            Keyword::Async
                 | Keyword::Await
                 | Keyword::Yield
                 | Keyword::With
                 | Keyword::From
+                | Keyword::File
+                | Keyword::Required
+                | Keyword::Scoped
+                | Keyword::Record_
+                | Keyword::Nameof_
+                // The pattern combinators are contextual too, and legal
+                // identifiers everywhere a NAME is expected. They are
+                // excluded only where a pattern is being parsed, since
+                // there they continue the pattern instead of naming it
+                // (see `is_contextual_binding`).
                 | Keyword::And_
                 | Keyword::Or_
                 | Keyword::Not_
-                | Keyword::When_),
-            ) => {
+                | Keyword::When_
+        )
+    }
+
+    /// The subset valid as a pattern designation. `and`, `or`, `not`
+    /// and `when` are excluded: there they continue or guard the
+    /// pattern (`is T and U`), so accepting them as names would eat the
+    /// rest of the pattern.
+    pub(super) fn is_contextual_binding(kw: Keyword) -> bool {
+        matches!(
+            kw,
+            Keyword::Async
+                | Keyword::Await
+                | Keyword::Yield
+                | Keyword::With
+                | Keyword::From
+                | Keyword::File
+                | Keyword::Required
+                | Keyword::Scoped
+                | Keyword::Record_
+        )
+    }
+
+    /// Whether `kw` names a type (`where T : IFoo`, parameter types).
+    /// Same set as a designation, minus `async`/`await`, which are not
+    /// types.
+    pub(super) fn is_contextual_type_name(kw: Keyword) -> bool {
+        matches!(
+            kw,
+            Keyword::With
+                | Keyword::From
+                | Keyword::File
+                | Keyword::Required
+                | Keyword::Scoped
+                | Keyword::Record_
+                | Keyword::Nameof_
+        )
+    }
+
+    pub(super) fn peek_is_name(&self, offset: usize) -> bool {
+        match &self.peek_at(offset).kind {
+            TokenKind::Identifier(_) => true,
+            TokenKind::Keyword(kw) if Self::is_contextual_name(*kw) => {
                 let _ = kw;
                 true
             }
@@ -197,17 +259,7 @@ impl Parser {
                 self.bump();
                 Some((name, span))
             }
-            TokenKind::Keyword(
-                Keyword::File
-                | Keyword::Required
-                | Keyword::Scoped
-                | Keyword::Record_
-                | Keyword::Async
-                | Keyword::Await
-                | Keyword::Yield
-                | Keyword::With
-                | Keyword::From,
-            ) => {
+            TokenKind::Keyword(kw) if Self::is_contextual_binding(*kw) => {
                 let span = self.peek().span;
                 let bytes = &self.source[span.start as usize..span.end as usize];
                 let src = std::str::from_utf8(bytes).unwrap_or("").to_owned();
@@ -260,18 +312,7 @@ impl Parser {
                 let j = i + 1;
                 let is_binding = match kind_at(self, j) {
                     TokenKind::Identifier(_) => true,
-                    TokenKind::Keyword(kw) => matches!(
-                        kw,
-                        Keyword::File
-                            | Keyword::Required
-                            | Keyword::Scoped
-                            | Keyword::Record_
-                            | Keyword::Async
-                            | Keyword::Await
-                            | Keyword::Yield
-                            | Keyword::With
-                            | Keyword::From
-                    ),
+                    TokenKind::Keyword(kw) => Self::is_contextual_binding(kw),
                     _ => false,
                 };
                 if is_binding
@@ -295,6 +336,7 @@ impl Parser {
                     };
                     if !name.is_empty() && name != "_" {
                         self.pre_pending.push(crate::models::Stmt::Let {
+                            is_const: false,
                             type_name: String::from("var"),
                             name,
                             init: crate::models::Expr::Literal(
@@ -327,18 +369,7 @@ impl Parser {
             // combinator (`(`, `not`, `true`, ...).
             let type_ok = match kind_at(self, j) {
                 TokenKind::Identifier(_) => true,
-                TokenKind::Keyword(kw) => matches!(
-                    kw,
-                    Keyword::File
-                        | Keyword::Required
-                        | Keyword::Scoped
-                        | Keyword::Record_
-                        | Keyword::Async
-                        | Keyword::Await
-                        | Keyword::Yield
-                        | Keyword::With
-                        | Keyword::From
-                ),
+                TokenKind::Keyword(kw) => Self::is_contextual_type_name(kw),
                 _ => false,
             };
             if !type_ok {
@@ -435,18 +466,7 @@ impl Parser {
             // Designation (never a combinator/guard/constant).
             let is_binding = match kind_at(self, j) {
                 TokenKind::Identifier(_) => true,
-                TokenKind::Keyword(kw) => matches!(
-                    kw,
-                    Keyword::File
-                        | Keyword::Required
-                        | Keyword::Scoped
-                        | Keyword::Record_
-                        | Keyword::Async
-                        | Keyword::Await
-                        | Keyword::Yield
-                        | Keyword::With
-                        | Keyword::From
-                ),
+                TokenKind::Keyword(kw) => Self::is_contextual_binding(kw),
                 _ => false,
             };
             if !is_binding {
@@ -484,6 +504,7 @@ impl Parser {
                     String::from("var")
                 };
                 self.pre_pending.push(crate::models::Stmt::Let {
+                    is_const: false,
                     type_name: if ty.is_empty() {
                         String::from("var")
                     } else {
@@ -507,17 +528,7 @@ impl Parser {
     pub(super) fn peek_is_pattern_binding(&self, offset: usize) -> bool {
         match &self.peek_at(offset).kind {
             TokenKind::Identifier(_) => true,
-            TokenKind::Keyword(
-                Keyword::File
-                | Keyword::Required
-                | Keyword::Scoped
-                | Keyword::Record_
-                | Keyword::Async
-                | Keyword::Await
-                | Keyword::Yield
-                | Keyword::With
-                | Keyword::From,
-            ) => true,
+            TokenKind::Keyword(kw) => Self::is_contextual_binding(*kw),
             _ => false,
         }
     }
@@ -809,6 +820,7 @@ impl Parser {
             || matches!(
                 &self.peek_at(idx).kind,
                 TokenKind::IntLiteral(_)
+                    | TokenKind::CharLiteral(_)
                     | TokenKind::StringLiteral(_)
                     | TokenKind::FloatLiteral(_)
                     | TokenKind::Keyword(Keyword::True)
@@ -1129,8 +1141,7 @@ impl Parser {
                 TokenKind::Comma => {
                     if top {
                         finish_part!();
-                        // Reset for the next part (macros expanded above).
-                        has_name = false;
+                            has_name = false;
                         complex = false;
                     }
                 }
@@ -1302,21 +1313,7 @@ impl Parser {
             // `record`, `async`, `await`, `yield`, `with`, `from`, `and`,
             // `or`, `not`, `when`) are legal identifiers. Accept them by
             // source text so real names like `var file` parse.
-            TokenKind::Keyword(
-                kw @ (Keyword::File
-                | Keyword::Required
-                | Keyword::Scoped
-                | Keyword::Record_
-                | Keyword::Async
-                | Keyword::Await
-                | Keyword::Yield
-                | Keyword::With
-                | Keyword::From
-                | Keyword::And_
-                | Keyword::Or_
-                | Keyword::Not_
-                | Keyword::When_),
-            ) => {
+            TokenKind::Keyword(kw) if Self::is_contextual_name(kw) => {
                 let _ = kw;
                 let span = self.peek().span;
                 let bytes = &self.source[span.start as usize..span.end as usize];
@@ -1401,6 +1398,7 @@ pub(super) fn describe_kind(kind: &TokenKind) -> String {
         TokenKind::Identifier(n) => format!("identifier '{n}'"),
         TokenKind::StringLiteral(s) => format!("string \"{s}\""),
         TokenKind::IntLiteral(v) => format!("integer {v}"),
+        TokenKind::CharLiteral(v) => format!("character {}", char::from_u32(*v).unwrap_or('\u{FFFD}')),
         TokenKind::FloatLiteral(bits) => format!("float {}", f64::from_bits(*bits)),
         TokenKind::Keyword(kw) => format!("'{kw:?}'"),
         TokenKind::Eof => "end of file".into(),

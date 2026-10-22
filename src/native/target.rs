@@ -294,10 +294,11 @@ pub enum Sym {
     /// Byte `offset` inside the read-only data blob marking the start of the
     /// exception runtime state block (inflight / depth / jmp_bufs).
     ExcState(usize),
-    /// Address of the 8-byte startup-saved stack slot (kernel rsp at
-    /// `_start`, written before `@start`'s prologue). The slot is the
-    /// LAST 8 bytes of the data blob whenever `helper_argv` is present;
-    /// `BuildArgv` reads argv through it (empty array where zero).
+    /// Address of the 8-byte startup argv slot. In a process image
+    /// `@start` writes the kernel rsp there before its prologue; a host
+    /// without a kernel stack (the JIT) pre-seeds it with its own argv
+    /// block. Its data offset is recorded in `MachineCode::helper_argv`;
+    /// `BuildArgv` reads argc through it (empty array where zero).
     ArgvRsp,
     /// Name i in `Program::names`, resolved to a runtime lookup table entry
     /// for `CallByName` dynamic dispatch.
@@ -394,8 +395,10 @@ pub struct MachineCode {
     /// Byte offset within `data` of the exception state block (None when
     /// exceptions are unused).
     pub exc_state_offset: Option<usize>,
-    /// Offset within `code` of the argv-builder helper (None when no
-    /// `BuildArgv` is lowered, i.e. paramless entry points).
+    /// Byte offset within `data` of the startup argv slot (None when no
+    /// `BuildArgv` is lowered, i.e. paramless entry points). The `@start`
+    /// prologue writes the kernel rsp there and `BuildArgv` reads it
+    /// back. Not a code offset: the builder is inlined at its use site.
     pub helper_argv: Option<usize>,
     /// `(library hint, entry point)` per declared import, in call-index
     /// order.
@@ -470,13 +473,12 @@ impl MachineCode {
             Sym::HelperExcClear => code_base + self.helper_exc_clear.unwrap_or(0) as u64,
             Sym::ExcState(off) => data_base + *off as u64,
             Sym::ArgvRsp => {
-                // Startup-saved rsp slot: last 8 data bytes whenever the
-                // argv helper exists (backend appends them with it).
-                if self.helper_argv.is_some() && self.data.len() >= 8 {
-                    data_base + (self.data.len() - 8) as u64
-                } else {
-                    data_base
-                }
+                // Recorded when the slot was appended. Do not derive this
+                // from `data.len()`: `relocate` takes the data vector
+                // before resolving, so a live length read is zero and the
+                // slot resolved to the data base (the JIT then read the
+                // first literal bytes as a saved stack pointer).
+                data_base + self.helper_argv.unwrap_or(0) as u64
             }
             Sym::Import(i) => {
                 // Load-time address wins when the loader resolved it;

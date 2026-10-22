@@ -15,7 +15,7 @@
 //!
 //! Format (all integers little-endian; strings are u32 length + bytes):
 //! ```text
-//! magic "RCI1", format version u32 (=2)
+//! magic "RCI1", format version u32 (=3)
 //! lib name, source-hash u64 (freshness vs the dep's current sources)
 //! classes: u32 count, each in TABLE order (declaration order —
 //!   consumers recompute nothing order-sensitive from it):
@@ -56,7 +56,7 @@ use crate::native::semantic::{
     ClassInfo, ConstValue, FieldInfo, MethodInfo, PropertyInfo,
 };
 
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 const MAGIC: &[u8; 4] = b"RCI1";
 
 fn access_byte(a: Access) -> u8 {
@@ -155,6 +155,10 @@ impl Writer {
         self.string(&m.name);
         self.string(&m.ret_type);
         self.strings(&m.param_types);
+        // Parameter names travel with the fragment: a call from the main
+        // project with a named argument is rewritten here, so the callee's
+        // names are part of its ABI description.
+        self.strings(&m.param_names);
         self.u32(m.param_has_default.len() as u32);
         for b in &m.param_has_default {
             self.u8(u8::from(*b));
@@ -411,6 +415,7 @@ impl<'a> Reader<'a> {
         let name = self.string();
         let ret_type = self.string();
         let param_types = self.strings();
+        let param_names = self.strings();
         let n = self.u32() as usize;
         let param_has_default = (0..n).map(|_| self.u8() != 0).collect();
         let has_params = self.u8() != 0;
@@ -434,6 +439,7 @@ impl<'a> Reader<'a> {
             name,
             ret_type,
             param_types,
+            param_names,
             param_has_default,
             has_params,
             param_is_byref,
@@ -480,6 +486,7 @@ impl<'a> Reader<'a> {
             is_this,
             is_params,
             is_byref,
+            attrs: Vec::new(),
         }
     }
 
@@ -512,6 +519,7 @@ impl<'a> Reader<'a> {
         let arity = self.u32() as usize;
         InterfaceDecl {
             name,
+            indexers: Vec::new(),
             generic_params,
             methods,
             bases,
@@ -565,6 +573,7 @@ impl<'a> Reader<'a> {
         let generic_params = self.strings();
         let is_struct = self.u8() != 0;
         ClassInfo {
+            type_arg_index: Vec::new(),
             name,
             key: TypeKey::new(path, arity),
             bases,
@@ -578,6 +587,11 @@ impl<'a> Reader<'a> {
             is_enum,
             generic_params,
             is_struct,
+            // The fragment format does not carry record-ness yet; a
+            // record arriving from a library is treated as a plain class
+            // (value equality is lost across the boundary, tracked with
+            // the fragment format rather than guessed here).
+            is_record: false,
             owner,
         }
     }

@@ -78,6 +78,8 @@ pub trait Visitor {
     fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Expression(expr) => self.visit_expr(expr),
+            Stmt::UsingDecl { init, .. } => self.visit_expr(init),
+            Stmt::CheckedBlock { body, .. } => self.visit_block(body),
             Stmt::Block { body, .. } => self.visit_block(body),
             Stmt::Fixed { declarators, body, .. } => {
                 for (_, _, init) in declarators {

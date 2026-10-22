@@ -9,8 +9,8 @@
 mod table;
 
 pub use table::{
-    ClassInfo, ConstValue, FieldInfo, ImportFn, MethodInfo, PropertyInfo, TypeKey, TypeTable,
-    split_arity,
+    ClassInfo, ConstValue, FieldInfo, FIRST_FIELD_SLOT, ImportFn, INSTANCE_HEADER_SLOTS,
+    MethodInfo, PropertyInfo, RUNTIME_TYPE_SLOT, TypeKey, TypeTable, split_arity,
 };
 
 use crate::models::diagnostic::{Diagnostic, ScopeContext, Severity};
@@ -96,6 +96,7 @@ fn const_fold(expr: &Expr, cx: &ConstCx) -> Option<ConstValue> {
     match expr {
         Expr::Literal(l) => match l {
             Literal::Int(v) => Some(ConstValue::Int(*v)),
+            Literal::Char(v) => Some(ConstValue::Int(*v as i64)),
             Literal::Float(v) => Some(ConstValue::Float(*v)),
             Literal::Bool(v) => Some(ConstValue::Int(i64::from(*v))),
             Literal::Str(s) => Some(ConstValue::Str(s.clone())),
@@ -413,6 +414,25 @@ struct ScopedClass {
     decl: ClassDecl,
 }
 
+/// The index of each of a class's OWN type parameters inside the
+/// instantiation's type-argument list. The base chain's arguments come
+/// first (.NET order: a base class's `T` is argument 0), so a derived
+/// class's own parameters follow the base chain's count.
+fn own_type_arg_index(
+    chain: &[crate::native::semantic::table::TypeKey],
+    raw_classes: &[ScopedClass],
+    decl: &ClassDecl,
+) -> Vec<u32> {
+    let base_args: u32 = chain
+        .iter()
+        .filter_map(|k| raw_classes.iter().find(|c| &c.key() == k))
+        .map(|c| c.decl.generic_params.len() as u32)
+        .sum();
+    (0..decl.generic_params.len() as u32)
+        .map(|i| base_args + i)
+        .collect()
+}
+
 impl ScopedClass {
     fn key(&self) -> crate::native::semantic::table::TypeKey {
         use crate::native::semantic::table::TypeKey;
@@ -596,6 +616,7 @@ pub fn analyze_with_preloaded(
                 {
                     if existing.is_partial && i.is_partial {
                         existing.methods.extend(i.methods.clone());
+                        existing.indexers.extend(i.indexers.clone());
                         existing.bases.extend(i.bases.clone());
                     } else {
                         return Err(vec![err(
@@ -685,6 +706,7 @@ pub fn analyze_with_preloaded(
                             access: crate::models::Access::Internal,
                             attrs: Vec::new(),
                             generic_params: Vec::new(),
+                            constraints: Vec::new(),
                             ret_type: String::new(),
                             name,
                             params: Vec::new(),
@@ -694,6 +716,9 @@ pub fn analyze_with_preloaded(
                             }),
                             span: crate::models::Span::default(),
                             is_override: false,
+                            is_virtual: false,
+                            is_sealed: false,
+                            is_hiding: false,
                             is_static: false,
                             is_abstract: false,
                             is_partial: false,
@@ -842,19 +867,14 @@ pub fn analyze_with_preloaded(
     for i in &preloaded.interfaces {
         owned.insert(TypeKey::new(i.name.clone(), i.arity));
     }
-    // Register well-known system/framework types that the fixture may use as
-    // bases. These are not defined in the source but are treated as opaque
-    // external bases (no members, no body).
-    for (ns_path, arity) in [
-        ("System.Attribute", 0),
-        ("System.Exception", 0),
-        ("System.IDisposable", 0),
-        ("System.Enum", 0),
-        ("System.Delegate", 0),
-        ("System.Object", 0),
-        ("System.ValueType", 0),
-        ("System.String", 0),
-    ] {
+    // `object` is the implicit root of every class and `ValueType` the
+    // implicit root of every struct — both are language rules, so the
+    // compiler knows them without a library (C# spec §8.9.1, §15.2.4).
+    // Every OTHER framework type must come from a real library: an
+    // `Exception`/`IDisposable`/`Enum`/`Delegate`/`Attribute`/`String`
+    // base that no declaration and no loaded fragment provides is
+    // simply unresolved, and the compiler reports it.
+    for (ns_path, arity) in [("System.Object", 0), ("System.ValueType", 0)] {
         owned.insert(TypeKey::new(ns_path, arity));
     }
 
@@ -1433,19 +1453,6 @@ pub fn analyze_with_preloaded(
     // Chains hold qualified keys; sources resolve by key (distinct
     // types never conflate, ending layout corruption from collisions).
     for (decl, res) in raw_classes.iter().zip(&resolved) {
-        // TEMP-CHAINDBG: audit base chains for misaligned entries.
-        // Removed before close.
-        if std::env::var("RUBYC_CHAINDBG").is_ok()
-            && (decl.decl.name.contains("Latin1Encoding")
-                || decl.decl.name.contains("UnicodeEncoding"))
-            && !decl.decl.name.contains("Sealed")
-        {
-            eprintln!(
-                "[rubyc] TEMP-CHAINDBG {} chain={:?}",
-                decl.decl.name,
-                res.chain.iter().map(|k| k.path.clone()).collect::<Vec<_>>()
-            );
-        }
         let mut fields: Vec<FieldInfo> = Vec::new();
         let mut static_fields: Vec<FieldInfo> = Vec::new();
         let mut const_fields: Vec<FieldInfo> = Vec::new();
@@ -1459,36 +1466,8 @@ pub fn analyze_with_preloaded(
             if let Some(bc) = raw_classes.iter().find(|c| &c.key() == base_key) {
                 field_sources.push((bc,));
             }
-            // TEMP-CHAINDBG2: audit key misses.
-            // Removed before close.
-            else if std::env::var("RUBYC_CHAINDBG").is_ok()
-                && (decl.decl.name.contains("Latin1Encoding")
-                    || decl.decl.name.contains("UnicodeEncoding"))
-                && !decl.decl.name.contains("Sealed")
-            {
-                eprintln!(
-                    "[rubyc] TEMP-CHAINDBG2 {} miss base_key={:?}",
-                    decl.decl.name, base_key
-                );
-            }
         }
         field_sources.push((decl,));
-        // TEMP-SRCDBG: audit member source order.
-        // Removed before close.
-        if std::env::var("RUBYC_CHAINDBG").is_ok()
-            && (decl.decl.name.contains("Latin1Encoding")
-                || decl.decl.name.contains("UnicodeEncoding"))
-            && !decl.decl.name.contains("Sealed")
-        {
-            eprintln!(
-                "[rubyc] TEMP-SRCDBG {} rawkey={:?} sources={:?} preloaded_n={} pre_same_name={:?}",
-                decl.decl.name,
-                decl.key(),
-                field_sources.iter().map(|(s,)| s.decl.name.clone()).collect::<Vec<_>>(),
-                preloaded.classes.len(),
-                preloaded.classes.iter().filter(|c| c.name.contains("Latin1Encoding") && !c.name.contains("Sealed")).map(|c| format!("{:?}", c.key)).collect::<Vec<_>>(),
-            );
-        }
 
         // Preloaded dependency members (chain order, verbatim copies):
         // the raw loop below then appends/updates own + raw-base
@@ -1579,12 +1558,45 @@ pub fn analyze_with_preloaded(
             }
         }
         {
-            let mut root_first: Vec<&ScopedClass> = Vec::new();
-            for base_key in res.chain.iter().rev() {
-                if let Some(bc) = raw_classes.iter().find(|c| &c.key() == base_key) {
-                    root_first.push(bc);
+            // Ancestors first, then this class. `res.chain` is ordered
+            // "a base, then ITS ancestors" per declared base, so for
+            // `C : A, B` it reads [A, Object, B]: reversing it put B
+            // BEFORE A and the second base's fields landed ahead of the
+            // first base's. Sorting by inheritance depth (stable, so
+            // declaration order breaks ties) gives the order a layout
+            // needs — Object, A, B, C — for any number of bases.
+            let depth = |k: &crate::native::semantic::table::TypeKey| -> usize {
+                let mut d = 0usize;
+                let mut cur = Some(k.clone());
+                while let Some(c) = cur {
+                    let Some(parent) = raw_classes
+                        .iter()
+                        .find(|sc| &sc.key() == &c)
+                        .and_then(|sc| sc.decl.bases.first())
+                    else {
+                        break;
+                    };
+                    let simple = parent.split('<').next().unwrap_or(parent).trim();
+                    cur = raw_classes
+                        .iter()
+                        .find(|sc| sc.decl.name == simple)
+                        .map(|sc| sc.key());
+                    d += 1;
+                    if d > 64 {
+                        break;
+                    }
                 }
-            }
+                d
+            };
+            let mut chain: Vec<&ScopedClass> = res
+                .chain
+                .iter()
+                .filter_map(|base_key| {
+                    raw_classes.iter().find(|c| &c.key() == base_key)
+                })
+                .collect();
+            chain.sort_by_key(|sc| depth(&sc.key()));
+            let mut root_first: Vec<&ScopedClass> = chain;
             root_first.push(decl);
             for src in root_first {
                 for m in &src.decl.members {
@@ -1605,6 +1617,13 @@ pub fn analyze_with_preloaded(
                         {
                             if !field_slot_order.iter().any(|n| n == &p.name) {
                                 field_slot_order.push(p.name.clone());
+                            }
+                        }
+                        // An event has storage too (the subscriber-list
+                        // head): it takes a slot like an auto-property.
+                        crate::models::ClassMember::Event(e) => {
+                            if !field_slot_order.iter().any(|n| n == &e.name) {
+                                field_slot_order.push(e.name.clone());
                             }
                         }
                         _ => {}
@@ -1650,30 +1669,6 @@ pub fn analyze_with_preloaded(
                                 .get(&(src.key(), f.name.clone()))
                                 .cloned()
                                 .map(|v| convert_const(v, &f.type_name));
-                            // TEMP-CONSTDIAG: audit resolution of time
-                            // consts (bisecting the FromUnits throw).
-                            // Removed before close.
-                            if std::env::var("RUBYC_CONSTDIAG").is_ok()
-                                && matches!(
-                                    f.name.as_str(),
-                                    "MinHours" | "MaxHours" | "MinTicks" | "MaxTicks"
-                                        | "MinValue" | "MaxValue" | "CACHE_LINE_SIZE"
-                                )
-                            {
-                            eprintln!(
-                                "[rubyc] TEMP-CONSTDIAG {}.{} = {:?}",
-                                decl.decl.name, f.name, const_value
-                            );
-                            // TEMP-KEYDBG. Removed before close.
-                            if std::env::var("RUBYC_CONSTDIAG").is_ok()
-                                && f.name.as_str() == "CACHE_LINE_SIZE"
-                            {
-                                eprintln!(
-                                    "[rubyc] TEMP-KEYDBG key={:?}",
-                                    decl.key()
-                                );
-                            }
-                            }
                             if const_value.is_none() {
                                 errors.push(err_help(
                                     "E0030",
@@ -1755,14 +1750,8 @@ pub fn analyze_with_preloaded(
                         // read slot 2 (+16, first data word) as the
                         // length — e.g. `ToCharArray` on `"\n"` saw
                         // length 10 (0x0A) instead of 1 and overran.
-                        let is_string_len = f.name == "_stringLength"
-                            && src
-                                .decl
-                                .name
-                                .rsplit('.')
-                                .next()
-                                .unwrap_or(&src.decl.name)
-                                == "String";
+                        let is_string_len =
+                            builtin_string_interior_offset(&src.decl.name, &f.name) == Some(0);
                         let offset_slots = if is_string_len {
                             0
                         } else {
@@ -1773,8 +1762,8 @@ pub fn analyze_with_preloaded(
                             field_slot_order
                                 .iter()
                                 .position(|n| n == &f.name)
-                                .map(|i| i + 2)
-                                .unwrap_or(fields.len() + 2)
+                                .map(|i| i + FIRST_FIELD_SLOT)
+                                .unwrap_or(fields.len() + FIRST_FIELD_SLOT)
                         };
                         fields.push(FieldInfo {
                             name: f.name.clone(),
@@ -1885,8 +1874,8 @@ pub fn analyze_with_preloaded(
                         let offset_slots = field_slot_order
                             .iter()
                             .position(|n| n == &p.name)
-                            .map(|i| i + 2)
-                            .unwrap_or(fields.len() + 2); // slots 0-1: vtable + refcount
+                            .map(|i| i + FIRST_FIELD_SLOT)
+                            .unwrap_or(fields.len() + FIRST_FIELD_SLOT);
                         fields.push(FieldInfo {
                             name: p.name.clone(),
                             type_name: p.type_name.clone(),
@@ -1901,10 +1890,29 @@ pub fn analyze_with_preloaded(
                             declaring_class: src.decl.name.clone(),
                         });
                     }
-                    // Indexers and events are accessor-backed: no object layout
-                    // slot.
+                    // An EVENT needs storage: it holds the head of the
+                    // subscriber list (`add` prepends, `remove` unlinks,
+                    // invocation walks it). Indexers and nested types
+                    // remain slot-less.
+                    crate::models::ClassMember::Event(e) => {
+                        let offset_slots = field_slot_order
+                            .iter()
+                            .position(|n| n == &e.name)
+                            .map(|i| i + FIRST_FIELD_SLOT)
+                            .unwrap_or(fields.len() + FIRST_FIELD_SLOT);
+                        fields.push(crate::native::semantic::FieldInfo {
+                            name: e.name.clone(),
+                            type_name: "object".to_owned(),
+                            access: e.access,
+                            is_static: false,
+                            is_const: false,
+                            const_value: None,
+                            is_byref: false,
+                            offset_slots,
+                            declaring_class: src.decl.name.clone(),
+                        });
+                    }
                     crate::models::ClassMember::Indexer(_)
-                    | crate::models::ClassMember::Event(_)
                     | crate::models::ClassMember::Nested(_) => {}
                     crate::models::ClassMember::Method(m) => {
                         // Overloads (`Dispose()` vs `Dispose(bool)`) are
@@ -1944,23 +1952,6 @@ pub fn analyze_with_preloaded(
                             continue;
                         }
                         let slot = methods.len();
-                        // TEMP-PUSHDBG: audit push order.
-                        // Removed before close.
-                        if std::env::var("RUBYC_CHAINDBG").is_ok()
-                            && (decl.decl.name.contains("Latin1Encoding")
-                                || decl.decl.name.contains("UnicodeEncoding"))
-                            && !decl.decl.name.contains("Sealed")
-                            && (methods.len() < 3 || m.name.contains("SetDefaultFallbacks") || m.name == "GetType")
-                        {
-                            eprintln!(
-                                "[rubyc] TEMP-PUSHDBG {} src={} srckey={:?} method={} slot={}",
-                                decl.decl.name, src.decl.name, src.key(), m.name, slot
-                            );
-                        }
-                        // Optional parameters (`void M(int x = 5)`): fold
-                        // each default now (const/enum refs resolve via the
-                        // fixpoint table, scoped to the DECLARING class)
-                        // so lowering can fill omitted trailing args.
                         let dcx = ConstCx {
                             enums: &enum_values,
                             consts: &const_values,
@@ -1986,6 +1977,7 @@ pub fn analyze_with_preloaded(
                             name: m.name.clone(),
                             ret_type: m.ret_type.clone(),
                             param_types: m.params.iter().map(|p| p.type_name.clone()).collect(),
+                            param_names: m.params.iter().map(|p| p.name.clone()).collect(),
                             param_has_default,
                             // `params` is always last by language rules;
                             // any flagged param marks the method.
@@ -2144,20 +2136,6 @@ pub fn analyze_with_preloaded(
             static_fields,
             const_fields,
             methods: {
-                // TEMP-METHDBG: audit methods order at push.
-                // Removed before close.
-                if std::env::var("RUBYC_CHAINDBG").is_ok()
-                    && (decl.decl.name.contains("Latin1Encoding")
-                        || decl.decl.name.contains("UnicodeEncoding"))
-                    && !decl.decl.name.contains("Sealed")
-                {
-                    eprintln!(
-                        "[rubyc] TEMP-METHDBG {} nmethods={} first3={:?}",
-                        decl.decl.name,
-                        methods.len(),
-                        methods.iter().take(3).map(|m| m.name.clone()).collect::<Vec<_>>()
-                    );
-                }
                 methods
             },
             own_members,
@@ -2165,7 +2143,9 @@ pub fn analyze_with_preloaded(
             properties,
             is_enum: false,
             generic_params: decl.decl.generic_params.clone(),
+            type_arg_index: own_type_arg_index(&res.chain, &raw_classes, &decl.decl),
             is_struct: decl.decl.is_struct,
+            is_record: decl.decl.is_record,
             // Ownership is attributed by the post-pass below (needs the
             // complete table for parent-chain inheritance).
             owner: String::new(),
@@ -2193,41 +2173,48 @@ pub fn analyze_with_preloaded(
                 m.generic_params.len(),
             )
         }
-        fn base_index(table: &TypeTable, cls: &ClassInfo) -> Option<usize> {
-            // Primary class base: first base resolving to a table
-            // class, preferring the same namespace (nested and
-            // cross-namespace same-names must not alias). Interfaces
-            // resolve to no table class and are skipped naturally.
-            // TEMP-BASEDBG. Removed before close.
-            let dbg = std::env::var("RUBYC_CHAINDBG").is_ok()
-                && (cls.name.contains("Latin1Encoding") || cls.name.contains("UnicodeEncoding"))
-                && !cls.name.contains("Sealed");
+        /// EVERY class base, in declaration order — not just the first.
+        ///
+        /// C# has single inheritance, so "the base" was unambiguous; with
+        /// concrete multiple inheritance a type has several, and each one
+        /// contributes a member set and a slot range. Resolving only the
+        /// first left the other bases' methods with no slots at all, so a
+        /// call to them landed on whichever method held the same slot in
+        /// the first base (`MyClass3.Multiply(10,100)` ran `Divide` and
+        /// answered 0).
+        ///
+        /// Same-named entries are preferred by namespace, as before; a
+        /// base whose name resolves to nothing (an interface) is skipped.
+        fn base_indices(table: &TypeTable, cls: &ClassInfo) -> Vec<usize> {
             let ns = cls
                 .key
                 .path
                 .rsplit_once('.')
                 .map(|(n, _)| n)
                 .unwrap_or("");
-            let mut fallback: Option<usize> = None;
+            let mut out: Vec<usize> = Vec::new();
             for b in &cls.bases {
+                let mut pick: Option<usize> = None;
+                let mut fallback: Option<usize> = None;
                 for (i, c) in table.classes.iter().enumerate() {
                     if c.key.simple_name() != *b && c.name != *b {
                         continue;
                     }
                     if c.key.path.rsplit_once('.').map(|(n, _)| n).unwrap_or("") == ns {
-                        if dbg {
-                            eprintln!("[rubyc] TEMP-BASEDBG {} base {b} -> {}", cls.name, c.key.path);
-                        }
-                        return Some(i);
+                        pick = Some(i);
+                        break;
                     }
                     fallback.get_or_insert(i);
                 }
+                if let Some(i) = pick.or(fallback) {
+                    if !out.contains(&i) {
+                        out.push(i);
+                    }
+                }
             }
-            if dbg {
-                eprintln!("[rubyc] TEMP-BASEDBG {} fallback={:?}", cls.name, fallback.map(|i| table.classes[i].key.path.clone()));
-            }
-            fallback
+            out
         }
+
         fn assign(
             table: &mut TypeTable,
             idx: usize,
@@ -2238,61 +2225,26 @@ pub fn analyze_with_preloaded(
                 return; // cycle: keep positional slots
             }
             stack.push(key.clone());
-            if let Some(bi) = base_index(table, &table.classes[idx].clone()) {
-                assign(table, bi, stack);
+            // Every base is finalized first, then their slot maps are
+            // UNIONED in declaration order: a signature two bases share
+            // keeps the first base's slot (decision B — declaration
+            // order decides), and distinct signatures from the second
+            // base take their own slots after the first base's range.
+            let bases = base_indices(table, &table.classes[idx].clone());
+            for bi in &bases {
+                assign(table, *bi, stack);
             }
-            // Inherited slot map from the (now final) base entry.
-            let inherited: std::collections::BTreeMap<
+            let mut inherited: std::collections::BTreeMap<
                 (String, String, usize),
                 usize,
-            > = match base_index(table, &table.classes[idx].clone()) {
-                Some(bi) => table.classes[bi]
-                    .methods
-                    .iter()
-                    .map(|m| (sig_of(m), m.vtable_slot))
-                    .collect(),
-                None => Default::default(),
-            };
-            // TEMP-SLOTDBG. Removed before close.
-            if std::env::var("RUBYC_CHAINDBG").is_ok()
-                && (table.classes[idx].name.contains("Latin1Encoding")
-                    || table.classes[idx].name.contains("UnicodeEncoding"))
-                && !table.classes[idx].name.contains("Sealed")
-            {
-                eprintln!(
-                    "[rubyc] TEMP-SLOTDBG {} inherited_n={} maxslot={:?}",
-                    table.classes[idx].name,
-                    inherited.len(),
-                    inherited.values().copied().max()
-                );
+            > = Default::default();
+            for bi in &bases {
+                for m in table.classes[*bi].methods.iter() {
+                    inherited.entry(sig_of(m)).or_insert(m.vtable_slot);
+                }
             }
             let mut next =
                 inherited.values().copied().max().map(|m| m + 1).unwrap_or(0);
-            // TEMP-SLOTMAP. Removed before close.
-            let mapdbg = std::env::var("RUBYC_CHAINDBG").is_ok()
-                && (table.classes[idx].name.contains("Latin1Encoding"))
-                && !table.classes[idx].name.contains("Sealed");
-            let cls = &mut table.classes[idx];
-            for m in cls.methods.iter_mut() {
-                if let Some(&s) = inherited.get(&sig_of(m)) {
-                    if mapdbg {
-                        eprintln!(
-                            "[rubyc] TEMP-SLOTMAP HIT {} params={:?} {} -> {}",
-                            m.name, m.param_types, m.vtable_slot, s
-                        );
-                    }
-                    m.vtable_slot = s;
-                } else {
-                    if mapdbg && m.vtable_slot < 40 {
-                        eprintln!(
-                            "[rubyc] TEMP-SLOTMAP MISS {} params={:?} stays {}",
-                            m.name, m.param_types, m.vtable_slot
-                        );
-                    }
-                    m.vtable_slot = next;
-                    next += 1;
-                }
-            }
             stack.pop();
         }
         // NOTE: `table.classes` grows below (enums); reconcile only
@@ -2358,9 +2310,10 @@ pub fn analyze_with_preloaded(
             properties: Vec::new(),
             is_enum: true,
             generic_params: Vec::new(),
+            type_arg_index: Vec::new(),
             // Enums lower as const-field holders; constructor rules
             // never apply to them.
-            is_struct: false,
+            is_struct: false, is_record: false,
             // Ownership is attributed by the post-pass below (needs the
             // complete table for parent-chain inheritance).
             owner: String::new(),
@@ -2649,6 +2602,36 @@ pub fn context_of(unit: &CompilationUnit, class_name: &str, function: &str) -> S
     }
 }
 
+/// Offset of a `string` interior member in RubyC's builtin string
+/// representation, or `None` when the member is an ordinary field.
+///
+/// RubyC owns the layout of its builtin `string`:
+/// `+0` character count · `+8` reference count · `+16` UTF-16 payload.
+/// A `string` implementation must be built to that representation, so
+/// the compiler — not any particular library — decides these offsets.
+///
+/// The member spellings below are the ones `System.String` uses
+/// (`_stringLength`, `_firstChar`). That is a compatibility shim, not a
+/// language rule: it is why this helper exists in exactly one place
+/// instead of being open-coded per stage. The fix is a language-level
+/// contract (lowering `Length` and the indexer off the builtin type) so
+/// no library's private field names are known here.
+pub fn builtin_string_interior_offset(declaring_type: &str, member: &str) -> Option<u32> {
+    if declaring_type
+        .rsplit('.')
+        .next()
+        .unwrap_or(declaring_type)
+        != "String"
+    {
+        return None;
+    }
+    match member {
+        "_stringLength" => Some(0),
+        "_firstChar" => Some(16),
+        _ => None,
+    }
+}
+
 /// Convert a semantic error into a diagnostic stamped with class context.
 pub fn to_diagnostic(e: &SemanticError, ctx: &ScopeContext) -> Diagnostic {
     let d = Diagnostic::new(e.code, Severity::Error, e.message.clone()).in_context(ctx.clone());
@@ -2674,7 +2657,7 @@ pub fn visible_from(table: &TypeTable, access: Access, declaring: &str, viewer: 
         // privates and vice versa (`SyncStream`, nested in `Stream`,
         // calls `Stream`'s private helpers).
         Access::Private | Access::Default => {
-            declaring == viewer || same_nesting_family(table, declaring, viewer)
+            same_type_or_nesting(table, declaring, viewer)
         }
         // Protected: same class, derived classes, or the same nesting
         // family (nested types access enclosing protecteds, e.g.
@@ -2684,9 +2667,8 @@ pub fn visible_from(table: &TypeTable, access: Access, declaring: &str, viewer: 
         // protected access (`Http2Stream` nested in `Http2Connection
         // : HttpConnectionBase` reads `_pool`).
         Access::Protected => {
-            declaring == viewer
+            same_type_or_nesting(table, declaring, viewer)
                 || table.derives_from(viewer, declaring)
-                || same_nesting_family(table, declaring, viewer)
                 || nested_in_derived(table, declaring, viewer)
         }
     }
@@ -2736,26 +2718,64 @@ fn nested_in_derived(table: &TypeTable, declaring: &str, viewer: &str) -> bool {
 /// allows (a truly unrelated viewer with the same simple name is
 /// C#-illegal input anyway; qualified identity is future work).
 fn same_nesting_family(table: &TypeTable, a: &str, b: &str) -> bool {
-    let paths = |n: &str| {
-        table
-            .classes
-            .iter()
-            .filter(|c| {
-                c.name == n
-                    || c.key.path == n
-                    // Namespace-relative spellings (`WaitSubsystem.ThreadWaitInfo`
-                    // as-written inside `System.Threading`): match by
-                    // dot-boundary suffix. For simple names this selects
-                    // exactly the name-matches; for dotted names it adds
-                    // the scope-relative hits C# name lookup would find.
-                    || c.key.path.ends_with(&format!(".{n}"))
-            })
-            .map(|c| c.key.path.clone())
-            .collect::<Vec<_>>()
-    };
-    let (pa, pb) = (paths(a), paths(b));
+    let (pa, pb) = (class_paths(table, a), class_paths(table, b));
     pa.iter().any(|x| {
         pb.iter().any(|y| {
+            x == y || x.starts_with(&format!("{y}.")) || y.starts_with(&format!("{x}."))
+        })
+    })
+}
+
+/// The table entries a class name may denote, as their qualified
+/// paths. A BARE name that matches several types identifies none of
+/// them: keeping every candidate let `Inner` claim the nesting family
+/// of `A.Outer.Inner` because one candidate happened to be that path —
+/// so an unrelated `Inner` inherited access it never had. Ambiguity is
+/// not evidence; a dotted spelling is what disambiguates.
+fn class_paths(table: &TypeTable, n: &str) -> Vec<String> {
+    let hits: Vec<String> = table
+        .classes
+        .iter()
+        .filter(|c| {
+            c.name == n
+                || c.key.path == n
+                // Namespace-relative spellings
+                // (`WaitSubsystem.ThreadWaitInfo` as-written inside
+                // `System.Threading`): match by dot-boundary suffix.
+                // That is C# name lookup, which searches enclosing
+                // namespaces outward.
+                || c.key.path.ends_with(&format!(".{n}"))
+        })
+        .map(|c| c.key.path.clone())
+        .collect();
+    if !n.contains('.') && hits.len() > 1 {
+        return Vec::new();
+    }
+    hits
+}
+
+/// The last segment of a qualified path (`Ns.Foo` → `Foo`).
+fn simple_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// The declaring class and the viewer denote the SAME type, or one
+/// nests the other: C# lets a nested type read the enclosing type's
+/// private members (`Dictionary.AlternateLookup` reading
+/// `Dictionary.GetBucket`). The viewer's qualified path identifies it
+/// exactly; when a name is too ambiguous to identify a type, the
+/// simple names are compared — the answer the old name comparison
+/// gave.
+fn same_type_or_nesting(table: &TypeTable, declaring: &str, viewer: &str) -> bool {
+    if declaring == viewer {
+        return true;
+    }
+    let (d, v) = (class_paths(table, declaring), class_paths(table, viewer));
+    if d.is_empty() || v.is_empty() {
+        return simple_name(declaring) == simple_name(viewer);
+    }
+    d.iter().any(|x| {
+        v.iter().any(|y| {
             x == y || x.starts_with(&format!("{y}.")) || y.starts_with(&format!("{x}."))
         })
     })
@@ -2764,7 +2784,7 @@ fn same_nesting_family(table: &TypeTable, a: &str, b: &str) -> bool {
 /// Arity of a type spelling: number of top-level generic arguments
 /// (`WeakReference<T>` → 1, `Dictionary<K,V>` → 2, `WeakReference` → 0).
 /// Used to disambiguate same-named entries by arity (see `class_arity`).
-fn spelling_arity(spelling: &str) -> usize {
+pub(crate) fn spelling_arity(spelling: &str) -> usize {
     let Some(start) = spelling.find('<') else {
         return 0;
     };
@@ -2852,8 +2872,169 @@ impl TypeTable {
     pub fn declaring_class_of_method(&self, start: &str, name: &str) -> Option<(String, Access)> {
         self.declaring_class_of(start, name, false)
     }
+
+    /// The declaring class of `name`, walking a PRECISE owner's base
+    /// chain. Starting from a bare type spelling resolves the owner by
+    /// name first-match, so a same-named sibling could answer for it
+    /// (25 `Enumerator`s share a name); starting from the entry itself
+    /// cannot.
+    pub fn declaring_class_of_in(
+        &self,
+        owner: &ClassInfo,
+        name: &str,
+        is_field: bool,
+    ) -> Option<(String, Access)> {
+        let mut queue = vec![owner.key.path.clone()];
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(cur) = queue.pop() {
+            if seen.contains(&cur) {
+                continue;
+            }
+            seen.push(cur.clone());
+            let Some(info) = self.class(&cur) else {
+                continue;
+            };
+            if let Some((_, _, access)) = info
+                .own_members
+                .iter()
+                .find(|(n, f, _)| n == name && *f == is_field)
+            {
+                return Some((info.key.path.clone(), *access));
+            }
+            queue.extend(info.bases.iter().cloned());
+        }
+        None
+    }
 }
 
 // Keep MethodDecl import used (signatures reference it through models).
 #[allow(unused)]
 fn _witness(_: &MethodDecl) {}
+
+// ---- interface dispatch slots -------------------------------------------
+//
+// A virtual call carries one row index and the runtime reads that index
+// from the RECEIVER's row. A class's own slots are numbered base-first
+// for that class, so the same method sits at different indices in two
+// unrelated implementers; an interface call cannot use a class slot.
+// Interface members therefore get their own range ABOVE every class
+// slot, and every row is padded to that range. Both the row builder
+// (`native::ir`) and call lowering (`canonical_slot`) derive the range
+// from this one function, so they cannot drift.
+
+/// Normalized parameter spelling for slot keys: case, qualifiers,
+/// nullable/ref markers, and whitespace do not change the signature.
+pub fn normalize_param_type(s: &str) -> String {
+    let mut t = s.to_lowercase();
+    for w in ["out ", "ref ", "in ", "params "] {
+        if let Some(rest) = t.strip_prefix(w) {
+            t = rest.to_string();
+            break;
+        }
+    }
+    t.retain(|c| !c.is_whitespace());
+    t.trim_end_matches('?').trim_end_matches('&').to_string()
+}
+
+/// First slot of the interface range: one past the highest class slot.
+pub fn iface_slot_base(table: &TypeTable) -> usize {
+    table
+        .classes
+        .iter()
+        .flat_map(|c| c.methods.iter().map(|m| m.vtable_slot))
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0)
+}
+
+/// Every interface member with its stable slot, sorted by key so the
+/// numbering depends only on the declarations, not on table order.
+pub fn iface_slot_entries(table: &TypeTable) -> Vec<((String, String, String), usize)> {
+    let mut keys: Vec<(String, String, String)> = Vec::new();
+    for i in &table.interfaces {
+        for m in &i.methods {
+            let sig = m
+                .params
+                .iter()
+                .map(|p| normalize_param_type(&p.type_name))
+                .collect::<Vec<_>>()
+                .join(",");
+            let key = (i.name.clone(), m.name.clone(), sig);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.sort();
+    let base = iface_slot_base(table);
+    keys.into_iter()
+        .enumerate()
+        .map(|(i, k)| (k, base + i))
+        .collect()
+}
+
+/// Interface names reachable from `iface`, itself first, with inherited
+/// bases after it (generic arguments and qualification stripped, like
+/// member lookup elsewhere).
+fn iface_and_bases(table: &TypeTable, iface: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut queue: Vec<String> = vec![iface.to_owned()];
+    while let Some(name) = queue.pop() {
+        if out.contains(&name) {
+            continue;
+        }
+        out.push(name.clone());
+        for d in table.interfaces.iter().filter(|d| d.name == name) {
+            for b in &d.bases {
+                let mut base = b.as_str();
+                if let Some(k) = base.find('<') {
+                    base = &base[..k];
+                }
+                let simple = base.rsplit('.').next().unwrap_or(base).trim();
+                // A base declared only in a dependency is not in the
+                // table; its members are not compiled here either.
+                queue.push(simple.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// Slot for one interface member, declared on the interface or on one
+/// of its bases (`IAsyncEnumerator.DisposeAsync`-style inheritance).
+pub fn iface_slot_for(
+    table: &TypeTable,
+    iface: &str,
+    method: &str,
+    param_sig: &str,
+) -> Option<usize> {
+    let entries = iface_slot_entries(table);
+    let names = iface_and_bases(table, iface);
+    for name in &names {
+        if let Some((_, slot)) = entries
+            .iter()
+            .find(|((i, m, s), _)| i == name && m == method && s == param_sig)
+        {
+            return Some(*slot);
+        }
+    }
+    None
+}
+
+/// Slot for the only member named `method` in `iface` or its bases
+/// (used when the call-site signature cannot match a generic spelling).
+pub fn iface_slot_by_name(table: &TypeTable, iface: &str, method: &str) -> Option<usize> {
+    let entries = iface_slot_entries(table);
+    for name in iface_and_bases(table, iface) {
+        let hits: Vec<usize> = entries
+            .iter()
+            .filter(|((i, m, _), _)| i == &name && m == method)
+            .map(|(_, slot)| *slot)
+            .collect();
+        match hits.as_slice() {
+            [one] => return Some(*one),
+            _ => {}
+        }
+    }
+    None
+}

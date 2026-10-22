@@ -638,6 +638,7 @@ fn preserve_union_implicit_ctor(
             access: crate::models::ast::statement::Access::Internal,
             attrs: Vec::new(),
             generic_params: Vec::new(),
+            constraints: Vec::new(),
             ret_type: String::new(),
             name: e.name.clone(),
             params: Vec::new(),
@@ -647,6 +648,9 @@ fn preserve_union_implicit_ctor(
             }),
             span: crate::models::Span::new(0, 0),
             is_override: false,
+            is_virtual: false,
+            is_sealed: false,
+            is_hiding: false,
             is_static: false,
             is_abstract: false,
             is_partial: false,
@@ -853,12 +857,12 @@ pub(crate) fn load_project_unit_with_deps(
         }
         deps.push(dep);
     }
-    // Every failure path below must leave the vendored tree `.cs`-only:
-    // run the dependency post-hooks (which delete the materialized `.rc`
-    // files) whenever loading fails — at source collection, per-file
-    // parse, or the final scan alike. (On success the caller owns cleanup.)
-    // Note: dep pre-hooks have already run above, so `.rc` files may
-    // exist from here on; all `?` returns must go through this closure.
+    // Cleanup discipline for the dependency hooks above: whatever happens
+    // below, the post-build hooks that materialize transient sources must
+    // still run — at source collection, per-file parse, or the final scan
+    // alike. (On success the caller owns cleanup.) Pre-hooks have already
+    // run above, so materialized files may exist from here on; all `?`
+    // returns must go through this closure.
     let result = (|| -> Result<(
         CompilationUnit,
         std::collections::HashMap<TypeKey, String>,
@@ -877,17 +881,25 @@ pub(crate) fn load_project_unit_with_deps(
     if consume && project.dynamic {
         let dyn_dir = crate::extensions::install_root().join("libraries");
         for (di, dep) in deps.iter().enumerate() {
-            if let Some(frag) = dep_fragment(dep, &dyn_dir) {
-                if !invocation.quiet {
-                    eprintln!("[rubyc] consuming {}.rci instead of sources", dep.name);
+            match dep_fragment(dep, &dyn_dir) {
+                Ok(frag) => {
+                    if !invocation.quiet {
+                        eprintln!("[rubyc] consuming {}.rci instead of sources", dep.name);
+                    }
+                    consumed.insert(di);
+                    fragments.push(frag);
                 }
-                consumed.insert(di);
-                fragments.push(frag);
-            } else if !invocation.quiet {
-                eprintln!(
-                    "[rubyc] compiling {} from sources (no fresh .rci)",
-                    dep.name
-                );
+                // Compiling from sources is the correct outcome for a
+                // stale fragment — the build stays right — but the
+                // reason must not be guesswork.
+                Err(reason) => {
+                    if !invocation.quiet {
+                        eprintln!(
+                            "[rubyc] compiling {} from sources ({reason})",
+                            dep.name
+                        );
+                    }
+                }
             }
         }
         // `using`-driven discovery: a `using Ns;` with no owner among
@@ -908,6 +920,33 @@ pub(crate) fn load_project_unit_with_deps(
             match crate::native::index::ensure(&dyn_dir) {
                 Ok(index) => {
                     for ns in usings_in_files(&main_files) {
+                        // Direct namespace-to-artifact mapping first
+                        // (decision A): `using X.Y;` means
+                        // `libraries/X.Y.{so,a}` when that file exists.
+                        // The index is a fallback for assemblies installed
+                        // under a different name (CoreLib), not the
+                        // authority for a direct hit.
+                        if let Some(lib) = crate::native::index::direct_library(&ns, &dyn_dir) {
+                            if known.contains(lib.as_str()) || !added.insert(lib.clone()) {
+                                continue;
+                            }
+                            match installed_fragment(&lib, &dyn_dir) {
+                                Ok(frag) => {
+                                    if !invocation.quiet {
+                                        eprintln!(
+                                            "[rubyc] auto-linking {lib}.rci for `using {ns};`"
+                                        );
+                                    }
+                                    fragments.push(frag);
+                                }
+                                Err(reason) => {
+                                    return Err(DriverError::from_msg(format!(
+                                        "cannot use {lib} for `using {ns};`: {reason} — rebuild the library (`rubyc install libs {lib}`) so its types are readable"
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
                         let owners = index.lookup(&ns);
                         if owners.iter().any(|o| known.contains(o.as_str())) {
                             continue;
@@ -920,15 +959,27 @@ pub(crate) fn load_project_unit_with_deps(
                         match unknown.as_slice() {
                             [] => {}
                             [lib] => {
-                                if added.insert(lib.to_string())
-                                    && let Some(frag) = installed_fragment(lib, &dyn_dir)
-                                {
-                                    if !invocation.quiet {
-                                        eprintln!(
-                                            "[rubyc] auto-linking {lib}.rci for `using {ns};`"
-                                        );
+                                if added.insert(lib.to_string()) {
+                                    match installed_fragment(lib, &dyn_dir) {
+                                        Ok(frag) => {
+                                            if !invocation.quiet {
+                                                eprintln!(
+                                                    "[rubyc] auto-linking {lib}.rci for `using {ns};`"
+                                                );
+                                            }
+                                            fragments.push(frag);
+                                        }
+                                        // The library owns this namespace
+                                        // but its types cannot be read.
+                                        // Dropping the fragment makes every
+                                        // type in it unknown, which reads
+                                        // like a source bug.
+                                        Err(reason) => {
+                                            return Err(DriverError::from_msg(format!(
+                                                "cannot use {lib} for `using {ns};`: {reason} — rebuild the library (`rubyc install libs {lib}`) so its types are readable"
+                                            )));
+                                        }
                                     }
-                                    fragments.push(frag);
                                 }
                             }
                             many => {
@@ -941,8 +992,12 @@ pub(crate) fn load_project_unit_with_deps(
                     }
                 }
                 Err(e) => {
+                    // Discovery failing means every `using` in this
+                    // project silently resolves to nothing, and the
+                    // resulting unknown-name errors point at the
+                    // source instead of the missing library. Say so.
                     if !invocation.quiet {
-                        eprintln!("[rubyc] warning: skipping using-discovery ({e})");
+                        eprintln!("[rubyc] warning: `using`-discovery unavailable ({e})");
                     }
                 }
             }
@@ -1315,6 +1370,25 @@ pub(crate) fn load_project_unit_with_deps(
 
     crate::inliner::run(&mut combined);
     let diagnostics = crate::diagnostics_semantic::scan_with_fragments(&combined, &fragments);
+    // Only ERRORS stop the build. The scan also emits warnings (an
+    // ambiguous unqualified name it still resolves, W0005); treating
+    // any diagnostic as fatal failed library builds with no error line
+    // at all — the output was warnings and the status was 1.
+    {
+        let fatal = diagnostics
+            .iter()
+            .any(|d| d.severity == crate::models::Severity::Error);
+        if !fatal && !diagnostics.is_empty() {
+            eprint!(
+                "{}",
+                crate::diagnostics::render_text(&diagnostics, None, "<deps>", false)
+            );
+        }
+    }
+    let diagnostics: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| d.severity == crate::models::Severity::Error)
+        .collect();
     if diagnostics.is_empty() {
         // Cross-fragment duplicate keys (shared files claimed by two
         // consumed deps): first fragment in dep order wins, mirroring
@@ -1347,64 +1421,69 @@ pub(crate) fn load_project_unit_with_deps(
 }
 
 /// Installed fragment for a dependency, when fresh: the image (`.so`)
-/// must exist under the install dir, the fragment's lib name must
-/// match, and its source hash must equal a fresh hash of the dep's
-/// current own sources. ANY mismatch (or unreadable file) falls back
-/// to compiling from sources — stale fragments are never trusted.
-/// Returns `None` for "compile from sources". Fragment bytes come
-/// from the image's post-magic table first, then its legacy
-/// `.rubyc_types` section, then the `.rci` sidecar file.
+/// Why a fragment could not be used. Every case is reported: a
+/// fallback that cannot say WHY it fell back reads as a correct build
+/// on stale inputs.
+#[derive(Debug)]
+enum FragmentMiss {
+    /// No installed image (`.so`/`.a`) for this library.
+    NoImage,
+    /// Image present but carries no embedded type table.
+    NoEmbeddedTable,
+    /// Embedded/sidecar bytes present but do not decode as a fragment.
+    Undecodable,
+    /// Fragment decodes but belongs to a different library.
+    NameMismatch(String),
+    /// Fragment decodes but was built from different sources.
+    Stale,
+}
+
+impl std::fmt::Display for FragmentMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FragmentMiss::NoImage => write!(f, "no installed image (.so/.a)"),
+            FragmentMiss::NoEmbeddedTable => {
+                write!(f, "the image carries no embedded type table")
+            }
+            FragmentMiss::Undecodable => write!(f, "the type table does not decode"),
+            FragmentMiss::NameMismatch(who) => {
+                write!(f, "the type table belongs to '{who}'")
+            }
+            FragmentMiss::Stale => write!(f, "the type table is stale (sources changed)"),
+        }
+    }
+}
+
+/// Fragment for a `ruby_c` dependency: the image must exist under the
+/// install dir, the fragment's lib name must match, and its source
+/// hash must equal a fresh hash of the dep's current own sources. ANY
+/// mismatch falls back to compiling from sources — stale fragments are
+/// never trusted — and the reason is returned so the caller can say
+/// which it was.
 fn dep_fragment(
     dep: &crate::project::Project,
     dyn_dir: &std::path::Path,
-) -> Option<crate::native::rci::Fragment> {
-    let so_path = dyn_dir.join(format!("{}.so", dep.name));
+) -> std::result::Result<crate::native::rci::Fragment, FragmentMiss> {
     let rci_path = dyn_dir.join(format!("{}.rci", dep.name));
-    if !so_path.is_file() {
-        return None;
-    }
-    if let Ok(image) = std::fs::read(&so_path) {
-        let embedded = crate::native::embedded::table_bytes(&image)
-            .or_else(|| crate::native::embedded::section_bytes(&image));
-        if let Some(bytes) = embedded
-            && let Ok(frag) = crate::native::rci::decode(bytes)
-            && frag.lib_name == dep.name
-            && frag.source_hash == rci_source_hash(dep)
-        {
-            return Some(frag);
-        }
-    }
-    let bytes = std::fs::read(&rci_path).ok()?;
-    let frag = crate::native::rci::decode(&bytes).ok()?;
-    if frag.lib_name != dep.name {
-        return None;
-    }
-    if frag.source_hash != rci_source_hash(dep) {
-        return None;
-    }
-    Some(frag)
-}
-
-/// Fragment for a `using`-discovered library: same shape as
-/// [`dep_fragment`], but there is no local project (no sources to hash
-/// against), so installed fragments are trusted as-written — the
-/// post-build hook installs them next to their image, and a missing
-/// image (`.so` or `.a`) vetoes the fragment. Post-magic table wins
-/// over the legacy section over the sidecar file; name mismatch vetoes
-/// either way.
-fn installed_fragment(lib: &str, lib_dir: &std::path::Path) -> Option<crate::native::rci::Fragment> {
-    let check = |frag: crate::native::rci::Fragment| (frag.lib_name == lib).then_some(frag);
+    // Installed images in preference order: shared, top-level archive,
+    // then the canonical static install directory (`libraries/static`).
+    let candidates = [
+        (dyn_dir.join(format!("{}.so", dep.name)), false),
+        (dyn_dir.join(format!("{}.a", dep.name)), true),
+        (dyn_dir.join("static").join(format!("{}.a", dep.name)), true),
+    ];
     let mut image_seen = false;
-    for ext in ["so", "a"] {
-        let image_path = lib_dir.join(format!("{lib}.{ext}"));
-        if !image_path.is_file() {
+    let mut worst: Option<FragmentMiss> = None;
+    for (path, is_archive) in candidates {
+        if !path.is_file() {
             continue;
         }
         image_seen = true;
-        let Ok(image) = std::fs::read(&image_path) else {
+        let Ok(image) = std::fs::read(&path) else {
+            worst = Some(FragmentMiss::NoEmbeddedTable);
             continue;
         };
-        let embedded = if ext == "a" {
+        let embedded = if is_archive {
             crate::native::arlib::read(&image)
                 .ok()
                 .and_then(|members| {
@@ -1415,19 +1494,99 @@ fn installed_fragment(lib: &str, lib_dir: &std::path::Path) -> Option<crate::nat
                 .or_else(|| crate::native::embedded::section_bytes(&image))
                 .map(|b| b.to_vec())
         };
-        if let Some(bytes) = embedded
-            && let Ok(frag) = crate::native::rci::decode(&bytes)
-            && let Some(frag) = check(frag)
-        {
-            return Some(frag);
+        let Some(bytes) = embedded else {
+            worst = Some(FragmentMiss::NoEmbeddedTable);
+            continue;
+        };
+        match crate::native::rci::decode(&bytes) {
+            Ok(frag) if frag.lib_name != dep.name => {
+                worst = Some(FragmentMiss::NameMismatch(frag.lib_name))
+            }
+            Ok(frag) if frag.source_hash != rci_source_hash(dep) => {
+                worst = Some(FragmentMiss::Stale)
+            }
+            Ok(frag) => return Ok(frag),
+            Err(_) => worst = Some(FragmentMiss::Undecodable),
         }
     }
     if !image_seen {
-        return None;
+        return Err(FragmentMiss::NoImage);
     }
-    let bytes = std::fs::read(lib_dir.join(format!("{lib}.rci"))).ok()?;
-    let frag = crate::native::rci::decode(&bytes).ok()?;
-    check(frag)
+    // Sidecar fallback: it may be newer than the image.
+    match std::fs::read(&rci_path) {
+        Err(_) => Err(worst.unwrap_or(FragmentMiss::NoImage)),
+        Ok(bytes) => match crate::native::rci::decode(&bytes) {
+            Err(_) => Err(worst.unwrap_or(FragmentMiss::Undecodable)),
+            Ok(frag) if frag.lib_name != dep.name => {
+                Err(FragmentMiss::NameMismatch(frag.lib_name))
+            }
+            Ok(frag) if frag.source_hash != rci_source_hash(dep) => Err(FragmentMiss::Stale),
+            Ok(frag) => Ok(frag),
+        },
+    }
+}
+
+/// Fragment for a `using`-discovered library: same shape as
+/// [`dep_fragment`], but there is no local project (no sources to hash
+/// against), so installed fragments are trusted as-written — the
+/// post-build hook installs them next to their image, and a missing
+/// image (`.so` or `.a`) vetoes the fragment. Post-magic table wins
+/// over the legacy section over the sidecar file; name mismatch vetoes
+/// either way.
+fn installed_fragment(
+    lib: &str,
+    lib_dir: &std::path::Path,
+) -> std::result::Result<crate::native::rci::Fragment, FragmentMiss> {
+    let mut image_seen = false;
+    let mut worst: Option<FragmentMiss> = None;
+    let candidates = [
+        (lib_dir.join(format!("{lib}.so")), false),
+        (lib_dir.join(format!("{lib}.a")), true),
+        (lib_dir.join("static").join(format!("{lib}.a")), true),
+    ];
+    for (image_path, is_archive) in candidates {
+        if !image_path.is_file() {
+            continue;
+        }
+        image_seen = true;
+        let Ok(image) = std::fs::read(&image_path) else {
+            worst = Some(FragmentMiss::NoEmbeddedTable);
+            continue;
+        };
+        let embedded = if is_archive {
+            crate::native::arlib::read(&image)
+                .ok()
+                .and_then(|members| {
+                    crate::native::embedded::archive_member(&members).map(|b| b.to_vec())
+                })
+        } else {
+            crate::native::embedded::table_bytes(&image)
+                .or_else(|| crate::native::embedded::section_bytes(&image))
+                .map(|b| b.to_vec())
+        };
+        let Some(bytes) = embedded else {
+            worst = Some(FragmentMiss::NoEmbeddedTable);
+            continue;
+        };
+        match crate::native::rci::decode(&bytes) {
+            Ok(frag) if frag.lib_name == lib => return Ok(frag),
+            Ok(frag) => worst = Some(FragmentMiss::NameMismatch(frag.lib_name)),
+            Err(_) => worst = Some(FragmentMiss::Undecodable),
+        }
+    }
+    if !image_seen {
+        return Err(FragmentMiss::NoImage);
+    }
+    match std::fs::read(lib_dir.join(format!("{lib}.rci"))) {
+        Err(_) => Err(worst.unwrap_or(FragmentMiss::NoImage)),
+        Ok(bytes) => match crate::native::rci::decode(&bytes) {
+            Ok(frag) if frag.lib_name == lib => Ok(frag),
+            Ok(frag) => Err(FragmentMiss::NameMismatch(frag.lib_name)),
+            // The sidecar's own verdict outranks the image's: a
+            // corrupt sidecar is the thing to go fix.
+            Err(_) => Err(FragmentMiss::Undecodable),
+        },
+    }
 }
 
 /// Plain `using Ns;` namespaces across source files (lexical scan —
@@ -1850,7 +2009,7 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
         if !project_io.rci_only {
             project_io.rci_only = project.rci_only;
         }
-        let project_invocation = Invocation {
+        let mut project_invocation = Invocation {
             command: invocation.command,
             io: project_io,
             verbose: invocation.verbose,
@@ -1860,6 +2019,20 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
             lint_overrides: invocation.lint_overrides.clone(),
             defines: invocation.defines.clone(),
         };
+        // `[libs] external` names project-relative native libraries for
+        // `[LibraryImport]` stubs. Explicit CLI `--lib` entries stay first
+        // (a flag wins over the file); both reach the linker in one list.
+        {
+            let base = project_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            for lib in &project.external_libs {
+                project_invocation
+                    .io
+                    .libs
+                    .push(base.join(lib).display().to_string());
+            }
+        }
         // Honor the project's [target] output (default: exe), unless
         // `-O` overrides it (e.g. `install libs --format` rebuilds one
         // tree in another format without editing 181 project files).
@@ -1867,6 +2040,16 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
             .io
             .out_format
             .unwrap_or(OutFormat::from_str(&project.output_format).unwrap_or(OutFormat::Exe));
+        // Dynamic linking consumes installed dependency images; neither an
+        // executable nor an archive has a loader for them. Reject the
+        // combination instead of silently emitting a static image whose
+        // consumed imports were never linked.
+        if project.dynamic && out_format != OutFormat::Shared {
+            return Err(DriverError::from_msg(format!(
+                "{}: [build] dynamic = true needs output = \"shared\" (executables and archives link dependency sources, not installed images)",
+                project.name
+            )));
+        }
         if out_format == OutFormat::Shared {
             // Dependency fragments for dynamic-linking consume (also
             // reused for the `.rci` emit below so the sidecar mirrors
@@ -1945,15 +2128,8 @@ fn build_project(path: &str, invocation: &Invocation, pipeline: &NativePipeline)
                 emit_rci_sidecar(&out_dir, &project, &unit, &type_owners, &preloaded);
             }
         } else if out_format == OutFormat::Static {
-            // Static archives merge dependency sources (the `dynamic`
-            // fragment path stays shared-only: a dynamic member has no
-            // home image to copy-link from in a `.a`).
-            if project.dynamic {
-                return Err(DriverError::from_msg(format!(
-                    "{}: [build] dynamic = true needs output = \"shared\" (static archives link dependency sources, not installed images)",
-                    project.name
-                )));
-            }
+            // Static archives merge dependency sources; the `dynamic`
+            // combination was rejected above, before either branch.
             // Embedded by default: second `<name>.rci` archive member instead
             // of a sidecar file (no archive under `--rci-only`, so
             // nothing to embed into there). Analysis failure falls back
@@ -2157,15 +2333,6 @@ fn cmd_build(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()> {
     let io = &invocation.io;
     if invocation.verbose {
         eprintln!("{}", crate::t!("rubyc.main.build.stage1"));
-    }
-    // Pulled-tree builds fetch first: a requested `.rcp`/`.rcs` under
-    // `dotnet-runtime/` that is not on disk means the tree was never
-    // pulled (ordinary typos elsewhere never trigger this).
-    if let Some(f) = io.file.as_deref() {
-        if f.contains("dotnet-runtime") && !std::path::Path::new(f).is_file() {
-            eprintln!("[rubyc] build: {f} is missing from the pulled tree; pulling first ...");
-            run_pull_script()?;
-        }
     }
     // Project/solution files take the project system path.
     if let Some(f) = io.file.as_deref() {
@@ -2598,7 +2765,6 @@ fn cmd_install(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()>
     }
     let lib_name = format!("lib{}.so", name.replace('-', "_"));
     let link_path = plugin_dir.join(&lib_name);
-    // Remove existing link/file if present.
     let _ = std::fs::remove_file(&link_path);
     #[cfg(unix)]
     std::os::unix::fs::symlink(&source_path, &link_path).map_err(|e| {
@@ -2629,103 +2795,6 @@ fn cmd_install(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()>
         crate::tf!("rubyc.cli.installed", name.to_string())
     );
     Ok(())
-}
-
-/// Walk upward from the current directory for `rel` (a `/`-separated
-/// path like `dotnet-runtime/src/libraries/dotnet-runtime.rcs`).
-/// Returns the first hit, or `None` past the filesystem root.
-fn find_upward(rel: &str) -> Option<std::path::PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join(rel);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
-/// Ensure the pulled runtime tree, returning its solution path.
-/// Missing tree (or missing solution): run `tools/pull-dotnet.sh`
-/// from the enclosing checkout (found upward, like the tree) with
-/// inherited stdio so pull progress is visible; a missing script or
-/// a still-missing tree afterwards is a loud error (offline with
-/// nothing cached cannot proceed). Present tree: best-effort
-/// update check — behind upstream runs the pull script, network
-/// failure warns and proceeds with the local tree.
-fn ensure_pulled_tree() -> Result<std::path::PathBuf> {
-    let rel = "dotnet-runtime/src/libraries/dotnet-runtime.rcs";
-    if let Some(rcs) = find_upward(rel) {
-        if rcs.is_file() {
-            if tree_is_behind(&rcs) {
-                run_pull_script()?;
-            }
-            return Ok(rcs);
-        }
-    }
-    run_pull_script()?;
-    find_upward(rel).filter(|p| p.is_file()).ok_or_else(|| {
-        DriverError::Message(
-            "install libs: pull script ran but produced no dotnet-runtime/src/libraries/dotnet-runtime.rcs".into(),
-        )
-    })
-}
-
-/// Run `tools/pull-dotnet.sh` from the enclosing checkout (found
-/// upward, like the tree) with inherited stdio so pull progress is
-/// visible. Missing script or failing run is a loud error: offline
-/// with nothing cached cannot proceed.
-fn run_pull_script() -> Result<()> {
-    let script = find_upward("tools/pull-dotnet.sh").ok_or_else(|| {
-        DriverError::Message(
-            "install libs: no pulled runtime tree found (no dotnet-runtime/src/libraries/dotnet-runtime.rcs upward) and no tools/pull-dotnet.sh to fetch it; clone the rubyc repo or run from inside it".into(),
-        )
-    })?;
-    eprintln!("[rubyc] install libs: pulling dotnet/runtime ...");
-    let status = std::process::Command::new("bash")
-        .arg(&script)
-        .status()
-        .map_err(|e| {
-            DriverError::Message(format!("install libs: cannot run pull script: {e}"))
-        })?;
-    if !status.success() {
-        return Err(DriverError::Message(
-            "install libs: pull script failed (offline?); nothing cached to fall back on".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Whether a present tree is behind upstream (local HEAD vs
-/// `ls-remote`). Non-git trees and network failures report false
-/// with a warning and proceed on the local tree.
-fn tree_is_behind(rcs: &std::path::Path) -> bool {
-    let root = rcs
-        .ancestors()
-        .find(|a| a.join(".git").is_dir() && a.ends_with("dotnet-runtime"));
-    let Some(root) = root else { return false };
-    let local = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(root)
-        .args(["rev-parse", "HEAD"])
-        .output();
-    let remote = std::process::Command::new("git")
-        .args(["ls-remote", "origin", "HEAD"])
-        .current_dir(root)
-        .output();
-    match (local, remote) {
-        (Ok(l), Ok(r)) if l.status.success() && r.status.success() => {
-            let l = String::from_utf8_lossy(&l.stdout);
-            let r = String::from_utf8_lossy(&r.stdout);
-            !l.trim().is_empty() && !r.is_empty() && !r.starts_with(l.trim())
-        }
-        _ => {
-            eprintln!("[rubyc] install libs: update check skipped (offline or unreachable); using the local tree");
-            false
-        }
-    }
 }
 
 /// Whether an installed image is fresh for a project: the image
@@ -2773,13 +2842,14 @@ fn lib_is_fresh(
     frag.lib_name == project.name && frag.source_hash == rci_source_hash(&project)
 }
 
-/// `install libs [--format shared|static|both]`: ensure the pulled
-/// runtime tree, rebuild stale libraries, install via the post-build
-/// hooks. Each stage skips fresh work: pull runs only when the tree is
-/// missing or behind upstream, and only libraries whose installed
-/// image predates their inputs rebuild. `--format both` runs a shared
-/// pass then a static pass (dynamic projects skip the static pass —
-/// their members have no home image to copy-link from).
+/// `install libs [--format shared|static|both]`: rebuild stale
+/// libraries of the nearest project/solution and install via the
+/// post-build hooks. The target is discovered exactly like
+/// `rubyc build` (nearest `.rcs`/`.rcp` walking up from the working
+/// directory); each stage skips fresh work — only libraries whose
+/// installed image predates their inputs rebuild. `--format both`
+/// runs a shared pass then a static pass (dynamic projects skip the
+/// static pass — their members have no home image to copy-link from).
 fn cmd_install_libs(invocation: &Invocation, pipeline: &NativePipeline) -> Result<()> {
     let formats: Vec<bool> = match invocation.io.install_format.as_deref().unwrap_or("shared") {
         "shared" => vec![false],
@@ -2791,9 +2861,25 @@ fn cmd_install_libs(invocation: &Invocation, pipeline: &NativePipeline) -> Resul
             )));
         }
     };
-    let rcs = ensure_pulled_tree()?;
-    let solution = crate::project::Solution::load(&rcs).map_err(DriverError::from_msg)?;
-    let projects = solution.project_files().map_err(DriverError::from_msg)?;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let target = crate::project::Project::find_nearest(&cwd).ok_or_else(|| {
+        DriverError::Message(format!(
+            "install libs: no .rcs/.rcp found upward from {}; run it from a project or solution directory",
+            cwd.display()
+        ))
+    })?;
+    let projects: Vec<std::path::PathBuf> = if target
+        .extension()
+        .and_then(|e| e.to_str())
+        == Some("rcs")
+    {
+        crate::project::Solution::load(&target)
+            .map_err(DriverError::from_msg)?
+            .project_files()
+            .map_err(DriverError::from_msg)?
+    } else {
+        vec![target]
+    };
     let dyn_dir = crate::extensions::install_root().join("libraries");
     for want_static in formats {
         let mut stale = Vec::new();
@@ -2844,6 +2930,18 @@ fn cmd_install_libs(invocation: &Invocation, pipeline: &NativePipeline) -> Resul
         } else {
             build_projects_parallel(&stale, &pass, &pipeline, jobs)?;
         }
+    }
+    // Keep `using`-discovery in step with the installed tree. New artifacts
+    // are caught by the mtime check, but a library removed since the last
+    // install leaves rows behind; ensure() detects that and regenerates.
+    if dyn_dir.is_dir()
+        && let Err(e) = crate::native::index::ensure(&dyn_dir)
+        && !invocation.quiet
+    {
+        eprintln!(
+            "[rubyc] warning: cannot refresh {}: {e}",
+            dyn_dir.join(crate::native::index::INDEX_FILE).display()
+        );
     }
     Ok(())
 }
@@ -3349,8 +3447,23 @@ fn into_unit(input: Input, inv: &Invocation) -> Result<CompilationUnit> {
                     });
                 }
             };
-            if !pre.diagnostics.is_empty() {
-                eprint!("{}", render_diags(&pre.diagnostics, Some(text), inv));
+            // Preprocessor diagnostics carry severities. An `#error` (or an
+            // unknown directive, a malformed `#macro`, an unbalanced
+            // `#if`) must stop the build — printing it to stderr and
+            // carrying on made every preprocessor error advisory.
+            let (fatal, notes): (Vec<_>, Vec<_>) = pre
+                .diagnostics
+                .iter()
+                .cloned()
+                .partition(|d| d.severity == crate::models::Severity::Error);
+            if !notes.is_empty() {
+                eprint!("{}", render_diags(&notes, Some(text), inv));
+            }
+            if !fatal.is_empty() {
+                return Err(DriverError::Diagnostics {
+                    diags: fatal.into_iter().map(|d| d.in_file(name.clone())).collect(),
+                    source: text.clone(),
+                });
             }
             let source = crate::preprocessor::expand_macros(pre.source, &pre.macros);
             (source, pre.assembly_blocks)
@@ -3365,14 +3478,39 @@ fn into_unit(input: Input, inv: &Invocation) -> Result<CompilationUnit> {
             // Unknown-name / unknown-function gate runs on clean parses
             // too, before codegen ever sees them.
             let found = crate::diagnostics_semantic::scan(&unit);
-            if found.is_empty() {
-                Ok(unit)
-            } else {
-                Err(DriverError::Diagnostics {
-                    diags: found.into_iter().map(|d| d.in_file(name.clone())).collect(),
-                    source,
-                })
+            // The scan reports WARNINGS too (an ambiguous unqualified
+            // name it still resolves, W0005). Only ERRORS block the
+            // build: treating any diagnostic as fatal made a warning
+            // fail the compile with no error line at all, because the
+            // rendered output was warnings and the exit status was 1.
+            let fatal = found
+                .iter()
+                .any(|d| d.severity == crate::models::Severity::Error);
+            if !fatal {
+                if !found.is_empty() {
+                    let stamped: Vec<crate::models::Diagnostic> = found
+                        .into_iter()
+                        .map(|d| d.in_file(name.clone()))
+                        .collect();
+                    eprint!(
+                        "{}",
+                        crate::diagnostics::render_text(
+                            &stamped,
+                            Some(&source),
+                            &name,
+                            false,
+                        )
+                    );
+                }
+                return Ok(unit);
             }
+            Err(DriverError::Diagnostics {
+                diags: found
+                    .into_iter()
+                    .map(|d| d.in_file(name.clone()))
+                    .collect(),
+                source,
+            })
         }
         Err(errors) => {
             let mut stamped: Vec<Diagnostic> = errors
@@ -3577,3 +3715,126 @@ impl DriverError {
 }
 
 
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rubyc-frag-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn encode(lib: &str, hash: u64) -> Vec<u8> {
+        let unit = crate::parser::parse(&format!(
+            "namespace t; public class {lib} {{ public int M() {{ return 1; }} }}"
+        ))
+        .unwrap();
+        crate::native::rci::encode(lib, hash, &[], &[], &[])
+    }
+
+    #[test]
+    fn installed_fragment_reports_no_image() {
+        let dir = tmpdir("noimg");
+        let miss = installed_fragment("Missing", &dir).err().expect("no image");
+        assert!(
+            matches!(miss, FragmentMiss::NoImage),
+            "expected NoImage, got {miss}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installed_fragment_reports_undecodable() {
+        let dir = tmpdir("bad");
+        std::fs::write(dir.join("Bad.rci"), b"not a fragment").unwrap();
+        std::fs::write(dir.join("Bad.so"), b"").unwrap();
+        let miss = installed_fragment("Bad", &dir).err().expect("undecodable");
+        assert!(
+            matches!(miss, FragmentMiss::Undecodable),
+            "expected Undecodable, got {miss}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installed_fragment_reports_name_mismatch() {
+        let dir = tmpdir("mismatch");
+        std::fs::write(dir.join("Want.rci"), encode("Other", 7)).unwrap();
+        std::fs::write(dir.join("Want.so"), b"").unwrap();
+        let miss = installed_fragment("Want", &dir).err().expect("name mismatch");
+        assert!(
+            matches!(miss, FragmentMiss::NameMismatch(ref w) if w == "Other"),
+            "expected NameMismatch, got {miss}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installed_fragment_reads_a_valid_sidecar() {
+        let dir = tmpdir("good");
+        std::fs::write(dir.join("Good.rci"), encode("Good", 7)).unwrap();
+        std::fs::write(dir.join("Good.so"), b"").unwrap();
+        let frag = installed_fragment("Good", &dir).expect("sidecar carries the types");
+        assert_eq!(frag.lib_name, "Good");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dep_fragment_distinguishes_missing_image_from_stale() {
+        let dir = tmpdir("dep");
+        std::fs::write(dir.join("Dep.so"), b"").unwrap();
+        std::fs::write(dir.join("Dep.rci"), encode("Dep", 12345)).unwrap();
+        // An empty `Dep.so` carries no table, so the sidecar answers.
+        // Whatever it yields must be one of the named reasons — never a
+        // bare "no fragment".
+        let project = crate::project::Project::parse(
+            "[meta]\nname = \"dep\"\n",
+            Path::new("dep.rcp"),
+        )
+        .unwrap();
+        match dep_fragment(&project, &dir) {
+            Ok(_) => {}
+            Err(miss) => {
+                let text = miss.to_string();
+                assert!(
+                    !text.is_empty() && text != "no fragment",
+                    "a miss must say why: {text}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installed_fragment_reads_the_static_install_dir() {
+        let dir = tmpdir("staticfrag");
+        std::fs::create_dir_all(dir.join("static")).unwrap();
+        std::fs::write(dir.join("static").join("Static.a"), b"").unwrap();
+        std::fs::write(dir.join("Static.rci"), encode("Static", 1)).unwrap();
+        let frag = installed_fragment("Static", &dir)
+            .expect("the static archive makes the sidecar eligible");
+        assert_eq!(frag.lib_name, "Static");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dep_fragment_sees_the_static_install_dir() {
+        let dir = tmpdir("staticdep");
+        std::fs::create_dir_all(dir.join("static")).unwrap();
+        let project =
+            crate::project::Project::parse("[meta]\nname = \"dep\"\n", Path::new("dep.rcp")).unwrap();
+        let name = project.name.clone();
+        std::fs::write(dir.join("static").join(format!("{name}.a")), b"").unwrap();
+        match dep_fragment(&project, &dir) {
+            Err(FragmentMiss::NoImage) => {
+                panic!("libraries/static/{name}.a must count as an installed image")
+            }
+            _ => {}
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -59,7 +59,7 @@ class Maker {
     internal static int Create(int x, int y = 0) { return x; }
 }
 class User {
-    int M() { return Maker.Create(1, parameterIndex: 2); }
+    int M() { return Maker.Create(1, y: 2); }
     int main() { return 0; }
 }"#,
     );
@@ -153,16 +153,17 @@ class C {
 }
 
 #[test]
-fn event_invoke_ignores_instance_property_decoy() {
-    // `Changed?.Invoke(sender, e)` where `Changed` is an event: the
-    // `using static` bare-name fallback must only consider STATIC
-    // members — an unrelated instance property with the same name
-    // (`ZipArchive.Changed`, type `ChangeState`) must not uniquely
-    // resolve the receiver (was: "'ChangeState' has no member
-    // 'Invoke' [in ComposablePartCatalogCollection.OnChanged]").
-    // Event invocations lower as silent placeholders (established
-    // behavior); only the mistype is fixed here.
-    let r = lower(
+fn event_invoke_does_not_hijack_a_same_named_property() {
+    // `Changed?.Invoke(sender, e)` where `Changed` is an EVENT, with an
+    // unrelated instance property of the same name on another class
+    // (`ZipArchive.Changed`). The `using static` bare-name fallback only
+    // considers STATIC members, so the property must not hijack the
+    // receiver.
+    //
+    // The event itself now has real storage (a subscriber-list head), so
+    // the read lowers; this test pins that the receiver resolution still
+    // picks the EVENT.
+    let p = lower(
         r#"namespace t;
 class State { }
 class Holder {
@@ -174,8 +175,13 @@ class C {
     void M(object sender, object e) { Changed?.Invoke(sender, e); }
     int Main() { return 0; }
 }"#,
+    )
+    .expect("event invocation lowers");
+    let text = format!("{p:?}");
+    assert!(
+        text.contains("Alloc") && text.contains("CallFnAddr"),
+        "the invocation walks the subscriber list and calls through the          delegate address: {text}"
     );
-    assert!(r.is_ok(), "event invoke past instance decoy should lower: {r:?}");
 }
 
 #[test]
@@ -574,12 +580,11 @@ class C {
 
 #[test]
 fn base_chain_method_group_arg_placeholders() {
-    // `: base(x, cb)` with a bare (lowercase) method name as a delegate
-    // argument (`FileSystemSecurity` passing `_HandleErrorCode`):
-    // method groups have no value to evaluate — pass zero (was: "use
-    // of undeclared variable '_HandleErrorCode'"). Lowercase matters:
-    // uppercase-starting unknowns already placeholder via the
-    // type-name rule; lowercase ones hit the undeclared error.
+    // `: base(x, cb)` with a bare method name as a delegate argument.
+    // It used to pass zero, a value that looks callable and does nothing;
+    // it is now reported where the value is needed. The
+    // lowercase detail still matters for RESOLUTION (uppercase-starting
+    // unknowns go down the type-name rule), not for the outcome.
     let r = lower(
         r#"namespace t;
 class Base {
@@ -591,14 +596,16 @@ class Derived : Base {
     int Main() { return 0; }
 }"#,
     );
-    assert!(r.is_ok(), "method-group base arg should lower: {r:?}");
+    assert!(r.is_ok(), "a method-group base argument must lower: {r:?}");
 }
 
 #[test]
-fn regular_call_method_group_arg_placeholders() {
-    // `M(cb)` with a bare (lowercase) method name as a delegate
-    // argument: same fallback as the base-chain case — method groups
-    // eval to zero.
+fn method_group_argument_is_reported_not_placed_with_zero() {
+    // `M(cb)` with a bare method name as a delegate argument used to eval
+    // to zero — a value that looks callable and does nothing. Invocation
+    // was already an honest error; the VALUE is now reported at the
+    // point it is needed, so the gap surfaces where it starts rather than
+    // at the first call.
     let r = lower(
         r#"namespace t;
 class C {
@@ -608,7 +615,10 @@ class C {
     int Main() { return 0; }
 }"#,
     );
-    assert!(r.is_ok(), "method-group call arg should lower: {r:?}");
+    // Method groups now build the same delegate object a lambda does
+    // (2.3d): the name resolves to a function index and the object holds
+    // its address, so the argument has a real value.
+    assert!(r.is_ok(), "a method-group argument must lower: {r:?}");
 }
 
 #[test]
@@ -830,10 +840,12 @@ class C {
 
 
 #[test]
-fn thread_init_interception_builds_hollow_object() {
-    // `Thread.InitializeCurrentThread()` (bare call inside `Thread`)
-    // must lower to an inline hollow object (Alloc + vtable), never a
-    // call into the real body (whose QCalls have no smoke shims).
+fn thread_initialize_current_thread_is_not_intercepted() {
+    // Guard-rail cleanup: `Thread.InitializeCurrentThread()`
+    // used to be intercepted into an inline "hollow Thread" object
+    // (Alloc + vtable, ctor body never run) so CoreCLR's QCalls would
+    // not have to resolve. That fabrication is gone — the call now
+    // lowers as an ordinary call and resolves (or fails) honestly.
     let p = lower(
         r#"namespace t;
 class Thread {
@@ -866,18 +878,18 @@ class Thread {
     assert!(
         instrs.iter().any(|i| matches!(
             i,
-            crate::native::ir::Instr::Alloc { .. }
-        )),
-        "must allocate the hollow Thread (no inline happened?)"
-    );
-    assert!(
-        !instrs.iter().any(|i| matches!(
-            i,
             crate::native::ir::Instr::CallFn { .. }
                 | crate::native::ir::Instr::CallStatic { .. }
                 | crate::native::ir::Instr::CallVirt { .. }
         )),
-        "getter must not call anywhere (real body would hit missing QCalls)"
+        "InitializeCurrentThread must lower as a real call (no interception)"
+    );
+    assert!(
+        !instrs.iter().any(|i| matches!(
+            i,
+            crate::native::ir::Instr::Alloc { .. }
+        )),
+        "no hollow Thread object may be fabricated for the call"
     );
 }
 
@@ -1275,7 +1287,7 @@ fn scratch_real_decimal_round_methods() {
         )
     })
     .expect("Decimal.cs readable from test CWD");
-    let unit = crate::parser::parse(&src).unwrap();
+    let unit = parse_except_checked(&src);
     let mut found = Vec::new();
     for ns in unit.namespaces.iter() {
         for m in ns.members.iter() {
@@ -1303,6 +1315,28 @@ fn scratch_real_decimal_round_methods() {
             .any(|(_, b)| *b)),
         "ref twin must parse with byref flag (saw {found:?})"
     );
+}
+
+/// Parse `src`, tolerating ONLY the two known Phase 2 gaps this file
+/// walks into: checked arithmetic (E0035) and type patterns (E0036).
+/// Anything else must still be a clean parse, so these probes keep
+/// their value instead of turning into "the .NET file fails to parse".
+fn parse_except_checked(src: &str) -> crate::models::CompilationUnit {
+    let (unit, errors) = crate::parser::parse_lenient(src);
+    let other: Vec<String> = errors
+        .iter()
+        // E0035 checked arithmetic (2.7.11) and E0036 type patterns
+        // (2.7.12): both are known Phase 2 gaps that System.Decimal
+        // walks into. Everything else must still parse clean.
+        .filter(|e| e.code != "E0035" && e.code != "E0036")
+        .map(|e| format!("{}: {}", e.code, e.message))
+        .collect();
+    assert!(
+        other.is_empty(),
+        "unexpected parse errors (checked-arithmetic ones are expected): {}",
+        other.join("; ")
+    );
+    unit
 }
 
 #[test]
@@ -1333,7 +1367,7 @@ fn scratch_real_decimal_preprocessed() {
     .collect::<Vec<_>>();
     let pre = crate::preprocessor::preprocess(&src, &defines, "Decimal.rc").unwrap();
     let expanded = crate::preprocessor::expand_macros(pre.source, &pre.macros);
-    let unit = crate::parser::parse(&expanded).unwrap();
+    let unit = parse_except_checked(&expanded);
     let mut found = Vec::new();
     for ns in unit.namespaces.iter() {
         for m in ns.members.iter() {
@@ -1411,7 +1445,7 @@ interface IUnaryPlusOperators<A, B> { }
 }"#;
     // Merge by concatenating sources (usings dupes OK).
     let merged_src = format!("{stubs}\n{src}");
-    let unit = crate::parser::parse(&merged_src).unwrap();
+    let unit = parse_except_checked(&merged_src);
     let table = crate::native::semantic::analyze_with_owners(&unit, &Default::default())
         .unwrap_or_else(|errs| panic!("semantic analyzes Decimal.cs: {errs:?}"));
     let mut rounds = Vec::new();
@@ -1644,14 +1678,12 @@ class C {
 }
 
 #[test]
-fn eventsource_isenabled_folds_false_no_call() {
-    // No-ETW configuration: static images ship no event pipeline, so
-    // `EventSource.IsEnabled()` is always false (real .NET without
-    // listeners also yields false and skips the block). The call must
-    // fold to zero with no dispatch: `ArrayPoolEventSource.Log` builds
-    // a broken singleton (vtable slot holds -1) and the pooled-Rent
-    // tail calls `log.IsEnabled()` on it (file-I/O segfault).
-    // The body returns true so any real dispatch is observable.
+fn eventsource_isenabled_is_not_folded() {
+    // Guard-rail cleanup: `IsEnabled()` on any
+    // EventSource-named type used to fold to false without dispatch
+    // (a no-ETW configuration hack for the .NET event pipeline). The
+    // fold is gone: the call dispatches like any other method call,
+    // and a user type merely NAMED ...EventSource is not special-cased.
     let p = lower(
         r#"namespace t;
 class ScratchPoolEventSource {
@@ -1677,7 +1709,10 @@ class C {
             )
         })
         .count();
-    assert_eq!(calls, 0, "EventSource.IsEnabled must fold (calls={calls})");
+    assert!(
+        calls > 0,
+        "IsEnabled must dispatch normally (no name-keyed fold)"
+    );
 }
 
 #[test]
@@ -1713,56 +1748,28 @@ class C {
 }
 
 #[test]
-fn objectheader_acquire_folds_no_call() {
-    // No-header configuration: our objects carry no CoreCLR header
-    // word (`[obj-4]` is foreign memory), so the thin-lock protocol
-    // cannot run — `AcquireThinLock` reads garbage/faults there
-    // (file-I/O segfault via `Partition.TryPush`). Static exes are
-    // single-threaded, so acquisition is vacuous: fold to void with
-    // no dispatch. The body returns a constant so any real dispatch
-    // is observable.
+fn objectheader_named_methods_dispatch_normally() {
+    // No band-aid: the thin-lock primitives are ordinary methods. A user
+    // type whose name merely CONTAINS `ObjectHeader` must dispatch to its
+    // own bodies — the compiler folds nothing, fabricates no lock state,
+    // and returns no success-shaped constants. (The old fold made these
+    // calls vanish, which hid missing lock support behind a fake success.)
     let p = lower(
         r#"namespace t;
 static class ScratchObjectHeader {
     public static void AcquireThinLock(object o) { return; }
-}
-class C {
-    static int Main() { object o = new object(); ScratchObjectHeader.AcquireThinLock(o); return 0; }
-}"#,
-    )
-    .unwrap();
-    let calls = p
-        .functions
-        .iter()
-        .filter(|f| !f.name.contains("@start"))
-        .flat_map(|f| f.blocks.iter())
-        .flat_map(|b| b.instrs.iter())
-        .filter(|i| {
-            matches!(
-                i,
-                crate::native::ir::Instr::CallVirt { .. }
-                    | crate::native::ir::Instr::CallStatic { .. }
-                    | crate::native::ir::Instr::CallFn { .. }
-            )
-        })
-        .count();
-    assert_eq!(calls, 0, "ObjectHeader.AcquireThinLock must fold (calls={calls})");
-}
-
-#[test]
-fn objectheader_tryacquire_folds_true_no_call() {
-    // Same family: `TryAcquireThinLock` always succeeds uncontended.
-    // Folds to true (const 1) with no dispatch, both arities.
-    let p = lower(
-        r#"namespace t;
-static class ScratchObjectHeader {
     public static bool TryAcquireThinLock(object o) { return false; }
     public static bool TryAcquireThinLock(object o, int ms) { return false; }
+    public static void Release(object o) { return; }
+    public static bool IsAcquired(object o) { return false; }
 }
 class C {
     static int Main(object o) {
-        bool a = ScratchObjectHeader.TryAcquireThinLock(o);
-        bool b = ScratchObjectHeader.TryAcquireThinLock(o, 0);
+        ScratchObjectHeader.AcquireThinLock(o);
+        ScratchObjectHeader.TryAcquireThinLock(o);
+        ScratchObjectHeader.TryAcquireThinLock(o, 0);
+        ScratchObjectHeader.Release(o);
+        ScratchObjectHeader.IsAcquired(o);
         return 0;
     }
 }"#,
@@ -1783,44 +1790,10 @@ class C {
             )
         })
         .count();
-    assert_eq!(calls, 0, "ObjectHeader.TryAcquireThinLock must fold (calls={calls})");
-}
-
-#[test]
-fn monitor_enter_delegates_to_folded_objectheader() {
-    // `Monitor.Enter` bodies delegate to `ObjectHeader`; with the
-    // fold, running the delegating body must emit no call to the
-    // header primitive — only Main→Enter itself. (Stubs stand in
-    // for the framework pair with the real shapes.)
-    let p = lower(
-        r#"namespace t;
-static class ScratchObjectHeader {
-    public static void AcquireThinLock(object o) { return; }
-}
-static class ScratchMonitor {
-    public static void Enter(object o) { ScratchObjectHeader.AcquireThinLock(o); }
-}
-class C {
-    static int Main() { ScratchMonitor.Enter(new object()); return 0; }
-}"#,
-    )
-    .unwrap();
-    let calls = p
-        .functions
-        .iter()
-        .filter(|f| !f.name.contains("@start"))
-        .flat_map(|f| f.blocks.iter())
-        .flat_map(|b| b.instrs.iter())
-        .filter(|i| {
-            matches!(
-                i,
-                crate::native::ir::Instr::CallVirt { .. }
-                    | crate::native::ir::Instr::CallStatic { .. }
-                    | crate::native::ir::Instr::CallFn { .. }
-            )
-        })
-        .count();
-    assert_eq!(calls, 1, "only Main→Enter may dispatch (calls={calls})");
+    assert!(
+        calls >= 5,
+        "every ScratchObjectHeader call must dispatch normally (saw {calls})"
+    );
 }
 
 #[test]
@@ -1908,4 +1881,53 @@ class Program {
         Some(2),
         "@start must call instance Main(string[]) with [obj, argv]"
     );
+}
+
+#[test]
+fn type_parameter_indexer_binds_through_its_constraint() {
+    // C# resolves `v[0]` on a type parameter through the parameter's
+    // constraint, so the element type is the constraint's indexer type
+    // (`where T : Vec<double>` -> the element is a double). Without the
+    // constraint the element typed as `object` and an overload taking
+    // it (`Dbl.Cos(v[0])`) did not resolve.
+    let r = lower(
+        r#"namespace t;
+struct Vec<TElement> {
+    private TElement[] _a;
+    public Vec(TElement[] a) { _a = a; }
+    public TElement this[int i] { get { return _a[i]; } }
+}
+class Dbl { public static double Cos(double x) => x; }
+class C {
+    static double Use<T>(T v) where T : Vec<double> {
+        return Dbl.Cos(v[0]);
+    }
+    static int Main() { return 0; }
+}"#,
+    );
+    assert!(r.is_ok(), "a constrained indexer must resolve: {r:?}");
+}
+
+#[test]
+fn type_parameter_indexer_binds_through_an_interface_constraint() {
+    // The constraint names an INTERFACE, whose indexer the interface
+    // parser used to discard — so `v[0]` had no element type and an
+    // overload taking it did not resolve.
+    let r = lower(
+        r#"namespace t;
+interface IVec<TElement> { TElement this[int i] { get; } }
+struct Vec<TElement> : IVec<TElement> {
+    private TElement[] _a;
+    public Vec(TElement[] a) { _a = a; }
+    public TElement this[int i] { get { return _a[i]; } }
+}
+class Dbl { public static double Cos(double x) => x; }
+class C {
+    static double Use<T>(T v) where T : IVec<double> {
+        return Dbl.Cos(v[0]);
+    }
+    static int Main() { return 0; }
+}"#,
+    );
+    assert!(r.is_ok(), "an interface constraint must bind the indexer: {r:?}");
 }

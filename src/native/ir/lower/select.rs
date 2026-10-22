@@ -52,6 +52,132 @@ pub(super) fn materialize_defaults(
     }
 }
 
+/// The value of parameter `i`'s default, materialized in the caller's
+/// frame. A parameter without a default is zero (`default(T)`).
+pub(super) fn default_arg_value(i: usize, mi: &MethodInfo, b: &mut Body<'_>) -> VReg {
+    let mut argv: Vec<VReg> = Vec::new();
+    let defaults = mi
+        .param_defaults
+        .get(i..i + 1)
+        .unwrap_or(&mi.param_defaults[mi.param_defaults.len()..]);
+    materialize_defaults(&mut argv, defaults, b);
+    argv.into_iter()
+        .next()
+        .unwrap_or_else(|| b.const_i64(0))
+}
+
+/// Bind a call's arguments to a method's parameters (C# named
+/// arguments). Returns, per parameter, the index of the WRITTEN
+/// argument that binds it; `None` means the parameter takes its
+/// default. A named argument must name a real parameter and must not
+/// repeat one; a positional argument takes the parameter at its own
+/// position (C#: a positional argument may follow a named one only in
+/// its correct position).
+fn bind_named_args(
+    args: &[Expr],
+    mi: &MethodInfo,
+) -> Result<Vec<Option<usize>>, LowerError> {
+    let n = mi.param_types.len();
+    let mut slots: Vec<Option<usize>> = vec![None; n];
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            Expr::NamedArg { name, .. } => {
+                let Some(p) = mi.param_names.iter().position(|nm| nm == name) else {
+                    return Err(LowerError::UnsupportedConstruct(format!(
+                        "no parameter named `{name}`"
+                    )));
+                };
+                if slots[p].is_some() {
+                    return Err(LowerError::UnsupportedConstruct(format!(
+                        "parameter `{name}` is given more than one value"
+                    )));
+                }
+                slots[p] = Some(i);
+            }
+            _ => {
+                if i >= n {
+                    if mi.has_params {
+                        // The `params` tail takes the extra arguments.
+                        break;
+                    }
+                    return Err(LowerError::UnsupportedConstruct(format!(
+                        "this method takes {n} argument(s)"
+                    )));
+                }
+                if slots[i].is_some() {
+                    return Err(LowerError::UnsupportedConstruct(
+                        "a positional argument cannot follow a named argument".to_owned(),
+                    ));
+                }
+                slots[i] = Some(i);
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// A parameter's default value as an EXPRESSION, so a skipped
+/// parameter can keep its place in the rewritten argument list
+/// (`F(b: 7)` binds b, and a takes its default).
+fn default_expr(mi: &MethodInfo, p: usize) -> Expr {
+    match mi.param_defaults.get(p).and_then(|d| d.clone()) {
+        Some(ConstValue::Int(v)) => Expr::Literal(crate::models::Literal::Int(v)),
+        Some(ConstValue::Float(f)) => Expr::Literal(crate::models::Literal::Float(f)),
+        Some(ConstValue::Str(s)) => Expr::Literal(crate::models::Literal::Str(s)),
+        // An absent default (or a null default) is the zero handle,
+        // matching `materialize_defaults`.
+        Some(ConstValue::Null) | None => Expr::Literal(crate::models::Literal::Int(0)),
+    }
+}
+
+/// Rewrite a call's argument list into parameter order (C# named
+/// arguments). `None` when the call has no named argument — the list
+/// is already positional, and the common path stays allocation-free.
+pub(super) fn positional_args(
+    args: &[Expr],
+    mi: &MethodInfo,
+) -> Result<Option<Vec<Expr>>, LowerError> {
+    if !args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+        return Ok(None);
+    }
+    let slots = bind_named_args(args, mi)?;
+    let mut out: Vec<Expr> = Vec::with_capacity(mi.param_types.len());
+    for (p, slot) in slots.iter().enumerate() {
+        match slot {
+            Some(i) => match &args[*i] {
+                Expr::NamedArg { value, .. } => out.push((**value).clone()),
+                other => out.push(other.clone()),
+            },
+            // The parameter takes its default: materialize it in
+            // place, so a later named argument keeps its own position.
+            None => out.push(default_expr(mi, p)),
+        }
+    }
+    // The `params` tail: the arguments past the parameter list.
+    if mi.has_params {
+        for (i, a) in args.iter().enumerate() {
+            if i >= mi.param_types.len() && !matches!(a, Expr::NamedArg { .. }) {
+                out.push(a.clone());
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// The permutation that puts a call's EVALUATED arguments into
+/// parameter order: per parameter, the index of the written argument
+/// that binds it (`None` = the parameter takes its default). `None`
+/// when the call has no named argument.
+pub(super) fn named_arg_order(
+    args: &[Expr],
+    mi: &MethodInfo,
+) -> Result<Option<Vec<Option<usize>>>, LowerError> {
+    if !args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+        return Ok(None);
+    }
+    Ok(Some(bind_named_args(args, mi)?))
+}
+
 /// Implicit numeric conversion table (C# widening conversions over
 /// canonical spellings), plus two deliberate latitudes:
 ///
@@ -71,6 +197,27 @@ pub(super) fn materialize_defaults(
 /// inapplicable, so overload ranking elects exact matches instead
 /// of silently reinterpreting (`FromHours(24.0)` picked `(int)`
 /// over `(double)` and hashed the bit pattern).
+/// The implicit conversion between two type spellings: identity, the
+/// widening numeric conversions, and a class to one of its bases or
+/// interfaces. The type inference's best-common-type rule needs
+/// exactly this relation.
+pub(super) fn converts_to(ctx: &Ctx<'_>, from: &str, to: &str) -> bool {
+    let (f, t) = (base_type_name(from), base_type_name(to));
+    if f == t {
+        return true;
+    }
+    if implicit_numeric(&f, &t) {
+        return true;
+    }
+    if ctx.table.derives_from(&f, &t) || ctx.table.interface_derives_from(&f, &t) {
+        return true;
+    }
+    ctx.table.classes.iter().any(|c| {
+        (c.name == f || c.key.path == from)
+            && c.interfaces.iter().any(|(n, _)| n == &t)
+    })
+}
+
 fn implicit_numeric(a: &str, p: &str) -> bool {
     if a == p {
         return true;
@@ -173,6 +320,32 @@ pub(super) fn compat_score(arg: &str, param: &str, table: &TypeTable, vars: &[St
         || param == "Object?"
     {
         return Some(2);
+    }
+    // The literal ZERO converts to any numeric or enum target (C#'s
+    // implicit constant-zero conversion) and to `object` (boxing), but
+    // never to a reference type.
+    if arg == "int-zero" {
+        if param == "object" || param == "Object" || param == "dynamic" {
+            return Some(2);
+        }
+        let p_base = base_type_name(param);
+        const NUMERIC: &[&str] = &[
+            "sbyte", "byte", "short", "ushort", "int", "uint", "long", "ulong", "nint", "nuint",
+            "char", "float", "double", "decimal", "bool", "SByte", "Byte", "Int16", "UInt16",
+            "Int32", "UInt32", "Int64", "UInt64", "IntPtr", "UIntPtr", "Char", "Single", "Double",
+            "Decimal", "Boolean",
+        ];
+        if NUMERIC.contains(&p_base.as_str()) {
+            return Some(1);
+        }
+        if table
+            .classes
+            .iter()
+            .any(|c| c.is_enum && (c.name == p_base || c.key.path == param))
+        {
+            return Some(1);
+        }
+        return None;
     }
     // Bare `default` ARG converts to every parameter type (C#:
     // `M(default)` means `M(default(T))` for whatever `T` the
@@ -538,7 +711,17 @@ pub(crate) fn score_call(
         for (i, a) in arg_types.iter().enumerate().take(fixed - 1) {
             sum += compat_score(a, &params[i + recv_skip], table, vars)?;
         }
-        let elem = base_type_name(&params[params.len() - 1]);
+        // The expanded form's element type: a `params ReadOnlySpan<T>`
+        // (or `Span<T>`) parameter takes values of `T`, an array
+        // parameter takes values of its element type.
+        let last = &params[params.len() - 1];
+        let elem = match super::span::span_view(last) {
+            Some((_, inner)) => inner,
+            None => match last.strip_suffix("[]") {
+                Some(inner) => inner.to_owned(),
+                None => base_type_name(last),
+            },
+        };
         let rest = &arg_types[fixed - 1..];
         if rest.len() == 1
             && let Some(s) = compat_score(
@@ -793,7 +976,51 @@ pub(super) fn legacy_pick<'m>(
 /// types) must hit their exact entry — a simple-name filter alone
 /// misses them.
 pub(super) fn entries_for<'t>(table: &'t TypeTable, type_name: &str) -> Vec<&'t ClassInfo> {
+    // The scan is O(classes) per call, and it is asked for on every
+    // call site and every member read: at CoreLib scale that was the
+    // dominant cost (a `Stream` method took 4 seconds). The answer
+    // depends only on the unit, so it is cached per class name for the
+    // run.
+    let table_addr = table as *const _ as usize;
+    let cached = ENTRIES_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let fresh = !matches!(cache.as_ref(), Some((t, _)) if *t == table_addr);
+        if fresh {
+            *cache = Some((table_addr, std::collections::HashMap::new()));
+        }
+        cache.as_ref().unwrap().1.get(type_name).cloned()
+    });
+    if let Some(indices) = cached {
+        return indices.iter().map(|i| &table.classes[*i]).collect();
+    }
+    let (result, indices) = entries_for_uncached(table, type_name);
+    ENTRIES_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some((_, map)) = cache.as_mut() {
+            map.insert(type_name.to_owned(), indices.clone());
+        }
+    });
+    result
+}
+
+thread_local! {
+    /// (table address, type name) -> indices into the class table.
+    static ENTRIES_CACHE: std::cell::RefCell<
+        Option<(usize, std::collections::HashMap<String, Vec<usize>>)>,
+    > = std::cell::RefCell::new(None);
+}
+
+/// Drop the entries cache: called once per lowering entry.
+pub(crate) fn clear_entries_cache() {
+    ENTRIES_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+fn entries_for_uncached<'t>(
+    table: &'t TypeTable,
+    type_name: &str,
+) -> (Vec<&'t ClassInfo>, Vec<usize>) {
     let mut out: Vec<&ClassInfo> = Vec::new();
+    let mut idxs: Vec<usize> = Vec::new();
     // Generic-instantiation spellings (`new TupleSlim<A,B,C>`,
     // `Task<VoidTaskResult>`) match same-bare-named entries: strip
     // generic arguments BEFORE the simple-name split (type args
@@ -818,6 +1045,7 @@ pub(super) fn entries_for<'t>(table: &'t TypeTable, type_name: &str) -> Vec<&'t 
             c.key == info.key && c.owner == info.owner && c.name == info.name
         }) {
             seen.push(idx);
+            idxs.push(idx);
             out.push(info);
         }
     }
@@ -829,6 +1057,7 @@ pub(super) fn entries_for<'t>(table: &'t TypeTable, type_name: &str) -> Vec<&'t 
     {
         if !seen.contains(&idx) {
             seen.push(idx);
+            idxs.push(idx);
             out.push(c);
         }
     }
@@ -839,6 +1068,11 @@ pub(super) fn entries_for<'t>(table: &'t TypeTable, type_name: &str) -> Vec<&'t 
     if out.iter().any(|c| c.is_enum) {
         if let Some(e) = table.class("System.Enum") {
             if !out.iter().any(|c| c.key == e.key) {
+                if let Some(idx) = table.classes.iter().position(|c| {
+                    c.key == e.key && c.owner == e.owner && c.name == e.name
+                }) {
+                    idxs.push(idx);
+                }
                 out.push(e);
             }
         }
@@ -851,11 +1085,16 @@ pub(super) fn entries_for<'t>(table: &'t TypeTable, type_name: &str) -> Vec<&'t 
     for target in table.alias_targets(type_name) {
         if let Some(info) = table.class(target) {
             if !out.iter().any(|e| e.key == info.key) {
+                if let Some(idx) = table.classes.iter().position(|c| {
+                    c.key == info.key && c.owner == info.owner && c.name == info.name
+                }) {
+                    idxs.push(idx);
+                }
                 out.push(info);
             }
         }
     }
-    out
+    (out, idxs)
 }
 /// Unified overload selection across same-named entries
 /// (generic-arity siblings, nesting collisions): per-entry
@@ -1180,7 +1419,7 @@ pub(super) fn explicit_arity_of(type_args: &[String]) -> Option<usize> {
     }
 }
 
-pub(super) fn explicit_type_args(name: &str) -> Vec<String> {
+pub(crate) fn explicit_type_args(name: &str) -> Vec<String> {
     let Some(start) = name.find('<') else {
         return Vec::new();
     };
@@ -1334,6 +1573,20 @@ pub(super) fn definition_entry<'t>(
     }
     table.class(&base)
 }
+/// The table entry a receiver's spelling names. A generic
+/// INSTANTIATION (`Box<int>`) is not an entry of its own — the
+/// definition (`Box`) is, and it owns the fields and methods the
+/// instantiation has. Without the fallback a write through a
+/// generic-typed receiver found no field at all and was dropped.
+pub(super) fn member_entry<'t>(
+    table: &'t TypeTable,
+    spelling: &str,
+) -> Option<&'t ClassInfo> {
+    table
+        .class(spelling)
+        .or_else(|| definition_entry(table, spelling))
+}
+
 /// Member-lookup entry for a nullability-annotated receiver
 /// (`string?`): C# nullability is an annotation, not a different
 /// type, so members resolve through the base type. Reference bases
@@ -1596,16 +1849,6 @@ pub(crate) fn is_method_group(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> bool 
 /// field, property, outer static, or type). Used where only the name
 /// is at hand (e.g. the undeclared-variable fallback in `eval`).
 pub(crate) fn is_method_group_name(name: &str, b: &Body<'_>, ctx: &Ctx<'_>) -> bool {
-    // TEMP-MGNAMEDBG. Removed before close.
-    if std::env::var("RUBYC_MGDBG").is_ok() && (name == "Foo" || name == "CompletionSentinel") {
-        let in_scope = b.scopes.lookup(name).is_some();
-        let cur = ctx.table.class(ctx.current_class);
-        let has_method = cur.is_some_and(|info| info.method(name).is_some());
-        eprintln!(
-            "[rubyc] TEMP-MGNAMEDBG name={name} class={} in_scope={in_scope} has_method={has_method}",
-            ctx.current_class
-        );
-    }
     if b.scopes.lookup(name).is_some() {
         return false;
     }
@@ -1697,6 +1940,8 @@ mod tests {
         use crate::native::semantic::TypeKey;
         let table = TypeTable {
             classes: vec![ClassInfo {
+                is_record: false,
+                type_arg_index: Vec::new(),
                 name: "Dup".to_owned(),
                 key: TypeKey::new("Sys.Dup", 0),
                 bases: Vec::new(),

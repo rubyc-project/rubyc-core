@@ -504,3 +504,13 @@ fn index_assign_keeps_simple_assign_shape() {
     assert!(decoded.structural_eq(&unit));
     assert_eq!(decoded.to_bytecode(), bytes);
 }
+
+#[test]
+fn char_literals_survive_bytecode_round_trip() {
+    // Without a CHAR tag a char literal decoded as an integer and
+    // `var c = 'A'` lost its type across `compile -O bytecode`.
+    let unit = parser::parse("class C { int Main() { var c = 'A'; return c; } }").unwrap();
+    let bytes = unit.to_bytecode();
+    let decoded = decode(&bytes).expect("char literal decodes");
+    assert!(decoded.structural_eq(&unit), "char literal changed type");
+}

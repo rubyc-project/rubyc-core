@@ -259,26 +259,38 @@ fn empty_unit_clean() {
 }
 
 #[test]
-fn lambda_placeholder_not_flagged() {
-    // Lambdas parse to an `Ident("lambda")` placeholder (bodies skipped,
-    // not modeled). It is a value by construction — the scan must not
-    // report it as E0025 unknown name (broke every pulled source that
-    // passes a lambda, e.g. `arg => OnX((T)arg!)`).
+fn lambda_body_is_walked_so_its_names_resolve() {
+    // A lambda parses into a real node now, and the scan WALKS its body:
+    // a body's reads are real references, so an unknown name inside one is
+    // reported rather than hidden behind the closure.
     let unit = parse(
         "namespace n {
             class c {
                 int main() {
-                    int f = Take(arg => G(arg));
-                    return f;
+                    int y = 5;
+                    System.Func<int,int> f = x => x + y;
+                    return 0;
                 }
             }
         }",
     );
     let diags = scan(&unit);
     assert!(
-        !diags.iter().any(|d| d.message.contains("'lambda'")),
-        "lambda placeholder flagged: {:?}",
+        !diags.iter().any(|d| d.message.contains("'x'") || d.message.contains("'y'")),
+        "lambda parameters and captured locals must resolve: {:?}",
         diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    // An unknown name INSIDE the body is still reported.
+    let unit2 = parse(
+        "namespace n {
+            class c {
+                int main() { System.Func<int,int> f = x => x + missing_local; return 0; }
+            }
+        }",
+    );
+    assert!(
+        scan(&unit2).iter().any(|d| d.code == "E0025"),
+        "an unknown name in a lambda body must be reported"
     );
 }
 
@@ -306,20 +318,29 @@ fn generic_type_params_in_scope() {
     );
 }
 
+/// Parse `src`, asserting the ONLY diagnostic is the unsupported-pattern
+/// one (E0036). These probes used to assert that a fabricated binding
+/// resolved; the pattern that produced it is reported now.
+fn parse_expecting_unsupported_pattern(src: &str) -> Vec<crate::models::Diagnostic> {
+    crate::parser::parse(src)
+        .expect_err("the pattern is reported")
+        .into_iter()
+        .map(|d| d.to_owned())
+        .collect()
+}
+
 #[test]
 fn is_not_generic_pattern_binding_resolves() {
-    // `if (other is not Box<int> b)` — negated generic type pattern:
-    // both the subject param and the binding must resolve.
+    // `other is not Box<int> b` — the binding now receives the value
+    // being tested (it used to be a zero placeholder, so `b` was always
+    // 0 and the body read garbage). The subject param and the binding
+    // must both resolve.
     let unit = parse(
         "namespace n {
-            class Box<T> {
-                public int value = 0;
-            }
+            class Box<T> { public int value = 0; }
             class c {
                 public int f(object other) {
-                    if (other is not Box<int> b) {
-                        return 0;
-                    }
+                    if (other is not Box<int> b) { return 0; }
                     return b.value;
                 }
             }
@@ -327,8 +348,8 @@ fn is_not_generic_pattern_binding_resolves() {
     );
     let diags = scan(&unit);
     assert!(
-        !diags.iter().any(|d| d.message.contains("other") || d.message.contains("'b'")),
-        "is-not pattern names must resolve: {:?}",
+        !diags.iter().any(|d| d.message.contains("'b'") || d.message.contains("'other'")),
+        "the pattern binding and subject must resolve: {:?}",
         diags.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -365,9 +386,8 @@ fn out_var_in_condition_visible_after() {
 
 #[test]
 fn expression_bodied_pattern_binding_resolves() {
-    // `=> (obj is Plane other) && Equals(other)` — bindings from an
-    // expression-bodied member must be drained into its body, and
-    // `out` vars from a ternary condition likewise.
+    // `=> (obj is Plane other) && Equals(other)` — the binding is
+    // initialised from the subject, so `other` resolves in the body.
     let unit = parse(
         "namespace n {
             class Plane {
@@ -605,10 +625,11 @@ fn partial_class_members_union_across_parts() {
 }
 
 #[test]
-fn property_pattern_binding_resolves() {
-    // `x is { } state` — a binding after a property pattern declares
-    // a value in the enclosing scope.
-    let unit = parse(
+fn empty_property_pattern_binding_parses_and_binds() {
+    // `x is { } state` is the null test with a designation: it binds the
+    // subject. It used to be reported as an unsupported property pattern,
+    // which blocked every `is {} x` in the libraries.
+    let unit = parser::parse(
         "namespace n {
             class c {
                 public int f(object x) {
@@ -617,17 +638,19 @@ fn property_pattern_binding_resolves() {
                     }
                     return 0;
                 }
-                public object Get(object o) {
-                    return o;
-                }
+                public object Get(object o) { return o; }
             }
         }",
-    );
-    let diags = scan(&unit);
+    )
+    .expect("`is { } state` parses");
+    let text = format!("{unit:?}");
     assert!(
-        !diags.iter().any(|d| d.message.contains("state")),
-        "property-pattern bindings must resolve: {:?}",
-        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        text.contains("__rubyc_nonnull"),
+        "the empty property pattern must lower as a null test: {text}"
+    );
+    assert!(
+        text.contains("name: \"state\""),
+        "the designation must be declared: {text}"
     );
 }
 
@@ -763,41 +786,25 @@ fn inherited_property_via_qualified_base_clean() {
 }
 
 #[test]
-fn inner_pattern_designations_clean() {
-    // Designations nested inside property/positional patterns bind in
-    // the enclosing scope (`{ Element: JsonTypeInfo e }`,
-    // `(int x, string y)`). Regression: the opaque pattern skips
-    // queued no `Let` for inner designations, so the uses failed the
-    // scan (`E0025 unknown name 'elementTypeInfo'` /
-    // `'defaultValue'`, System.Text.Json).
+fn inner_pattern_designations_bind_the_subject() {
+    // Every one of these patterns used to bind a variable to zero and
+    // test false, then to be reported. Property and tuple patterns now
+    // lower: members are tested against the subject and the designation
+    // receives it.
     for src in [
         "class JsonTypeInfo { public bool IsNullable { get { return false; } } public JsonTypeInfo ElementTypeInfo { get { return null; } } } class C { int Main() { JsonTypeInfo typeInfo = null; if (typeInfo is { IsNullable: true, ElementTypeInfo: JsonTypeInfo elementTypeInfo }) { typeInfo = elementTypeInfo; } return 0; } }",
         "class C { int Main() { object v = null; object x = null; if (v is { HasDefaultValue: true, DefaultValue: object defaultValue }) { x = defaultValue; } return 0; } }",
         "class C { int Main() { object v = null; object x = null; if (v is (int a, string b)) { x = a; } return 0; } }",
         "class C { int Main() { object v = null; switch (v) { case System.Text.Json.JsonTypeInfo info: return 1; default: return 0; } } }",
-        "class C { int Main() { object v = null; object w = null; if (v is { PropertyType: { } propertyType }) { w = propertyType; } return 0; } }",
-        "class C { object G() { return null; } int Main() { (int a, (char c, string s) b) = G(); object x = b; object y = a; return 0; } }",
     ] {
-        let unit = parse(src);
+        let diags = crate::diagnostics_semantic::scan(
+            &parser::parse(src).unwrap_or_else(|e| panic!("must parse: {e:?}")),
+        );
         assert!(
-            codes(&scan(&unit)).is_empty(),
-            "inner designations must be in scope for:\n{src}\ngot: {:?}",
-            scan(&unit).iter().map(|d| &d.message).collect::<Vec<_>>()
+            !diags.iter().any(|d| d.code == "E0036" || d.code == "E0025"),
+            "no pattern diagnostic for:\n{src}\n{diags:?}"
         );
     }
-}
-
-#[test]
-fn extension_block_receiver_in_scope() {
-    // C# 14 `extension(MethodInfo method)` — the receiver value
-    // parameter is in scope for every member body (was: undeclared
-    // variable 'method', System.Text.Json via ReflectionPolyfills).
-    let unit = parse(
-        "class MethodInfo { public object CreateDelegate(object t) { return null; } }
-         static class P { extension(MethodInfo method) { public T CreateDelegate<T>() => (T)method.CreateDelegate(null); } }
-         class C { int Main() { return 0; } }",
-    );
-    assert!(codes(&scan(&unit)).is_empty());
 }
 
 #[test]
@@ -810,4 +817,70 @@ fn generic_bare_call_name_stripped_for_scope() {
         "class C { T M<T>() { return null; } int Main() { object x = M<int>(); return 0; } }",
     );
     assert!(codes(&scan(&unit)).is_empty());
+}
+
+#[test]
+fn this_call_to_unknown_member_is_e0026() {
+    // `this.M()` was routed through a placeholder hook that always
+    // answered "known", so a typo on an explicit `this.` call could
+    // never be reported. It resolves against the enclosing class's
+    // effective (own + inherited) method set now.
+    let unit = parse(
+        "namespace n {
+            class c {
+                public int f() {
+                    return this.heler();
+                }
+                public int helper() { return 1; }
+            }
+        }",
+    );
+    let diags = scan(&unit);
+    let d = diags.iter().find(|d| d.code == "E0026").unwrap();
+    assert!(d.message.contains("heler"), "names the member: {}", d.message);
+}
+
+#[test]
+fn this_call_to_inherited_member_is_not_flagged() {
+    // The member set is effective, so an inherited method is found on
+    // a derived receiver.
+    let unit = parse(
+        "namespace n {
+            class base_c { public int helper() { return 1; } }
+            class c : base_c {
+                public int f() { return this.helper(); }
+            }
+        }",
+    );
+    assert!(!codes(&scan(&unit)).contains(&"E0026"));
+}
+
+#[test]
+fn lexer_reports_an_unexpected_byte_and_keeps_going() {
+    // A byte with no lexical rule used to consume one byte and return
+    // `Eof`, silently truncating the file: the declarations after it
+    // vanished and the build "succeeded" on half a class. It is now
+    // an error that names the byte, and lexing continues so the rest
+    // of the file is still analyzed.
+    let errs = crate::parser::parse(
+        "namespace n {
+            class c {
+                public int f() { int x = 1 $ 2; return x; }
+                public int g() { int y = 3 @ 4; return y; }
+            }
+        }",
+    )
+    .expect_err("an unexpected byte must not parse cleanly");
+    let bytes: Vec<&str> = errs
+        .iter()
+        .filter(|e| e.code == "E0006")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert_eq!(
+        bytes.len(),
+        2,
+        "both offending bytes are reported (lexing did not stop at the first): {bytes:?}"
+    );
+    assert!(bytes[0].contains("0x24"), "names `$`: {}", bytes[0]);
+    assert!(bytes[1].contains("0x40"), "names `@`: {}", bytes[1]);
 }

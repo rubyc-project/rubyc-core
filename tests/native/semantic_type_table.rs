@@ -11,6 +11,8 @@ fn table() -> TypeTable {
         delegates: vec![],
         classes: vec![
             ClassInfo {
+                is_record: false,
+                type_arg_index: Vec::new(),
                 name: "Animal".into(),
                 key: TypeKey::new("Animal", 0),
                 bases: vec![],
@@ -28,6 +30,7 @@ fn table() -> TypeTable {
                 static_fields: vec![],
                 const_fields: vec![],
                 methods: vec![MethodInfo {
+                    param_names: vec![],
                     name: "Speak".into(),
                     ret_type: "void".into(),
                     param_types: vec![],
@@ -56,6 +59,8 @@ fn table() -> TypeTable {
                 owner: String::new(),
             },
             ClassInfo {
+                is_record: false,
+                type_arg_index: Vec::new(),
                 name: "Dog".into(),
                 key: TypeKey::new("Dog", 0),
                 bases: vec!["Animal".into()],
@@ -63,6 +68,7 @@ fn table() -> TypeTable {
                 static_fields: vec![],
                 const_fields: vec![],
                 methods: vec![MethodInfo {
+                    param_names: vec![],
                     name: "Speak".into(),
                     ret_type: "void".into(),
                     param_types: vec![],
@@ -88,6 +94,8 @@ fn table() -> TypeTable {
                 owner: String::new(),
             },
             ClassInfo {
+                is_record: false,
+                type_arg_index: Vec::new(),
                 name: "Stranger".into(),
                 key: TypeKey::new("Stranger", 0),
                 bases: vec![],
@@ -294,9 +302,18 @@ class ConcurrentDictionary {
             &table,
             crate::models::Access::Private,
             "ConcurrentDictionary",
-            "AlternateLookup"
+            "ConcurrentDictionary.AlternateLookup"
         ),
         "expected nesting family across same-named entries"
+    );
+    assert!(
+        !crate::native::semantic::visible_from(
+            &table,
+            crate::models::Access::Private,
+            "ConcurrentDictionary",
+            "AlternateLookup"
+        ),
+        "a bare name that matches several types identifies none of them"
     );
     assert!(
         !crate::native::semantic::visible_from(
@@ -1552,8 +1569,9 @@ fn abstract_properties_declare_no_backing_storage() {
     assert!(prop.is_abstract, "Flag recorded abstract");
     let after = entry.field("After").expect("After field present");
     assert_eq!(
-        after.offset_slots, 2,
-        "first real field keeps slot 2, got {}",
+        after.offset_slots, 3,
+        "first real field keeps slot 3 (after the vtable, the refcount and \
+         the runtime type), got {}",
         after.offset_slots
     );
 }

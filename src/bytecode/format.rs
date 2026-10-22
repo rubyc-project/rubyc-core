@@ -20,7 +20,9 @@
 /// v10: `PROPERTY` flags carry `is_abstract` (no storage for abstract
 /// accessors — previously indistinguishable from auto-properties).
 /// v11: `FIELD` carries `is_byref` (`ref T` slots hold addresses).
-pub const FORMAT_VERSION: u16 = 11;
+/// v12: `CHAR` expression tag for character literals (previously they
+///      decoded as integers, so `var c = 'A'` lost the `char` type).
+pub const FORMAT_VERSION: u16 = 15;
 
 /// Node tags. One byte per node, children follow recursively.
 ///
@@ -100,6 +102,8 @@ pub mod tag {
     pub const AWAIT: u8 = 0x2D;
     /// `float`/`double` literal — bits(u64) of the `f64` value.
     pub const FLOAT: u8 = 0x2E;
+    /// `char` literal — the UTF-16 code unit (u32).
+    pub const CHAR: u8 = 0x40;
     /// `$"..."` interpolated string — count(u32) of parts; each part is a
     /// kind byte (0 = text `str`, 1 = hole `expr`).
     pub const INTERP_STRING: u8 = 0x2F;
@@ -107,6 +111,14 @@ pub mod tag {
     pub const POST_INC: u8 = 0x30;
     /// `target--` — target(expr). Yields the old value.
     pub const POST_DEC: u8 = 0x31;
+    /// A lambda. The bytecode model does not carry closures, so this tag
+    /// exists to make the gap EXPLICIT: encoding writes it and decoding
+    /// REJECTS it, rather than the encoder picking a shape that decodes to
+    /// a different expression (which is how a lambda would silently become
+    /// something else on a round-trip).
+    pub const LAMBDA: u8 = 0x3E;
+    /// `checked(expr)` overflow-control wrapper.
+    pub const CHECKED: u8 = 0x3F;
     /// Simple assignment expression `target = value`:
     /// target(expr), value(expr). Distinct from `ASSIGN_COMPLEX`
     /// (`lhs op= rhs` shape with complex-LHS lowering).
@@ -179,5 +191,7 @@ pub mod tag {
         /// `fixed` statement — u32(n) + (string(type), string(name),
         /// byte(has-init) + expr?) each, then block(body).
         pub const FIXED: u8 = 0x3D;
+        /// `checked { ... }` — block(body).
+        pub const CHECKED_BLOCK: u8 = 0x3E;
     }
 }

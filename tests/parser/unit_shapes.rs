@@ -1049,15 +1049,23 @@ fn switch_arm_trailing_out_lets_ignored() {
 }
 
 #[test]
-fn is_pattern_sizeof_operands_parse() {
-    // `is sizeof(char) or sizeof(byte)` — `sizeof`/`typeof`/`nameof`
-    // in `is`-patterns consume name + balanced parens as one unit.
+fn is_pattern_sizeof_operands_parse_as_constants() {
+    // `is sizeof(char) or sizeof(byte)` — `sizeof`/`typeof`/`nameof` in
+    // pattern position are CONSTANT patterns (the two values are
+    // compared), not type tests. They used to be reported; now they
+    // parse into the ordinary call node so the same lowering answers
+    // them.
     for src in [
         r#"class C { Main() { Debug.Assert(sizeof(TChar) is sizeof(char) or sizeof(byte)); return 0; } }"#,
         r#"class C { Main() { if (x is typeof(int)) { return 1; } return 0; } }"#,
     ] {
-        parser::parse(src)
-            .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
+        let unit = parser::parse(src)
+            .unwrap_or_else(|e| panic!("constant pattern must parse: {src}\n{e:?}"));
+        let text = format!("{unit:?}");
+        assert!(
+            text.contains("callee: \"sizeof\"") || text.contains("callee: \"typeof\""),
+            "the pattern must be a constant call: {text}"
+        );
     }
 }
 
@@ -1077,9 +1085,11 @@ fn relational_pattern_full_operand_parses() {
 
 #[test]
 fn bare_generic_case_and_combined_access() {
-    // `case GenericEqualityComparer<string>:` — a bare generic type
-    // is a type pattern (constants/comparisons never carry `<>`).
-    // `private protected` — combined accessibility modifiers.
+    // `case GenericEqualityComparer<string>:` — a bare generic type is a
+    // TYPE pattern. It used to become an always-false placeholder (the
+    // arm could never run), then a report; now the spelling is kept so
+    // the type test can resolve it. `private protected` still parses —
+    // combined accessibility is unrelated.
     let src = r#"class C {
         Main() {
             switch (t) {
@@ -1089,19 +1099,12 @@ fn bare_generic_case_and_combined_access() {
                     return 0;
             }
         }
-        private protected virtual bool M() { return true; }
+        private protected int Combined() { return 0; }
     }"#;
-    let unit = parser::parse(src)
-        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
-    let Member::Class(class) = &unit.members[0] else {
-        panic!("expected class member")
-    };
+    let unit = parser::parse(src).unwrap_or_else(|e| panic!("must parse: {e:?}"));
     assert!(
-        class.members.iter().any(|m| matches!(
-            m,
-            ClassMember::Method(method) if method.name == "M"
-        )),
-        "combined-access method must survive member parsing"
+        format!("{unit:?}").contains("GenericEqualityComparer<string>"),
+        "the generic spelling must reach the type test: {unit:?}"
     );
 }
 
@@ -1756,11 +1759,17 @@ fn switch_arm_bare_name_when_guard_parses() {
     for src in [
         r#"class C { Main() { int r = x switch { A.B when c => 1, _ => 2, }; return r; } }"#,
         r#"class C { Main() { int r = x switch { A.B when c && d => 1, _ => 2, }; return r; } }"#,
-        r#"class C { Main() { int r = x switch { A.B when Foo(v => v > 0) => 1, _ => 2, }; return r; } }"#,
     ] {
+        // Neither has a lambda at all — the bare-name guard must not be
+        // read as one — so they must parse clean.
         parser::parse(src)
             .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
     }
+    // The third has a lambda inside the guard: recognised, consumed,
+    // reported once, and the switch arm still parses.
+    only_lambda_diagnostics(
+        r#"class C { Main() { int r = x switch { A.B when Foo(v => v > 0) => 1, _ => 2, }; return r; } }"#,
+    );
 }
 
 #[test]
@@ -1934,13 +1943,23 @@ fn stackalloc_dotted_and_initializer_forms_parse() {
 }
 
 #[test]
-fn sized_array_with_initializer_parses() {
-    // `new byte[1] { 0 }` — C# allows a size together with an
-    // initializer. The braces must be consumed, not misparsed as a
-    // block (regression: "expected ';' after statement, found '{'").
+fn sized_array_with_initializer_stores_its_elements() {
+    // `new byte[1] { 0 }` — legal C#: the size must agree with the
+    // initializer, and the ELEMENTS are the value. They used to be
+    // consumed and dropped (the array came back zeroed), then reported;
+    // now the array is built from them.
     let src = r#"class C { static byte[] E = new byte[1] { 0 }; Main() { int[] a = new int[2] { 1, 2 }; return 0; } }"#;
-    let unit = parser::parse(src)
-        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    let unit = parser::parse(src).unwrap_or_else(|e| panic!("must parse: {e:?}"));
+    let text = format!("{unit:?}");
+    assert!(
+        text.contains("NewArray"),
+        "the value must be an array with elements: {text}"
+    );
+    assert!(
+        !text.contains("E0038"),
+        "no dropped-initializer diagnostic: {text}"
+    );
+    // The field survives as a member.
     let Member::Class(class) = &unit.members[0] else {
         panic!("expected class member")
     };
@@ -1949,7 +1968,7 @@ fn sized_array_with_initializer_parses() {
             m,
             ClassMember::Field(f) if f.name == "E"
         )),
-        "sized+initialized field must survive member parsing"
+        "the field must survive member parsing"
     );
 }
 
@@ -2460,6 +2479,56 @@ fn is_pattern_cast_operand_parses() {
     }
 }
 
+/// Parse `src` and assert every diagnostic is the "no closure
+/// representation" one: the lambda SHAPE must still be recognised and
+/// consumed, and nothing else may go wrong around it.
+/// Assert the parse of `src` produces ONLY the unsupported-pattern
+/// diagnostic (E0036) — the pattern is consumed and the REST of the
+/// file still parses.
+fn only_unsupported_pattern(src: &str) {
+    let errors = parser::parse(src)
+        .err()
+        .unwrap_or_else(|| panic!("expected an unsupported-pattern diagnostic for:\n{src}"));
+    let other: Vec<&str> = errors
+        .iter()
+        .filter(|e| e.code != "E0036")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert!(
+        other.is_empty(),
+        "pattern consumed but other diagnostics appeared for:\n{src}\n{other:?}"
+    );
+}
+
+/// Parse `src` and assert the lambda SHAPE was recognised and built into a
+/// real node. These sources exist to pin the shapes (attributes, `async`,
+/// contextual-keyword parameters); they used to assert a diagnostic because
+/// the parser could only reject a lambda, and now assert the node.
+fn only_lambda_diagnostics(src: &str) {
+    // The original regression these pin was a SYNTAX error ("expected ';'
+    // after assignment"), so the assertion is that the lambda shape is
+    // consumed without one. A bare lambda used as a STATEMENT is CS0201 in
+    // C# and is reported as E0040 — that is the language rule, not a
+    // parsing failure, so it is tolerated here.
+    let (unit, errors) = crate::parser::parse_lenient(src);
+    let syntax: Vec<&str> = errors
+        .iter()
+        .filter(|e| e.code == "E0001")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert!(
+        syntax.is_empty(),
+        "the lambda shape must be consumed without a syntax error:\n{src}\n{syntax:?}"
+    );
+    for e in &errors {
+        assert_eq!(
+            e.code, "E0040",
+            "only the statement-position rule may fire for:\n{src}"
+        );
+    }
+    let _ = format!("{unit:?}");
+}
+
 #[test]
 fn async_lambda_forms_parse() {
     // `async x =>`, `async (a, b) =>`, `static async (x) =>` — the
@@ -2471,8 +2540,7 @@ fn async_lambda_forms_parse() {
         r#"class C { Main() { var t = Foo(static async (x) => 1); return 0; } }"#,
         r#"class C { Main() { var t = Foo(async static (x) => 1); return 0; } }"#,
     ] {
-        parser::parse(src)
-            .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
+        only_lambda_diagnostics(src);
     }
 }
 
@@ -2504,27 +2572,46 @@ class User {
     int M() { int closed = 1; return closed; }
     int main() { return 0; }
 }"#;
-    parser::parse(src)
-        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    // Parses, but the restriction is NOT enforced — a warning says so
+    // rather than letting the reader assume a closed hierarchy is real
+    //.
+    let (unit, errors) = crate::parser::parse_lenient(src);
+    assert_eq!(
+        errors.len(),
+        2,
+        "one warning per `closed` type, nothing else: {errors:?}"
+    );
+    assert!(
+        errors.iter().all(|e| e.code == "W0004"),
+        "the warning names the unenforced modifier: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.severity == crate::models::Severity::Error),
+        "a `closed` type is still a valid declaration: {errors:?}"
+    );
+    assert!(format!("{unit:?}").contains("Inner"), "the type survived");
 }
 
 #[test]
 fn is_pattern_contextual_keyword_binding_parses() {
-    // `record` lexes as Keyword::Record_, not an identifier — but it is
-    // a valid designation, parameter, and local name
-    // (System.Formats.Nrbf: `value is SerializationRecord record`,
-    // `Add(SerializationRecord record)`, `out SerializationRecord?
-    // record`). Regression: the pattern-binding checks demanded
-    // Identifier, so the `if` lost its `)` ("expected ')' to close if
-    // condition, found 'Record_'") and the rest of the file cascaded.
+    // `record` lexes as Keyword::Record_, not an identifier, but it is a
+    // valid designation. The binding is now initialised from the subject
+    // rather than a zero placeholder, so these parse AND resolve.
+    // NOTE the `is` form only: a `case T record:` binding is still
+    // reported, because the switch-arm pattern parser does not see the
+    // subject it would have to assign from.
     for src in [
         r#"class C { int Main() { if (value is SerializationRecord record) { return 1; } return 0; } }"#,
-        r#"class C { void Add(SerializationRecord record) { return; } int Main() { return 0; } }"#,
-        r#"class C { Main() { switch (x) { case SerializationRecord record: return 1; default: return 0; } } }"#,
     ] {
-        parser::parse(src)
+        let unit = parser::parse(src)
             .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
+        assert!(
+            format!("{unit:?}").contains("record"),
+            "the designation must be recorded: {src}"
+        );
     }
+    parser::parse(r#"class C { void Add(SerializationRecord record) { return; } int Main() { return 0; } }"#)
+        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
 }
 
 #[test]
@@ -2968,8 +3055,7 @@ fn contextual_keyword_lambda_param_parses() {
     // (`files.Select(file => file.Path)`). The name-lambda arm only
     // accepted plain identifiers.
     let src = "namespace t { class F { string Path; } class C { void M(System.Collections.Generic.List<F> files) { files.Select(file => file.Path); } int Main() { return 0; } } } namespace System.Collections.Generic { class List<T> { } }";
-    parser::parse(src)
-        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    only_lambda_diagnostics(src);
 }
 
 #[test]
@@ -2990,16 +3076,29 @@ fn parenthesized_query_with_anonymous_type_parses() {
     // followed by `.ToArray()`. The query swallower must stop at the
     // enclosing `)` instead of eating it (`expected ')'`).
     let src = "namespace t { class C { object M(object xs) { var imports = (from pi in xs where pi != null let site = new Site(pi) select new { Site = site }).ToArray(); return imports; } int Main() { return 0; } } }";
-    parser::parse(src)
-        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    let errors = parser::parse(src).expect_err("query syntax has no lowering yet");
+    // The point of the test is the token walk: the query must stop at
+    // the enclosing `)` so `.ToArray()` and the rest of the method stay
+    // parseable. A swallowed `)` would add "expected ')'" here.
+    assert_eq!(
+        errors.len(),
+        1,
+        "only the query itself is reported (the enclosing `)` was not swallowed): {errors:?}"
+    );
+    assert_eq!(errors[0].code, "E0031", "{errors:?}");
 }
 
 #[test]
 fn query_as_call_argument_parses() {
     // The arg-list `)` likewise ends the query without being consumed.
     let src = "namespace t { class C { object M(object xs) { var r = Take(from pi in xs where pi != null select pi); return r; } object Take(object q) { return q; } int Main() { return 0; } } }";
-    parser::parse(src)
-        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    let errors = parser::parse(src).expect_err("query syntax has no lowering yet");
+    assert_eq!(
+        errors.len(),
+        1,
+        "the arg-list `)` ends the query without being consumed: {errors:?}"
+    );
+    assert_eq!(errors[0].code, "E0031", "{errors:?}");
 }
 
 #[test]
@@ -3017,8 +3116,7 @@ fn attributed_lambda_forms_parse() {
         r#"class C { Main() { var f = [A] static (x) => x; return 0; } }"#,
         r#"class C { Main() { var f = [A] async (x) => x; return 0; } }"#,
     ] {
-        parser::parse(src)
-            .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
+        only_lambda_diagnostics(src);
     }
     // Collection expressions still parse as collections, not lambdas.
     parser::parse(r#"class C { Main() { var xs = new int[3]; xs[0] = 1; return 0; } }"#)
@@ -3056,4 +3154,453 @@ fn extension_block_generic_receiver_parses() {
         parser::parse(src)
             .unwrap_or_else(|errors| panic!("parse failed: {errors:?} for source:\n{src}"));
     }
+}
+
+#[test]
+fn query_expression_is_reported_not_turned_into_a_string() {
+    // `from ... select ...` used to parse into a single string literal
+    // whose text was the token dump ("query: Identifier pi ..."), so a
+    // query compiled and handed callers that string. It is now a
+    // diagnostic pointing at the query and suggesting method syntax
+    //.
+    let src = "namespace t { class C { int Main() { var q = from n in ns where n > 0 select n; return 0; } } }";
+    let errors = parser::parse(src).expect_err("query syntax must be reported");
+    let d = errors.iter().find(|e| e.code == "E0031").expect("E0031 reported");
+    assert!(
+        d.message.contains("query"),
+        "the diagnostic names the construct: {}",
+        d.message
+    );
+    assert!(
+        d.help.as_deref().unwrap_or_default().contains("Select"),
+        "points at method syntax: {d:?}"
+    );
+}
+
+/// The string literal `M()` returns in `namespace t { class C { object M()
+/// { return <expr>; } } }`.
+fn nameof_in_unit(src: &str) -> Option<String> {
+    let unit = parser::parse(src).ok()?;
+    for member in unit.all_members() {
+        let crate::models::Member::Class(c) = member else {
+            continue;
+        };
+        for cm in &c.members {
+            let crate::models::ClassMember::Method(m) = cm else {
+                continue;
+            };
+            let body = m.body.as_ref()?;
+            for st in &body.stmts {
+                if let crate::models::Stmt::Return { value: Some(v), .. } = st
+                    && let crate::models::Expr::Literal(crate::models::Literal::Str(s)) = v
+                {
+                    return Some(s.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn nameof_returns_the_actual_name() {
+    // `nameof` used to parse into the fixed string "name" whatever its
+    // argument was, so every name-based lookup read the wrong key. It
+    // now folds to the last simple name, as C# defines it.
+    let cases = [
+        ("x", "x"),
+        ("A.B", "B"),
+        ("a.b.c", "c"),
+        ("this.field", "field"),
+        ("m()", "m"),
+        ("obj.Compute(1, 2)", "Compute"),
+        ("List<int>.Node", "Node"),
+        ("Dictionary<string, int>", "Dictionary"),
+        ("int", "int"),
+        ("default", "default"),
+    ];
+    for (arg, want) in cases {
+        let src = format!(
+            "namespace t {{ class C {{ object M() {{ return nameof({arg}); }} }} }}"
+        );
+        assert_eq!(
+            nameof_in_unit(&src),
+            Some(want.to_owned()),
+            "nameof({arg})"
+        );
+    }
+}
+
+#[test]
+fn nameof_without_a_name_is_reported() {
+    // C# has no name to return here (CS8082). Answering a constant
+    // anyway is how the old placeholder hid the mistake.
+    let src = "namespace t { class C { object M() { return nameof(a + b); } } }";
+    let errors = parser::parse(src).expect_err("nameof of a binary expression is an error");
+    assert!(
+        errors.iter().any(|e| e.code == "E0032"),
+        "expected E0032: {errors:?}"
+    );
+}
+
+#[test]
+fn anonymous_method_is_a_lambda() {
+    // `delegate(...) { ... }` used to parse into a zero-element `NewArray`
+    // labelled "anonymous_method": it compiled and the value reaching the
+    // call site was an empty array, so invoking it did nothing. C# gives
+    // anonymous methods exactly the semantics of a lambda (the target
+    // delegate supplies the parameter types, the body captures), so they
+    // now parse into the SAME `Expr::Lambda` node — one representation,
+    // one lowering, no second mechanism to drift.
+    for src in [
+        "namespace t { class C { object M() { return delegate { return 1; }; } } }",
+        "namespace t { class C { object M() { return delegate(int x) { return x; }; } } }",
+        "namespace t { class C { object M() { return delegate(Func<int, int> f) { return f; }; } } }",
+    ] {
+        let unit = parser::parse(src).unwrap_or_else(|e| panic!("must parse: {src}\n{e:?}"));
+        let text = format!("{unit:?}");
+        assert!(
+            text.contains("Lambda"),
+            "an anonymous method must lower as a lambda: {src}\n{text}"
+        );
+        assert!(
+            !text.contains("anonymous_method"),
+            "no placeholder node may remain: {src}"
+        );
+    }
+    // Parameter TYPES are skipped; the NAME is bound, so the body resolves.
+    let unit = parser::parse(
+        "namespace t { class C { object M() { return delegate(int count) { return count; }; } } }",
+    )
+    .expect("typed parameter");
+    assert!(
+        format!("{unit:?}").contains("params: [\"count\"]"),
+        "the parameter name must survive: {unit:?}"
+    );
+}
+
+
+#[test]
+fn statement_position_lambda_does_not_become_a_break() {
+    // A lambda used to parse into `Stmt::Break`, a no-op that actually
+    // broke out of whatever loop contained it. A statement-position
+    // lambda is now reported and yields no statement.
+    let src = "class C { int main() { while (true) { int q = 1; x => q; } return 0; } }";
+    let errors = parser::parse(src).expect_err("statement lambdas are reported");
+    assert!(
+        errors.iter().any(|e| e.code == "E0040"),
+        "expected the statement-position rule (E0040): {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.code == "E0001"),
+        "and no syntax error: {errors:?}"
+    );
+}
+
+#[test]
+fn unchecked_is_transparent_and_checked_is_kept() {
+    // Arithmetic wraps by default, which IS `unchecked`, so that form stays
+    // a pass-through. `checked` used to be reported because the promise of
+    // an OverflowException never arrived; it is now a real node
+    // the lowering arms overflow checks for, so it must SURVIVE parsing.
+    let src = "class C { int Main() { return unchecked(1 + 2); } }";
+    let unit = parser::parse(src).unwrap_or_else(|errors| panic!("unchecked must parse: {errors:?}"));
+    assert!(
+        !format!("{unit:?}").contains("Checked"),
+        "`unchecked` must stay transparent, not become a node"
+    );
+
+    let unit = parser::parse("class C { int Main() { return checked(1 + 2); } }")
+        .expect("checked(expr) parses");
+    assert!(
+        format!("{unit:?}").contains("Checked"),
+        "`checked(expr)` must be represented, not dropped: {unit:?}"
+    );
+
+    let unit = parser::parse("class C { int Main() { checked { int y = 1 + 2; } return 0; } }")
+        .expect("checked { } parses");
+    assert!(
+        format!("{unit:?}").contains("CheckedBlock"),
+        "`checked {{ }}` must be represented, not dropped: {unit:?}"
+    );
+}
+
+#[test]
+fn unchecked_block_still_scopes_like_a_block() {
+    let src = "class C { int Main() { unchecked { int y = 1 + 2; return y; } return 0; } }";
+    let unit = parser::parse(src).unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    // The statements are still there, not dropped.
+    let text = format!("{unit:?}");
+    assert!(text.contains("Block"), "the block survives: {text}");
+}
+
+#[test]
+fn generic_argument_list_must_close() {
+    // A generic argument list used to swallow ANY token until the
+    // depth balanced, so `List<int {` and `Dict<K,>` produced a
+    // plausible-looking type name that resolved against whatever
+    // happened to share it. Both are reported now.
+    for src in [
+        "namespace t { class Box<T> { } class C { Box<int Main() { return 0; } } }",
+        "namespace t { class Box<T> { } class C { int Main() { object o = new Box<T; } return 0; } }",
+    ] {
+        let errors = match parser::parse(src) {
+            Ok(_) => panic!("expected a diagnostic for:\\n{src}"),
+            Err(e) => e,
+        };
+        assert!(
+            !errors.is_empty(),
+            "the malformed list must not parse clean:\\n{src}"
+        );
+    }
+}
+
+#[test]
+fn shift_after_generic_closes_the_list_like_csharp() {
+    // `A<X>>y` splits as `(A<X>) > y` in C# — the surplus `>` belongs
+    // to the comparison. This is NOT tolerance: the list closes on its
+    // own `>` and the operator still reaches the expression parser.
+    let unit = parser::parse(
+        "namespace t { class C { bool M(int a, int b, int c) { return Box<int>(a) > b > c; } } }",
+    )
+    .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    assert!(format!("{unit:?}").contains("Gt"), "the `>` is a comparison");
+}
+#[test]
+fn generic_array_element_type_is_rendered_from_tokens() {
+    // The element type used to be sliced out of the raw source starting
+    // at the `new` keyword — its own `n` was the first ASCII letter — so
+    // `new Box<int>[2]` spelled its element `new Box<int>`, a type that
+    // matches no entry in the table and silently fell back to a default
+    // element layout. Rendered from tokens instead.
+    fn elem_of(src: &str) -> String {
+        let unit = parser::parse(src).unwrap_or_else(|e| panic!("parse failed: {e:?}"));
+        let text = format!("{unit:?}");
+        let at = text.find("elem_type: \"").expect("a NewArray in the source");
+        text[at + "elem_type: \"".len()..]
+            .split('"')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+    let cases = [
+        ("new Box<int>[2]", "Box<int>"),
+        ("new /* note */ Box<int>[2]", "Box<int>"),
+        ("new Ns.Outer<int>[2]", "Ns.Outer<int>"),
+        ("new Dictionary<string, int>[n]", "Dictionary<string,int>"),
+        ("new Plain[2]", "Plain"),
+    ];
+    for (expr, want) in cases {
+        let src = format!(
+            "namespace t {{ class Box<T> {{ public int V; }} class Ns {{ class Outer<T> {{ public int V; }} }} class Plain {{ public int V; }} class Dictionary<K, V> {{ public int V; }} class C {{ int Main() {{ var a = {expr}; return 0; }} }} }}"
+        );
+        assert_eq!(elem_of(&src), want, "for `{expr}`");
+    }
+}
+
+#[test]
+fn index_and_collection_initializers_are_recorded() {
+    // A bare value in an initializer is an `Add(value)` call; an index
+    // initializer (`[k] = v`) is a `set_Item(k, v)` after construction.
+    // Both used to be parsed and DROPPED (the collection came back
+    // empty); the index form was then reported. Both are recorded now.
+    let unit = parser::parse(
+        "namespace t { class D { public int this[int k] { get { return 0; } set { } } } class C { int Main() { D d = new D { [1] = 7 }; return 0; } } }",
+    )
+    .expect("an index initializer parses");
+    assert!(
+        format!("{unit:?}").contains("index: Some"),
+        "the index expression must be recorded: {unit:?}"
+    );
+
+    let unit = parser::parse(
+        "namespace t { class L { public void Add(int x) { } } class C { int Main() { L l = new L { 1, 2 }; return 0; } } }",
+    )
+    .expect("collection initializer parses");
+    assert!(
+        format!("{unit:?}").contains("name: \"\""),
+        "each bare element must be recorded as an Add entry: {unit:?}"
+    );
+
+    // `Key = Value` is a member write and must keep parsing clean.
+    parser::parse(
+        "namespace t { class Box { public int V; } class C { int Main() { Box b = new Box { V = 42 }; return b.V; } } }",
+    )
+    .unwrap_or_else(|errors| panic!("member initializers still work: {errors:?}"));
+}
+
+#[test]
+fn contextual_keyword_sets_have_one_home_each() {
+    // The "this spelling is a valid name here" list was copy-pasted
+    // into five position checks and had already drifted: two of them
+    // accepted the pattern combinators `and`/`or`/`not`/`when` and the
+    // other three did not, so the same spelling was legal in one
+    // position and a syntax error in the next. There are now three
+    // named predicates with the differences written down, and every
+    // position asks one of them.
+    //
+    // Behaviour is unchanged where it was already right, which is what
+    // this pins: a designation still takes a contextual keyword, and
+    // `and`/`or`/`not`/`when` still continue a pattern instead of being
+    // swallowed as its name.
+    // `is T x` parses now (the binding takes the subject); what this
+    // test guards is that `and` still CONTINUES the pattern rather than
+    // being swallowed as the designation.
+    parser::parse(
+        "class C { int Main() { if (v is SerializationRecord record) { return 1; } return 0; } }",
+    )
+    .unwrap_or_else(|e| panic!("an `is` pattern with a binding must parse: {e:?}"));
+
+    // `and` continues the pattern: the second operand must still be
+    // there (otherwise this would parse as `is T` binding a name `and`).
+    let unit = parser::parse(
+        "class C { int Main() { object v = null; if (v is string s and s.Length > 0) { return 1; } return 0; } }",
+    )
+    .unwrap_or_else(|e| panic!("`and` must continue the pattern: {e:?}"));
+    // The designation is `s`, not `and`: if `and` had been taken as the
+    // name, `s.Length` would never have been parsed and the subject
+    // binding would be `and`.
+    let text = format!("{unit:?}");
+    assert!(
+        text.contains("name: \"s\""),
+        "the designation must be `s`: {text}"
+    );
+}
+
+#[test]
+fn safe_modifier_does_not_swallow_a_variable_of_the_same_name() {
+    // The `safe` spelling gate must still let a VARIABLE be called
+    // `safe` — it is not a reserved word, and treating it as one would
+    // reject valid code.
+    let src = "namespace t { class C { int safe = 5; int Main() { return safe; } } }";
+    let unit = parser::parse(src).unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    assert!(format!("{unit:?}").contains("\"safe\""), "the field survived");
+}
+
+#[test]
+fn unicode_whitespace_follows_the_csharp_definition() {
+    // The trivia rule used to lean on "real dotnet sources contain
+    // NBSP" and then used Rust's `is_whitespace`, which also swallows
+    // NEL (U+0085) — category Cc, not a separator, so C# does not treat
+    // it as whitespace. It is now stated as conformance and implemented
+    // as conformance.
+    fn runs(src: &str) -> bool {
+        parser::parse(src).is_ok()
+    }
+    // Zs / Zl / Zp and the control whitespace are whitespace.
+    assert!(runs("namespace t { class C { int Main() { return 1; } } }"));
+    assert!(runs("namespace t { class C\u{a0}{ int Main() { return 1; } } }"));
+    assert!(
+        runs("namespace t { class C { int Main() { return 1; } } }\u{2029}"),
+        "paragraph separator (Zp) is whitespace"
+    );
+    // A BOM is a file prologue, not general trivia.
+    assert!(runs("\u{feff}namespace t { class C { int Main() { return 1; } } }"));
+    // NEL is not whitespace: it must be reported, not silently skipped.
+    let errors = parser::parse("namespace t { class C\u{85}int Main() { return 1; } }")
+        .expect_err("NEL is not C# whitespace");
+    assert!(
+        errors.iter().any(|e| e.code == "E0006"),
+        "expected the unexpected-character report: {errors:?}"
+    );
+}
+
+#[test]
+fn sizeof_of_a_tuple_is_reported() {
+    // The tuple type erases to the opaque name "tuple" in the compact
+    // type model, and `sizeof` of THAT name used to produce a number —
+    // 8, printed by a program as if it were the size of `(int, string)`.
+    // C# rejects it outright (`sizeof` takes unmanaged types; a tuple is
+    // managed), so it is reported.
+    let errors = parser::parse("namespace t { class C { int Main() { int n = sizeof((int, string)); return n; } } }")
+        .expect_err("sizeof of a tuple is reported");
+    assert!(
+        errors.iter().any(|e| e.code == "E0039"),
+        "expected E0039: {errors:?}"
+    );
+
+    // An unmanaged type still sizes correctly.
+    parser::parse("namespace t { class C { int Main() { int n = sizeof(int); return n; } } }")
+        .unwrap_or_else(|errors| panic!("sizeof(int) still works: {errors:?}"));
+}
+
+#[test]
+fn lambda_node_carries_params_and_body() {
+    // The lambda shapes now produce a REAL node rather than a placeholder,
+    // which is what every downstream pass needs (2.3): the parameter names
+    // are recorded (a body cannot resolve its own parameters without them)
+    // and the body is kept (its reads and side effects are real).
+    //
+    // NOTE: parenthesised parameter lists in an INITIALIZER still hit the
+    // routing gap pinned by the test below, so these cases put the lambda
+    // where the declaration path reaches it: as a call argument.
+    // `want` is the parameter list as the AST debug prints it.
+    let cases = [
+        ("x => x + 1", "[\"x\"]"),
+        ("(a, b) => a * b", "[\"a\", \"b\"]"),
+        ("() => 1", "[]"),
+        ("(int n) => n", "[\"n\"]"),
+    ];
+    for (lam, want) in cases {
+        let src = format!(
+            "class C {{ void Take(object o) {{ }} Main() {{ Take({lam}); return 0; }} }}"
+        );
+        let unit = parser::parse(&src)
+            .unwrap_or_else(|e| panic!("`{lam}` must parse: {e:?}"));
+        let text = format!("{unit:?}");
+        assert!(
+            text.contains(&format!("params: {want}")),
+            "`{lam}` must record parameters {want}: {text}"
+        );
+        assert!(
+            text.contains("Expr(") || text.contains("Block("),
+            "body kept for `{lam}`"
+        );
+    }
+
+}
+
+#[test]
+fn parenthesised_lambda_in_an_initializer_parses() {
+    // Was a gap: `looks_like_typed_lambda()` claimed `(x) => x` as an
+    // explicit-return-type lambda, skipped the params, and returned
+    // `init: 0` with the body DISCARDED — the leftover `(x) => x;` was then
+    // re-parsed as a statement and rejected. With the cursor at `(` the
+    // list is the PARAMETERS, so the plain-lambda path handles it now.
+    for src in [
+        "class C { void Main() { var f = (x) => x; } }",
+        "class C { void Main() { Action a = () => {}; } }",
+        "class C { void Main() { var f = (int n) => n; } }",
+    ] {
+        let unit = parser::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` must parse: {e:?}"));
+        assert!(
+            format!("{unit:?}").contains("Lambda"),
+            "a Lambda node is expected for `{src}`"
+        );
+    }
+}
+
+#[test]
+fn char_literals_keep_their_type() {
+    // `'A'` used to be an IntLiteral, so `var c = 'A'` typed as int.
+    let unit = parser::parse("class C { int Main() { var c = 'A'; return 0; } }").unwrap();
+    let init = unit
+        .members
+        .iter()
+        .find_map(|m| match m {
+            Member::Class(c) if c.name == "C" => c.members.iter().find_map(|cm| match cm {
+                ClassMember::Method(m) if m.name == "Main" => {
+                    let body = m.body.as_ref()?;
+                    let Stmt::Let { init, .. } = &body.stmts[0] else {
+                        return None;
+                    };
+                    Some(init)
+                }
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("Main local");
+    assert!(matches!(init, Expr::Literal(Literal::Char(65))), "got {init:?}");
 }

@@ -7,6 +7,7 @@
 mod instructions;
 mod lower;
 mod serialize;
+mod verify;
 
 pub use instructions::{
     BinOp, Block, BlockId, CmpOp, FBinOp, FCmpOp, Instr, IrFunction, IrStatic, Program,
@@ -64,7 +65,9 @@ impl StringArena {
 use crate::models::{Access, ClassDecl, ClassMember, CompilationUnit, Expr, Member, MethodDecl};
 use crate::models::{Block as AstBlock, Param as AstParam, Stmt as AstStmt};
 use crate::models::visitor::Visitor;
-use crate::native::semantic::{self, ClassInfo, MethodInfo, SemanticError, TypeTable};
+use crate::native::semantic::{
+    self, ClassInfo, INSTANCE_HEADER_SLOTS, MethodInfo, SemanticError, TypeTable,
+};
 
 /// A static local function collected for real emission
 /// (`EnsureInitialized` inside a property getter lowers to a
@@ -81,31 +84,231 @@ pub(crate) struct LocalFnDecl {
     pub body: AstBlock,
     /// Enclosing method's generic params (locals inherit them).
     pub method_vars: Vec<String>,
+    /// Local constants visible at the declaration. A static local
+    /// function may use them (a constant is not a captured variable);
+    /// they are materialized in its own frame.
+    pub consts: Vec<(String, String, Expr)>,
+    /// `extern` local function: no body of its own. With an
+    /// `[UnsafeAccessor]` attribute it names a target method.
+    pub is_extern: bool,
+    /// Attributes on the declaration (`[UnsafeAccessor(...)]`).
+    pub attrs: Vec<crate::models::Attribute>,
+    /// The ENCLOSING method's `where` clauses. A local function
+    /// inherits the enclosing method's type parameters, so it inherits
+    /// their constraints too — a member on one of those parameters
+    /// binds through them.
+    pub constraints: Vec<crate::models::ast::method::TypeConstraint>,
+    /// The enclosing class's QUALIFIED path. A local function's body
+    /// belongs to that class, and the access rule compares paths (a
+    /// bare class name is ambiguous for a nested type).
+    pub class_path: Option<String>,
+}
+
+/// How many lambda functions a method body will add to `Program::functions`.
+///
+/// A lifted lambda is emitted immediately after the method that created it,
+/// so every method after the first lambda shifts by one. The function-index
+/// map is a *prediction* built before lowering starts (call sites need the
+/// index of a method that has not been emitted yet), so it has to know this
+/// count up front — without it, `new Both()` resolved its base constructors
+/// to whichever functions happened to sit at the predicted slots, and a
+/// program containing a lambda ran the wrong code.
+///
+/// Local functions are deliberately not descended into: their bodies are
+/// lowered with `lambda_deferred: None`, so a lambda there is reported
+/// rather than lifted and cannot shift anything.
+pub(crate) fn count_lambdas(block: &crate::models::Block) -> usize {
+    fn walk_block(b: &crate::models::Block) -> usize {
+        b.stmts.iter().map(walk_stmt).sum()
+    }
+    fn walk_stmt(s: &crate::models::Stmt) -> usize {
+        use crate::models::Stmt as S;
+        match s {
+            S::Let { init, .. } | S::UsingDecl { init, .. } => walk_expr(init),
+            S::Assign { value, .. } => walk_expr(value),
+            S::MemberAssign { object, value, .. } => walk_expr(object) + walk_expr(value),
+            S::Expression(e) => walk_expr(e),
+            S::CheckedBlock { body, .. } => walk_block(body),
+            S::Block { body, .. } => walk_block(body),
+            S::Return { value, .. } => value.as_ref().map(walk_expr).unwrap_or(0),
+            S::If {
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => {
+                walk_expr(cond)
+                    + walk_block(then_block)
+                    + else_block.as_ref().map(walk_block).unwrap_or(0)
+            }
+            S::While { cond, body, .. } => walk_expr(cond) + walk_block(body),
+            S::DoWhile { body, cond, .. } => walk_block(body) + walk_expr(cond),
+            S::For {
+                init,
+                cond,
+                step,
+                body,
+                ..
+            } => {
+                init.as_deref().map(walk_stmt).unwrap_or(0)
+                    + cond.as_ref().map(walk_expr).unwrap_or(0)
+                    + step.as_deref().map(walk_stmt).unwrap_or(0)
+                    + walk_block(body)
+            }
+            S::Switch {
+                subject,
+                arms,
+                default_body,
+                ..
+            } => {
+                walk_expr(subject)
+                    + arms
+                        .iter()
+                        .map(|a| {
+                            a.labels.iter().map(walk_expr).sum::<usize>()
+                                + walk_block(&a.body)
+                        })
+                        .sum::<usize>()
+                    + default_body.as_ref().map(walk_block).unwrap_or(0)
+            }
+            S::Goto { case_expr, .. } => case_expr.as_ref().map(walk_expr).unwrap_or(0),
+            S::Fixed {
+                declarators, body, ..
+            } => {
+                declarators
+                    .iter()
+                    .map(|(_, _, init)| init.as_ref().map(walk_expr).unwrap_or(0))
+                    .sum::<usize>()
+                    + walk_block(body)
+            }
+            S::Try {
+                body,
+                catches,
+                finally_block,
+                ..
+            } => {
+                walk_block(body)
+                    + catches.iter().map(|c| walk_block(&c.body)).sum::<usize>()
+                    + finally_block.as_ref().map(walk_block).unwrap_or(0)
+            }
+            S::Throw { expr, .. } => expr.as_ref().map(walk_expr).unwrap_or(0),
+            S::LocalFunction { .. } => 0,
+            S::Break { .. } | S::Continue { .. } | S::Label { .. } => 0,
+        }
+    }
+    fn walk_expr(e: &crate::models::Expr) -> usize {
+        use crate::models::Expr as E;
+        match e {
+            E::NamedArg { value, .. } => walk_expr(value),
+            // The lambda itself is one function; its body adds more.
+            E::Lambda { body, .. } => {
+                1 + match body {
+                    crate::models::ast::expression::LambdaBody::Expr(inner) => walk_expr(inner),
+                    crate::models::ast::expression::LambdaBody::Block(b) => walk_block(b),
+                }
+            }
+            E::Checked { inner, .. } => walk_expr(inner),
+            E::Binary { lhs, rhs, .. } => walk_expr(lhs) + walk_expr(rhs),
+            E::Unary { inner, .. } => walk_expr(inner),
+            E::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+                ..
+            } => walk_expr(cond) + walk_expr(then_expr) + walk_expr(else_expr),
+            E::Call { args, .. } => args.iter().map(walk_expr).sum(),
+            E::New { args, init, .. } => {
+                args.iter().map(walk_expr).sum::<usize>()
+                    + init.iter().map(|m| walk_expr(&m.value)).sum::<usize>()
+            }
+            E::Member { object, .. } => walk_expr(object),
+            E::MethodCall { object, args, .. } => {
+                walk_expr(object) + args.iter().map(walk_expr).sum::<usize>()
+            }
+            E::Await { inner, .. } => walk_expr(inner),
+            E::NewArray { size, init, .. } => {
+                walk_expr(size) + init.iter().map(walk_expr).sum::<usize>()
+            }
+            E::Index { object, index, .. } => walk_expr(object) + walk_expr(index),
+            E::Cast { expr, .. } => walk_expr(expr),
+            E::AssignComplex { lhs, value, .. } => walk_expr(lhs) + walk_expr(value),
+            E::Assign { target, value, .. } => walk_expr(target) + walk_expr(value),
+            E::PostInc { target, .. } | E::PostDec { target, .. } => walk_expr(target),
+            E::SwitchExpr { subject, arms, .. } => {
+                walk_expr(subject) + arms.iter().map(|a| walk_expr(&a.body)).sum::<usize>()
+            }
+            E::InterpolatedString { parts, .. } => parts
+                .iter()
+                .map(|p| match p {
+                    crate::models::InterpPart::Hole(h) => walk_expr(h),
+                    crate::models::InterpPart::Text(_) => 0,
+                })
+                .sum(),
+            E::Ident { .. } | E::Literal(_) | E::Default { .. } => 0,
+        }
+    }
+    walk_block(block)
 }
 
 /// Collect static local functions in deterministic order (classes
 /// → methods → source order, descending into nested blocks).
 /// Instance, async, generic, bodiless, or fancy-param locals stay
 /// on the legacy placeholder path (not collected).
-pub(crate) fn collect_static_locals(classes: &[&ClassDecl]) -> Vec<LocalFnDecl> {
+pub(crate) fn collect_static_locals(
+    classes: &[&ClassDecl],
+    class_paths: &std::collections::HashMap<*const ClassDecl, String>,
+) -> Vec<LocalFnDecl> {
     fn walk_block(
         out: &mut Vec<LocalFnDecl>,
+        classes: &[&ClassDecl],
+        class_paths: &std::collections::HashMap<*const ClassDecl, String>,
+        owner: &ClassDecl,
         class_name: &str,
         method_name: &str,
         method_vars: &[String],
+        consts: &mut Vec<(String, String, Expr)>,
         block: &AstBlock,
     ) {
+        let mark = consts.len();
         for stmt in &block.stmts {
             match stmt {
+                AstStmt::Let {
+                    is_const: true,
+                    type_name,
+                    name,
+                    init,
+                    ..
+                } => {
+                    consts.push((name.clone(), type_name.clone(), init.clone()));
+                }
                 AstStmt::LocalFunction {
                     name,
                     params,
                     ret_type,
                     body,
                     is_static,
+                    is_extern,
+                    attrs,
                     ..
                 } => {
                     if *is_static {
+                        // The enclosing method's constraints: a local
+                        // function inherits its type parameters, so it
+                        // inherits their constraints.
+                        let constraints = classes
+                            .iter()
+                            .find(|c| c.name == class_name)
+                            .and_then(|c| {
+                                c.members.iter().find_map(|m| match m {
+                                    crate::models::ClassMember::Method(md)
+                                        if md.name == *method_name =>
+                                    {
+                                        Some(md.constraints.clone())
+                                    }
+                                    _ => None,
+                                })
+                            })
+                            .unwrap_or_default();
                         out.push(LocalFnDecl {
                             class_name: class_name.to_owned(),
                             method_name: method_name.to_owned(),
@@ -114,37 +317,45 @@ pub(crate) fn collect_static_locals(classes: &[&ClassDecl]) -> Vec<LocalFnDecl> 
                             ret_type: ret_type.clone(),
                             body: body.clone(),
                             method_vars: method_vars.to_owned(),
+                            consts: consts.clone(),
+                            is_extern: *is_extern,
+                            attrs: attrs.clone(),
+                            constraints,
+                            class_path: class_paths
+                                .get(&(owner as *const ClassDecl))
+                                .cloned(),
                         });
                     }
-                    walk_block(out, class_name, method_name, method_vars, body);
+                    let mut inner = consts.clone();
+                    walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, &mut inner, body);
                 }
                 AstStmt::Block { body, .. } => {
-                    walk_block(out, class_name, method_name, method_vars, body)
+                    walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, body)
                 }
                 AstStmt::If {
                     then_block,
                     else_block,
                     ..
                 } => {
-                    walk_block(out, class_name, method_name, method_vars, then_block);
+                    walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, then_block);
                     if let Some(b) = else_block {
-                        walk_block(out, class_name, method_name, method_vars, b);
+                        walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, b);
                     }
                 }
                 AstStmt::While { body, .. } | AstStmt::DoWhile { body, .. } => {
-                    walk_block(out, class_name, method_name, method_vars, body)
+                    walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, body)
                 }
                 AstStmt::For { body, .. } => {
-                    walk_block(out, class_name, method_name, method_vars, body)
+                    walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, body)
                 }
                 AstStmt::Switch {
                     arms, default_body, ..
                 } => {
                     for arm in arms {
-                        walk_block(out, class_name, method_name, method_vars, &arm.body);
+                        walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, &arm.body);
                     }
                     if let Some(b) = default_body {
-                        walk_block(out, class_name, method_name, method_vars, b);
+                        walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, b);
                     }
                 }
                 AstStmt::Try {
@@ -153,17 +364,18 @@ pub(crate) fn collect_static_locals(classes: &[&ClassDecl]) -> Vec<LocalFnDecl> 
                     finally_block,
                     ..
                 } => {
-                    walk_block(out, class_name, method_name, method_vars, body);
+                    walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, body);
                     for c in catches {
-                        walk_block(out, class_name, method_name, method_vars, &c.body);
+                        walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, &c.body);
                     }
                     if let Some(b) = finally_block {
-                        walk_block(out, class_name, method_name, method_vars, b);
+                        walk_block(out, classes, class_paths, owner, class_name, method_name, method_vars, consts, b);
                     }
                 }
                 _ => {}
             }
         }
+        consts.truncate(mark);
     }
 
     let mut out = Vec::new();
@@ -171,11 +383,16 @@ pub(crate) fn collect_static_locals(classes: &[&ClassDecl]) -> Vec<LocalFnDecl> 
         for m in &class.members {
             if let ClassMember::Method(method) = m {
                 if let Some(body) = &method.body {
+                    let mut consts = Vec::new();
                     walk_block(
                         &mut out,
+                        classes,
+                        class_paths,
+                        class,
                         &class.name,
                         &method.name,
                         &method.generic_params,
+                        &mut consts,
                         body,
                     );
                 }
@@ -185,10 +402,32 @@ pub(crate) fn collect_static_locals(classes: &[&ClassDecl]) -> Vec<LocalFnDecl> 
             // also emit or their calls stay placeholders.
             if let ClassMember::Property(prop) = m {
                 if let Some(body) = &prop.get {
-                    walk_block(&mut out, &class.name, &prop.name, &[], body);
+                    let mut consts = Vec::new();
+                    walk_block(
+                        &mut out,
+                        classes,
+                        class_paths,
+                        class,
+                        &class.name,
+                        &prop.name,
+                        &[],
+                        &mut consts,
+                        body,
+                    );
                 }
                 if let Some(body) = &prop.set {
-                    walk_block(&mut out, &class.name, &prop.name, &[], body);
+                    let mut consts = Vec::new();
+                    walk_block(
+                        &mut out,
+                        classes,
+                        class_paths,
+                        class,
+                        &class.name,
+                        &prop.name,
+                        &[],
+                        &mut consts,
+                        body,
+                    );
                 }
             }
         }
@@ -219,6 +458,10 @@ pub enum LowerError {
         class: String,
         field: String,
     },
+    /// Lowering produced IR that fails its own consistency check (a value
+    /// read on a path that never assigns it). This is a compiler bug, not
+    /// a source error; failing here prevents emitting a silent miscompile.
+    IrInvalid(String),
 }
 
 impl std::fmt::Display for LowerError {
@@ -267,6 +510,10 @@ impl std::fmt::Display for LowerError {
                 f,
                 "error[E0040]: cross-image mutable static '{class}.{field}' in a dynamic-linking build\n  help: shared mutable statics need GOT-style sharing (not implemented); build this library static (remove `[build] dynamic`)"
             ),
+            LowerError::IrInvalid(detail) => write!(
+                f,
+                "internal compiler error: invalid IR: {detail}"
+            ),
         }
     }
 }
@@ -289,6 +536,13 @@ pub(crate) struct Ctx<'a> {
     /// `Enumerator`s share names/signatures). `None` outside method
     /// bodies or when the path is unavailable (legacy first-match).
     pub current_path: Option<&'a str>,
+    /// AST declaration -> qualified path map, so a context that
+    /// switches class can name it by PATH. A nested type's bare name is
+    /// ambiguous (Utf8 and Utf16 both declare
+    /// `TryWriteInterpolatedStringHandler`) and the table stores nested
+    /// classes under their qualified name, so a bare name does not
+    /// resolve at all.
+    pub class_paths: &'a std::collections::HashMap<*const crate::models::ClassDecl, String>,
     pub classes: &'a [&'a ClassDecl],
     /// `(class, method)` → index into `Program::imports`.
     pub import_index: &'a std::collections::BTreeMap<(String, String), usize>,
@@ -306,6 +560,12 @@ pub(crate) struct Ctx<'a> {
     /// Generic type parameters of the method under lowering (`M<T>`).
     /// Empty outside method bodies (field initializers, tests).
     pub method_vars: &'a [String],
+    /// Concrete substitutions for a GENERIC-INLINED call body
+    /// (`Test<IntNum>` inlines `Test<T>` with `T -> IntNum`). `None`
+    /// everywhere else: a method is lowered once with its type
+    /// parameters erased, so `T.Member` has no runtime meaning unless a
+    /// specialization supplies the concrete type.
+    pub type_subst: Option<&'a [(String, String)]>,
     /// `(declaring class, field name)` → index into `Program::statics`.
     pub static_index: &'a std::collections::BTreeMap<(String, String), u32>,
     /// Active preprocessor symbols (CLI `-D` plus `[build] defines`):
@@ -327,6 +587,36 @@ pub(crate) struct Ctx<'a> {
     /// `current_method`; property-inline contexts set the
     /// property's type.
     pub current_ret: Option<String>,
+    /// Lambdas encountered while lowering the current method, in the
+    /// order they were met. `eval` cannot append to
+    /// `Program::functions`, so it records the lambda here and returns a
+    /// delegate object referring to a predicted index; the method's
+    /// emission loop drains this list afterwards and emits one function
+    /// per entry, which is why the prediction holds.
+    ///
+    /// `None` outside method bodies (field initializers, tests), where a
+    /// lambda has nowhere to be lifted to and is reported.
+    pub lambda_deferred:
+        Option<&'a std::cell::RefCell<Vec<LambdaDeferred>>>,
+    /// This method's own final function index, so a lambda can predict
+    /// where its lifted function will land (`lambda_base + 1 + position`).
+    pub lambda_base: u32,
+}
+
+/// One lambda waiting to be lifted into a function, recorded by `eval`
+/// and emitted after the enclosing method.
+///
+/// OWNED rather than borrowed: `eval` sees the expression through a
+/// shorter borrow than the context's `'a`, so a reference could not be
+/// stored. A lambda body is small, and each is copied exactly once.
+#[derive(Clone)]
+pub struct LambdaDeferred {
+    pub params: Vec<String>,
+    pub body: crate::models::ast::expression::LambdaBody,
+    pub span: crate::models::Span,
+    /// Free variables, in delegate-object word order (word 8+k*8 holds
+    /// the ADDRESS of the k-th capture).
+    pub captures: Vec<String>,
 }
 
 impl Ctx<'_> {
@@ -359,6 +649,22 @@ impl Ctx<'_> {
             .is_some_and(|info| info.generic_params.iter().any(|p| p == base))
     }
 
+    /// The class the current code is in, as the access rules see it:
+    /// the QUALIFIED key path where it is known. A bare class name is
+    /// ambiguous when two namespaces declare same-named nested types,
+    /// and the ambiguity made the nesting-family rule give up.
+    fn viewer_path(&self) -> &str {
+        if let Some(p) = self.current_path
+            && !p.is_empty()
+        {
+            return p;
+        }
+        if let Some(info) = self.current_info {
+            return info.key.path.as_str();
+        }
+        &self.current_class
+    }
+
     /// Enforce C# member visibility for `member` accessed through static
     /// type `owner_type`. The declaring class is located along the owner's
     /// base chain; `Default` behaves like `private`.
@@ -368,15 +674,27 @@ impl Ctx<'_> {
         owner_type: &str,
         member: &str,
     ) -> Result<(), LowerError> {
-        let found = if is_field {
-            self.table.declaring_class_of_field(owner_type, member)
-        } else {
-            self.table.declaring_class_of_method(owner_type, member)
+        // The owner is the class under lowering when the member is
+        // read on `this`: a bare type spelling is ambiguous (25
+        // same-named `Enumerator`s), so the anchored entry is the
+        // precise one.
+        let anchored = self
+            .current_info
+            .filter(|i| i.name == owner_type || i.key.path == owner_type);
+        let found = match anchored {
+            Some(info) => self.table.declaring_class_of_in(info, member, is_field),
+            None => {
+                if is_field {
+                    self.table.declaring_class_of_field(owner_type, member)
+                } else {
+                    self.table.declaring_class_of_method(owner_type, member)
+                }
+            }
         };
         let Some((declaring, access)) = found else {
             return Ok(());
         };
-        if semantic::visible_from(self.table, access, &declaring, self.current_class) {
+        if semantic::visible_from(self.table, access, &declaring, self.viewer_path()) {
             return Ok(());
         }
         // Base-slot redemption for `protected` (mirrors
@@ -408,7 +726,7 @@ impl Ctx<'_> {
                             self.table,
                             access2,
                             &decl2,
-                            self.current_class,
+                            &self.current_class,
                         )
                     {
                         return Ok(());
@@ -429,7 +747,11 @@ impl Ctx<'_> {
     /// different access (`FileSystem.MoveDirectory`: `internal` 2-arg +
     /// `private` 3-arg) and falsely denies legal calls.
     pub(crate) fn check_method_access(&self, mi: &MethodInfo) -> Result<(), LowerError> {
-        if semantic::visible_from(self.table, mi.access, &mi.declaring_class, self.current_class)
+        // The viewer is named by its qualified path: a nested type's
+        // simple name is ambiguous (`AlternateLookup` exists in three
+        // collections), and the enclosing type's private members are
+        // reachable from it (C#).
+        if semantic::visible_from(self.table, mi.access, &mi.declaring_class, self.viewer_path())
         {
             return Ok(());
         }
@@ -451,7 +773,7 @@ impl Ctx<'_> {
         mi: &MethodInfo,
         recv_type: &str,
     ) -> Result<(), LowerError> {
-        if semantic::visible_from(self.table, mi.access, &mi.declaring_class, self.current_class)
+        if semantic::visible_from(self.table, mi.access, &mi.declaring_class, &self.current_class)
         {
             return Ok(());
         }
@@ -464,7 +786,7 @@ impl Ctx<'_> {
                             self.table,
                             m.access,
                             &m.declaring_class,
-                            self.current_class,
+                            &self.current_class,
                         )
                     {
                         return Ok(());
@@ -782,19 +1104,6 @@ impl<'a> InitRefCollector<'a> {
         let cached: Option<Vec<String>> =
             self.memo.borrow().refs.get(key).cloned();
         if let Some(cached) = cached {
-            // TEMP-ORDERDIAG3: trace memo replays. Removed before close.
-            if std::env::var("RUBYC_ORDERDIAG").is_ok()
-                && (key.0.contains("AppContextConfigHelper")
-                    || key.0.contains("NumberFormatInfo")
-                    || key.0.contains("HillClimbing"))
-            {
-                eprintln!(
-                    "[rubyc] TEMP-ORDERDIAG3 replay={}:{:?} n={}",
-                    key.0,
-                    key.1,
-                    cached.len()
-                );
-            }
             for r in cached {
                 if !self.refs.contains(&r) {
                     self.refs.push(r);
@@ -826,8 +1135,6 @@ impl<'a> InitRefCollector<'a> {
     /// `base(...)` before the derived body) are scanned too —
     /// their static reads constrain order equally.
     fn scan_ctor_bodies(&mut self, class_name: &str) {
-        // TEMP-ORDERDIAG: trace the transitive ctor scan. Removed before close.
-        let diag = std::env::var("RUBYC_ORDERDIAG").is_ok();
         let key = (class_name.to_owned(), "\0ctor".to_owned());
         let Some(start) = self.follow_begin(&key) else {
             return;
@@ -838,10 +1145,7 @@ impl<'a> InitRefCollector<'a> {
             *const Vec<crate::models::Stmt>,
             Vec<(String, String)>,
         )> = Vec::new();
-        let mut found_decl = false;
-        let mut ctor_count = 0usize;
         if let Some(decl) = self.classes.iter().find(|c| c.name == class_name) {
-            found_decl = true;
             for m in &decl.members {
                 if let ClassMember::Method(md) = m {
                     if md.is_static || md.name != simple {
@@ -864,7 +1168,6 @@ impl<'a> InitRefCollector<'a> {
                             .map(|p| (p.name.clone(), p.type_name.clone()))
                             .collect();
                         bodies.push((&body.stmts as *const Vec<crate::models::Stmt>, params));
-                        ctor_count += 1;
                     }
                 }
             }
@@ -873,13 +1176,6 @@ impl<'a> InitRefCollector<'a> {
         // the `visit_stmt` recursion (`visit_expr` reborrows `self`
         // mutably via the `New` arm). The pointers derive from
         // `self.classes` entries, which outlive the collector.
-        // TEMP-ORDERDIAG: trace the transitive ctor scan. Removed before close.
-        if diag {
-            eprintln!(
-                "[rubyc] TEMP-ORDERDIAG scan={class_name} decl={found_decl} ctors={ctor_count} refs={:?}",
-                self.refs
-            );
-        }
         // Bodies belong to the constructed class: nested same-class
         // calls (`this.RefreshLoggingEnabled()`) resolve there, not
         // in the initializer's class.
@@ -1051,14 +1347,6 @@ impl<'a> InitRefCollector<'a> {
             return;
         }
         let prev = std::mem::replace(&mut self.owner, owner.to_owned());
-        // TEMP-ORDERDIAG2: trace method-body scans. Removed before close.
-        if std::env::var("RUBYC_ORDERDIAG").is_ok()
-            && (owner.contains("AppContextConfigHelper")
-                || owner.contains("NumberFormatInfo")
-                || name.contains("TryParse"))
-        {
-            eprintln!("[rubyc] TEMP-ORDERDIAG2 methodscan={owner}::{base}");
-        }
         // SAFETY: pointers derive from `self.classes` entries, which
         // outlive the collector; the AST is never mutated mid-scan.
         for (ptr, params) in bodies {
@@ -1172,6 +1460,21 @@ impl<'a> InitRefCollector<'a> {
 impl Visitor for InitRefCollector<'_> {
     fn visit_expr(&mut self, expr: &Expr) {
         match expr {
+            Expr::NamedArg { value, .. } => self.visit_expr(value),
+            Expr::Checked { inner, .. } => self.visit_expr(inner),
+            // A static initializer may contain a lambda; its body's
+            // static reads still happen (lazily, but before any use), so
+            // they constrain init order and must be collected.
+            Expr::Lambda { body, .. } => match body {
+                crate::models::ast::expression::LambdaBody::Expr(e) => {
+                    self.visit_expr(e)
+                }
+                crate::models::ast::expression::LambdaBody::Block(b) => {
+                    for st in &b.stmts {
+                        self.visit_stmt(st);
+                    }
+                }
+            },
             Expr::Binary { lhs, rhs, .. } => {
                 self.visit_expr(lhs);
                 self.visit_expr(rhs);
@@ -1385,21 +1688,6 @@ fn init_class_order<'c>(
             }
         }
         for r in std::mem::take(&mut collector.refs) {
-            // TEMP-ORDERDIAG: show final refs per class. Removed before close.
-            // TEMP-SENTDIAG (2026-10): sentinel crash diagnosis. Removed before close.
-            if std::env::var("RUBYC_ORDERDIAG").is_ok()
-                && (class.name.contains("PortableThreadPool")
-                    || class.name.contains("HillClimbing")
-                    || class.name.contains("PoolingAsyncValueTaskMethodBuilder")
-                    || class.name.contains("ManualResetValueTaskSourceCore")
-                    || class.name.contains("StateMachineBox")
-                    || class.name.contains("SyncSuccessSentinel")
-                    || r.contains("NativeRuntimeEventSource")
-                    || r.contains("ManualResetValueTaskSourceCoreShared")
-                    || r.contains("CultureInfo"))
-            {
-                eprintln!("[rubyc] TEMP-ORDERDIAG class={} ref={r}", class.name);
-            }
             edge_to(&r, &mut deps);
         }
     }
@@ -1415,9 +1703,6 @@ fn init_class_order<'c>(
     // waiter (it has just 1 unmet: the dependency itself).
     let mut emitted = vec![false; n];
     let mut order: Vec<&'c ClassDecl> = Vec::with_capacity(n);
-    // TEMP-ORDERDIAG4: dump positions of key classes + cycle stalls.
-    // Removed before close.
-    let order_diag = std::env::var("RUBYC_ORDERDIAG").is_ok();
     for _ in 0..n {
         let mut pick: Option<usize> = None;
         for i in 0..n {
@@ -1454,134 +1739,6 @@ fn init_class_order<'c>(
         });
         emitted[i] = true;
         order.push(all_classes[i]);
-        if order_diag && stalled {
-            eprintln!(
-                "[rubyc] TEMP-ORDERDIAG4 stall@{}, emitting {} with {} unmet deps",
-                order.len(),
-                all_classes[i].name,
-                deps[i].iter().filter(|&&d| !emitted[d]).count()
-            );
-            // TEMP-ORDERDIAG7: name the unmet deps (cycle diagnosis).
-            // Removed before close.
-            if all_classes[i].name == "HillClimbing"
-                || all_classes[i].name == "CultureInfo"
-                || all_classes[i].name == "NumberFormatInfo"
-            {
-                let unmet: Vec<&str> = deps[i]
-                    .iter()
-                    .filter(|&&d| !emitted[d])
-                    .map(|&d| all_classes[d].name.as_str())
-                    .collect();
-                eprintln!(
-                    "[rubyc] TEMP-ORDERDIAG7 {} unmet={:?}",
-                    all_classes[i].name, unmet
-                );
-            }
-            // TEMP-ORDERDIAG8: trace one cycle by DFS through unmet
-            // deps, starting from HillClimbing's stall (the crash
-            // relevant one). Removed before close.
-            if order_diag && stalled && all_classes[i].name == "HillClimbing" {
-                static FIRST: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !FIRST.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    let mut path: Vec<usize> = vec![i];
-                    let mut seen: std::collections::HashSet<usize> =
-                        std::collections::HashSet::new();
-                    seen.insert(i);
-                    loop {
-                        let cur = *path.last().unwrap();
-                        let nxt = deps[cur]
-                            .iter()
-                            .find(|&&d| !emitted[d] && !seen.contains(&d));
-                        match nxt {
-                            Some(&n) => {
-                                seen.insert(n);
-                                path.push(n);
-                            }
-                            None => {
-                                // Dead end or back-edge: find a member of
-                                // path that `cur` waits on (the cycle).
-                                if let Some(&back) = deps[cur]
-                                    .iter()
-                                    .find(|&&d| path.contains(&d))
-                                {
-                                    let start = path.iter().position(|&x| x == back).unwrap();
-                                    let names: Vec<&str> = path[start..]
-                                        .iter()
-                                        .map(|&x| all_classes[x].name.as_str())
-                                        .collect();
-                                    eprintln!(
-                                        "[rubyc] TEMP-ORDERDIAG8 cycle={:?}",
-                                        names
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                        if path.len() > 40 {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if order_diag {
-        // TEMP-ORDERDIAG6: verify Kahn invariant (every dep emitted
-        // before its dependent). Removed before close.
-        let position: std::collections::HashMap<usize, usize> = order
-            .iter()
-            .enumerate()
-            .map(|(p, c)| {
-                let idx = all_classes.iter().position(|a| std::ptr::eq(*a, *c)).unwrap_or(usize::MAX);
-                (idx, p)
-            })
-            .collect();
-        let mut violations = 0usize;
-        for (i, _) in all_classes.iter().enumerate() {
-            for &d in &deps[i] {
-                let (pi, pd) = (position[&i], position[&d]);
-                if pd > pi {
-                    violations += 1;
-                    if violations <= 5 {
-                        eprintln!(
-                            "[rubyc] TEMP-ORDERDIAG6 VIOLATION {}@{} after {}@{}",
-                            all_classes[d].name, pd, all_classes[i].name, pi
-                        );
-                    }
-                }
-            }
-        }
-        if violations > 0 {
-            eprintln!("[rubyc] TEMP-ORDERDIAG6 violations={violations}");
-        }
-        for (pos, c) in order.iter().enumerate() {
-            if c.name.contains("CultureInfo") && !c.name.contains("Data")
-                || c.name == "HillClimbing"
-                || c.name == "PortableThreadPool"
-                // TEMP-SENTDIAG positions. Removed before close.
-                || c.name.contains("PoolingAsyncValueTaskMethodBuilder")
-                || c.name.contains("ManualResetValueTaskSourceCore")
-                || c.name.contains("StateMachineBox")
-                || c.name.contains("SyncSuccessSentinel")
-            {
-                let idx = all_classes
-                    .iter()
-                    .position(|a| std::ptr::eq(*a, *c))
-                    .unwrap_or(usize::MAX);
-                eprintln!("[rubyc] TEMP-ORDERDIAG4 order@{pos} = {} idx={idx}", c.name);
-            }
-        }
-        // TEMP-ORDERDIAG5: dump deps of key classes. Removed before close.
-        if let (Some(&hi), Some(&ci)) = (pos.get("HillClimbing"), pos.get("CultureInfo")) {
-            eprintln!(
-                "[rubyc] TEMP-ORDERDIAG5 hi={hi} ci={ci} contains={} ndeps={}",
-                deps[hi].contains(&ci),
-                deps[hi].len()
-            );
-            let cnames: Vec<&str> = deps[ci].iter().map(|&d| all_classes[d].name.as_str()).collect();
-            eprintln!("[rubyc] TEMP-ORDERDIAG5 CultureInfo ndeps={} deps={:?}", cnames.len(), cnames);
-        }
     }
     order
 }
@@ -1622,6 +1779,8 @@ pub fn lower_with_owners(
 ) -> Result<Program, LowerError> {
     // Fresh run, fresh call-index cache (keyed by table address).
     lower::clear_fn_index_cache();
+    lower::clear_subclass_cache();
+    lower::clear_lookup_cache();
     let table = semantic::analyze_with_preloaded(unit, owners, preloaded)
         .map_err(LowerError::Semantic)?;
 
@@ -1650,36 +1809,6 @@ pub fn lower_with_owners(
     let mut all_classes: Vec<&ClassDecl> = Vec::new();
     for c in &classes {
         flatten(c, &mut all_classes);
-    }
-    // TEMP-VTALIGN: verify vtable row basis (emission order) matches
-    // table order used by `new`. Removed before close.
-    if std::env::var("RUBYC_VTALIGN").is_ok() {
-        let filtered: Vec<&str> = all_classes
-            .iter()
-            .filter(|c| table.class(&c.name).is_some())
-            .map(|c| c.name.as_str())
-            .collect();
-        let mut mism = 0usize;
-        let mut first_mismatch = String::new();
-        for (i, f) in filtered.iter().enumerate() {
-            let tp = table.classes.get(i).map(|c| c.key.path.as_str()).unwrap_or("<none>");
-            // Compare by simple name to tolerate qualification diffs.
-            let fs = f.rsplit('.').next().unwrap_or(f);
-            let ts = tp.rsplit('.').next().unwrap_or(tp).split('<').next().unwrap_or(tp);
-            if fs != ts {
-                if mism == 0 {
-                    first_mismatch = format!("all[{i}]={f} table[{i}]={tp}");
-                }
-                mism += 1;
-            }
-        }
-        eprintln!(
-            "[rubyc] TEMP-VTALIGN filtered={} table={} mismatches={} first={}",
-            filtered.len(),
-            table.classes.len(),
-            mism,
-            first_mismatch
-        );
     }
 
     // Qualified AST path per class declaration (pointer-keyed): method
@@ -1822,19 +1951,6 @@ pub fn lower_with_owners(
         seen: &mut Vec<String>,
         exact_only: bool,
     ) -> Option<usize> {
-        // TEMP-WALKDBG2: print every walk entry (does the base walk
-        // recurse?). Removed before close.
-        if std::env::var("RUBYC_WALKDBG").is_ok()
-            && method == "GetBytes"
-            && class_name.contains("Encoding")
-        {
-            eprintln!(
-                "[rubyc] TEMP-WALKDBG2 enter class={} siglen={} seen={:?}",
-                class_name,
-                sig.len(),
-                seen,
-            );
-        }
         if class_name == "@start" {
             return None;
         }
@@ -1893,37 +2009,6 @@ pub fn lower_with_owners(
                 }
                 _ => None,
             });
-            // TEMP-SIGDBG: show both sides when a GetBytes sig
-            // match fails at an Encoding level (spelling drift?).
-            // Removed before close.
-            if std::env::var("RUBYC_SIGDBG").is_ok()
-                && method == "GetBytes"
-                && sig.len() == 5
-                && (class_name.contains("Encoding"))
-            {
-                for m in class.members.iter().filter_map(|m| match m {
-                    ClassMember::Method(md)
-                        if md.name == method && md.params.len() == sig.len() =>
-                    {
-                        Some(md)
-                    }
-                    _ => None,
-                }) {
-                    eprintln!(
-                        "[rubyc] TEMP-SIGDBG {}.{} decl=[{:?}] vs sig=[{:?}] body={}",
-                        class_name,
-                        method,
-                        m.params.iter().map(|p| p.type_name.clone()).collect::<Vec<_>>(),
-                        sig,
-                        m.body.is_some()
-                    );
-                }
-            }
-            // Remember the last attempt for the audit below; a hit
-            // with a resolving function index returns immediately.
-            // In exact-only mode there is no arity fallback (first
-            // pass): a same-arity mismatch must not preempt the base
-            // walk.
             found = if exact_only {
                 by_sig
             } else {
@@ -1984,70 +2069,6 @@ pub fn lower_with_owners(
             // No hit in this same-named declaration (partial part
             // without the method): try the next one.
         }
-            // TEMP-IMPLDBG2: outcome audit. Removed before close.
-            // TEMP-SENTDIAG6: include ConsoleEncoding/SetDefaultFallbacks
-            // (bisecting the slot-35 fault). Removed before close.
-            if std::env::var("RUBYC_IMPLDBG2").is_ok()
-                && (class_name.contains("Latin1")
-                    || class_name.contains("ConsoleEncoding")
-                    || class_name.contains("Encoding"))
-                && (method == "GetByteCount"
-                    || method == "GetBytes"
-                    || method == "SetDefaultFallbacks")
-            {
-                let key = format!(
-                    "{}::{}#{}",
-                    class_name,
-                    method,
-                    found.map(|d| d.params.len()).unwrap_or(999)
-                );
-                eprintln!(
-                    "[rubyc] TEMP-IMPLDBG2 class={} method={} tablesig={:?} found={} keyhit={} bases={:?}",
-                    class_name,
-                    method,
-                    sig,
-                    found
-                        .map(|d| format!(
-                            "{}#{}({})",
-                            d.name,
-                            d.params.len(),
-                            d.params
-                                .iter()
-                                .map(|p| p.type_name.clone())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ))
-                        .unwrap_or("NONE".to_string()),
-                    fn_index
-                        .get(&key)
-                        .and_then(|v| v.last())
-                        .map(|i| i.to_string())
-                        .unwrap_or("MISS".to_string()),
-                    table
-                        .class(class_name)
-                        .map(|e| e.bases.clone())
-                );
-            }
-        // TEMP-WALKDBG: trace impl_index_seen walk decisions.
-        // Removed before close.
-        if std::env::var("RUBYC_WALKDBG").is_ok()
-            && method == "GetBytes"
-            && class_name.contains("Encoding")
-        {
-            let n_same_named =
-                classes.iter().filter(|c| c.name == class_name).count();
-            let table_hit = table.class(class_name).is_some();
-            let nbases = table.class(class_name).map(|e| e.bases.len()).unwrap_or(999);
-            eprintln!(
-                "[rubyc] TEMP-WALKDBG class={} siglen={} same_named_decls={} table_hit={} nbases={} seen_len={}",
-                class_name,
-                sig.len(),
-                n_same_named,
-                table_hit,
-                nbases,
-                seen.len(),
-            );
-        }
         let info = table.class(class_name)?;
         info.bases.iter().find_map(|b| {
             impl_index_seen(classes, table, b, method, sig, fn_index, seen, exact_only)
@@ -2074,38 +2095,6 @@ pub fn lower_with_owners(
             let key = (fi.declaring_class.clone(), fi.name.clone());
             if !static_index.contains_key(&key) {
                 static_index.insert(key.clone(), statics.len() as u32);
-                // TEMP-STATICDIAG: dump static indices for crash correlation.
-                // Removed before close.
-                if std::env::var("RUBYC_STATICDIAG").is_ok()
-                    && (fi.name.contains("UICulture")
-                        || fi.name.contains("Invariant")
-                        || fi.name.contains("uiCulture")
-                        // TEMP-SENTDIAG2. Removed before close.
-                        || fi.name.contains("s_sentinel")
-                        // TEMP-SWDIAG3: newline static (bisecting the
-                        // CoreNewLine-null fault). Removed before close.
-                        || fi.name.contains("s_coreNewLine")
-                        || fi.name.contains("NewLineConst"))
-                {
-                    eprintln!(
-                        "[rubyc] TEMP-STATICDIAG idx={} {}.{} : {}",
-                        statics.len(),
-                        fi.declaring_class,
-                        fi.name,
-                        fi.type_name
-                    );
-                }
-                // TEMP-STATICDIAG2: dump specific indices for crash correlation.
-                // Removed before close.
-                if std::env::var("RUBYC_STATICDIAG2").is_ok() {
-                    eprintln!(
-                        "[rubyc] TEMP-STATICDIAG2 idx={} {}.{} : {}",
-                        statics.len(),
-                        fi.declaring_class,
-                        fi.name,
-                        fi.type_name
-                    );
-                }
                 statics.push(IrStatic {
                     name: fi.name.clone(),
                     class: info.key.path.clone(),
@@ -2115,7 +2104,88 @@ pub fn lower_with_owners(
         }
     }
 
+    // Canonical type descriptors live in static slots after the real
+    // statics. The registry only records requests during lowering; the
+    // slots themselves are appended once the final count is known (a
+    // `typeof` in @start can add more).
+    let type_registry =
+        std::cell::RefCell::new(lower::TypeRegistry::new(statics.len() as u32));
+
     // ---- methods
+
+
+
+/// The `[UnsafeAccessor]` target of an extern local function: the
+/// method name from the attribute, and the target type from the first
+/// parameter's `[UnsafeAccessorType("Type, Assembly")]`.
+fn accessor_target(
+    attrs: &[crate::models::Attribute],
+    params: &[crate::models::Param],
+) -> Option<(String, String)> {
+    let ua = attrs.iter().find(|a| {
+        a.name.rsplit('.').next() == Some("UnsafeAccessor")
+    })?;
+    let method = ua.arguments.iter().find_map(|a| match (&a.name, &a.value) {
+        (Some(n), crate::models::AttributeValue::Str(s)) if n == "Name" => Some(s.clone()),
+        _ => None,
+    })?;
+    let type_attr = params.first()?.attrs.iter().find(|a| {
+        a.name.rsplit('.').next() == Some("UnsafeAccessorType")
+    })?;
+    let type_str = type_attr.arguments.first().and_then(|a| match &a.value {
+        crate::models::AttributeValue::Str(s) => Some(s.clone()),
+        _ => None,
+    })?;
+    let type_name = type_str
+        .split(',')
+        .next()
+        .unwrap_or(&type_str)
+        .trim()
+        .to_owned();
+    Some((type_name, method))
+}
+
+/// The target's function index and whether it is static. `None` when
+/// the target is not in this unit (the call then throws, as .NET does
+/// for a missing accessor target).
+fn resolve_accessor_target(
+    ctx: &Ctx<'_>,
+    type_name: &str,
+    method_name: &str,
+    local_arity: usize,
+) -> Option<(u32, bool)> {
+    let info = ctx.table.class(type_name)?;
+    let mi = info.methods.iter().find(|m| m.name == method_name)?;
+    // A static target drops the local's dummy receiver parameter.
+    let want = if mi.is_static {
+        local_arity.saturating_sub(1)
+    } else {
+        local_arity
+    };
+    if mi.param_types.len() != want {
+        return None;
+    }
+    let key = format!("{}::{}#{}", mi.declaring_class, mi.name, mi.param_types.len());
+    let idx = lower::functions_index(ctx).get(&key)?.last().copied()?;
+    Some((idx as u32, mi.is_static))
+}
+
+/// Append one zeroed static slot per canonical type descriptor. The
+/// slots are appended after every body is lowered, because @start and
+/// @init can still request new types.
+fn append_type_slots(
+    registry: &std::cell::RefCell<lower::TypeRegistry>,
+    statics: &mut Vec<IrStatic>,
+) {
+    let n = registry.borrow().len();
+    for i in 0..n {
+        statics.push(IrStatic {
+            name: format!("__type{i}"),
+            class: "@types".to_owned(),
+            type_name: "object".to_owned(),
+        });
+    }
+}
 
 /// Whether an entry method takes exactly one `string[]` parameter
 /// (`Main(string[] args)` in any namespace spelling): @start builds
@@ -2137,6 +2207,42 @@ fn takes_argv(method: &crate::models::MethodDecl) -> bool {
 /// enumerated the int capacity as a collection (fault reading
 /// address 11). `None` when no overload applies (caller skips the
 /// chain like a bodyless target).
+/// The class name and the type arguments of a generic spelling:
+/// `System.Threading.Tasks.Task<int>` gives `("Task", ["int"])`.
+fn split_generic_spelling(spelling: &str) -> (String, Vec<String>) {
+    let s = spelling.trim();
+    let Some(open) = s.find('<') else {
+        return (s.to_owned(), Vec::new());
+    };
+    let base = &s[..open];
+    let simple = base.rsplit('.').next().unwrap_or(base);
+    (simple.to_owned(), lower::explicit_type_args(s))
+}
+
+/// Substitute type variables inside a spelling: `T` becomes `int`,
+/// and `Func<T>?` becomes `Func<int>?`. The variables are whole
+/// identifiers, so the substitution never touches a name that merely
+/// starts with the same letters.
+fn substitute_type_vars(spelling: &str, sub: &[(String, String)]) -> String {
+    if sub.is_empty() {
+        return spelling.to_owned();
+    }
+    let mut out = String::with_capacity(spelling.len());
+    let mut rest = spelling;
+    while !rest.is_empty() {
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(end);
+        match sub.iter().find(|(v, _)| v == word) {
+            Some((_, concrete)) => out.push_str(concrete),
+            None => out.push_str(word),
+        }
+        rest = tail;
+    }
+    out
+}
+
 fn pick_chain_ctor(
     cands: &[(Vec<String>, usize)],
     arg_tys: &[String],
@@ -2170,19 +2276,7 @@ fn pick_chain_ctor(
     // (name, arity, fidx, return type); failed lowerings keep their
     // slot (dummy body) but get a sentinel fidx so calls fall back
     // to the legacy zero placeholder instead of misrouting.
-    let local_decls = collect_static_locals(&all_classes);
-    // TEMP-LOCALDBG.
-    if std::env::var("RUBYC_LOCALDBG").is_ok() {
-        for ld in &local_decls {
-            eprintln!(
-                "[rubyc] TEMP-LOCALDBG collected {}.{}.{}#{}",
-                ld.class_name,
-                ld.method_name,
-                ld.local_name,
-                ld.params.len()
-            );
-        }
-    }
+    let local_decls = collect_static_locals(&all_classes, &class_paths);
     let mut local_table: Vec<(String, String, String, usize, usize, String)> = local_decls
         .iter()
         .enumerate()
@@ -2201,20 +2295,6 @@ fn pick_chain_ctor(
     // numbering with @start at 0) so `: base(args)` chains resolve
     // even when a derived class is declared before its base. Must
     // mirror the lowering skip rules below (no body, destructors,
-    // >64 params, TEMP-SKIPMETHOD): any divergence silently retargets
-    // every chain call (see below). Numbering starts past the local
-    // functions, which push first (each `local_decls` entry emits
-    // exactly one function, including fail-open placeholders).
-    //
-    // Keyed by (class, arity) to a declaration-ordered list of
-    // (param-type signature, fidx): same-arity overloads MUST NOT
-    // collapse — `Exception(string?, Exception?)` vs
-    // `Exception(SerializationInfo, StreamingContext)` shared one
-    // slot under last-wins, retargeting every `: base(msg, inner)`
-    // chain in the framework into the serialization ctor (infinite
-    // `ThrowIfNull` recursion at runtime). The use site selects by
-    // exact signature, falling back to the first (declaration
-    // order) entry.
     let mut ctor_index: std::collections::BTreeMap<(String, usize), Vec<(Vec<String>, usize)>> =
         Default::default();
     {
@@ -2231,14 +2311,10 @@ fn pick_chain_ctor(
                     if method.params.len() > 64 {
                         continue;
                     }
-                    // TEMP-SKIPMETHOD mirror (diagnostic): a skipped
-                    // method occupies no slot. Removed before close.
-                    if std::env::var("RUBYC_SKIPMETHOD").is_ok()
-                        && method.name == "LCIDToLocaleName"
-                    {
-                        continue;
-                    }
-                    n += 1;
+                    // Same shift as `functions_index`: the ctor chain
+                    // table numbers functions, so a preceding method's
+                    // lifted lambdas move every later constructor.
+                    n += 1 + method.body.as_ref().map(count_lambdas).unwrap_or(0);
                     if method.ret_type.is_empty() && method.name == class.name {
                         let sig: Vec<String> =
                             method.params.iter().map(|p| p.type_name.clone()).collect();
@@ -2257,13 +2333,24 @@ fn pick_chain_ctor(
             ld.class_name, ld.method_name, ld.local_name,
             ld.params.len()
         );
-        let mut f = IrFunction::new(&fname, ReceiverKind::None, ld.params.len());
-        let mut lb = lower::Body::new(&mut f, &mut strings);
+        let mut f = IrFunction::new(
+            &fname,
+            ReceiverKind::None,
+            ld.params.len() + ld.method_vars.len(),
+        );
+        let mut lb = lower::Body::new(&mut f, &mut strings, &type_registry);
         let lctx = Ctx {
             table: &table,
+            class_paths: &class_paths,
             current_class: &ld.class_name,
-            current_info: None,
-            current_path: None,
+            // The local function's body belongs to the enclosing class,
+            // named by its QUALIFIED path: the access rule compares
+            // paths, and a nested type's bare name is ambiguous.
+            current_info: ld
+                .class_path
+                .as_deref()
+                .and_then(|p| table.class(p)),
+            current_path: ld.class_path.as_deref(),
             classes: &all_classes,
             import_index: &import_index,
             dep_imports: &dep_imports,
@@ -2271,22 +2358,120 @@ fn pick_chain_ctor(
             static_index: &static_index,
             defines,
             method_vars: &ld.method_vars,
+                type_subst: None,
             local_fns: &local_table,
             current_method: Some(ld.method_name.clone()),
             current_ret: Some(ld.ret_type.clone()),
+            lambda_deferred: None,
+                    lambda_base: 0,
         };
         let lowered: Result<(), LowerError> = (|| {
             lb.scope_mut().push();
-            // TEMP-MTRACE for locals (mirrors method markers).
-            if std::env::var("RUBYC_MTRACE").is_ok() {
-                let marker = format!("M {}::{} (local)\n", ld.class_name, ld.local_name);
-                let (off, len) = lb.string_literal(&marker);
-                lb.push_raw(Instr::EWriteStr { off, len });
-            }
             for p in &ld.params {
                 lb.scope_mut()
                     .declare(&p.name, &p.type_name, Access::Default)
                     .map_err(LowerError::UnsupportedConstruct)?;
+            }
+            // A static local function inherits the enclosing method's
+            // type parameters; it receives their handles after its own
+            // parameters and reads them through the same map.
+            for g in &ld.method_vars {
+                let slot = lb
+                    .scope_mut()
+                    .declare(
+                        &format!("__type${g}"),
+                        "System.Type",
+                        Access::Default,
+                    )
+                    .map_err(LowerError::UnsupportedConstruct)?;
+                let v = lb.bindings[slot];
+                lb.type_handles.insert(g.clone(), v);
+            }
+            // The enclosing method's constraints: a member on one of
+            // the inherited type parameters binds through them.
+            lb.constraints = ld.constraints.clone();
+            // Constants visible at the declaration are part of the
+            // local function's compile-time world; materialize them in
+            // its own frame (they are not captures).
+            for (cname, cty, cinit) in &ld.consts {
+                let v = lower::eval(cinit, &mut lb, &lctx)?;
+                let slot = lb
+                    .scope_mut()
+                    .declare(cname, cty, Access::Default)
+                    .map_err(LowerError::UnsupportedConstruct)?;
+                while lb.bindings.len() <= slot {
+                    let fresh = lb.fresh();
+                    lb.bindings.push(fresh);
+                }
+                let home = lb.bindings[slot];
+                lb.mov(home, v);
+            }
+            // An `extern` local function (an `[UnsafeAccessor]`
+            // declaration) has no body: the attribute names the target
+            // method — the attribute carries the method name, and the
+            // first parameter's `[UnsafeAccessorType]` carries the
+            // target type. The call is emitted here, so the target's
+            // function index is known.
+            if ld.is_extern {
+                let target = accessor_target(&ld.attrs, &ld.params);
+                let resolved = target.as_ref().and_then(|(ty, m)| {
+                    resolve_accessor_target(&lctx, ty, m, ld.params.len())
+                });
+                match resolved {
+                    Some((fidx, is_static)) => {
+                        let mut argv: Vec<crate::native::ir::VReg> = Vec::new();
+                        for i in 0..ld.params.len() {
+                            // A static target takes no receiver: the
+                            // local's first parameter is the dummy .NET
+                            // declares for it.
+                            if is_static && i == 0 {
+                                continue;
+                            }
+                            argv.push(lb.bindings[i]);
+                        }
+                        let dst = lb.fresh();
+                        if is_static {
+                            lb.push_raw(crate::native::ir::Instr::CallStatic {
+                                dst,
+                                fidx,
+                                args: argv,
+                            });
+                        } else {
+                            lb.push_raw(crate::native::ir::Instr::CallFn {
+                                dst,
+                                fidx,
+                                args: argv,
+                            });
+                        }
+                        lb.terminate(crate::native::ir::Terminator::Ret(Some(dst)));
+                        return Ok(());
+                    }
+                    None => {
+                        // The target is not in this unit: .NET throws
+                        // for a missing accessor target, and the
+                        // source's `catch` handles it. The exception
+                        // type must exist for that to mean anything:
+                        // a null exception object would crash the
+                        // handler instead of reporting.
+                        if lctx.table.class("System.MissingMethodException").is_none() {
+                            return Err(LowerError::UnsupportedConstruct(format!(
+                                "`[UnsafeAccessor]` target '{}' is not in this unit, and System.MissingMethodException is not available to report it",
+                                target
+                                    .map(|(t, m)| format!("{t}.{m}"))
+                                    .unwrap_or_else(|| "an unnamed target".to_owned())
+                            )));
+                        }
+                        let ex = crate::models::Expr::New {
+                            class_name: "System.MissingMethodException".to_owned(),
+                            args: Vec::new(),
+                            init: Vec::new(),
+                            span: Default::default(),
+                        };
+                        let obj = lower::eval(&ex, &mut lb, &lctx)?;
+                        lb.terminate(crate::native::ir::Terminator::Unwind { src: obj });
+                        return Ok(());
+                    }
+                }
             }
             for s in &ld.body.stmts {
                 if lb.is_sealed() {
@@ -2302,12 +2487,12 @@ fn pick_chain_ctor(
             Ok(()) => {
                 functions.push(lb.finish_with(Terminator::Ret(None)));
             }
-            Err(_) => {
-                let mut db = lower::Body::new(&mut f, &mut strings);
-                db.scope_mut().push();
-                db.seal_with_return_zero();
-                functions.push(db.finish_with(Terminator::Ret(None)));
-                local_table[j].4 = usize::MAX;
+            // A method that cannot be lowered gets no body at all. It
+            // used to be emitted as a stub returning 0, so calling it
+            // silently produced 0; now the missing implementation is a
+            // hard build error.
+            Err(e) => {
+                return Err(e);
             }
         }
     }
@@ -2331,20 +2516,6 @@ fn pick_chain_ctor(
             let Some(body) = &method.body else {
                 continue;
             };
-            // TEMP-SKIPMETHOD (diagnostic): skip runaway methods.
-            // Removed before close.
-            if std::env::var("RUBYC_SKIPMETHOD").is_ok()
-                && method.name == "LCIDToLocaleName"
-            {
-                continue;
-            }
-            // TEMP-BIGFN: method start trace (last line before an
-            // overflow names the culprit).
-            if std::env::var("RUBYC_BIGFN").is_ok() {
-                eprintln!("[rubyc] TEMP-METHOD {}.{}", class.name, method.name);
-            }
-            // Destructors (~Class) are not wired into the runtime yet; skip
-            // them (they are not called explicitly in the fixture).
             if method.name.starts_with('~') {
                 continue;
             }
@@ -2364,12 +2535,21 @@ fn pick_chain_ctor(
                 } else {
                     ReceiverKind::This
                 },
-                method.params.len(),
+                method.params.len() + method.generic_params.len(),
             );
             f.is_async = method.is_async;
-            let mut lb = lower::Body::new(&mut f, &mut strings);
+            let mut lb = lower::Body::new(&mut f, &mut strings, &type_registry);
+            // Lambdas met while lowering THIS body. Their functions are
+            // emitted immediately after it, so the index `eval` predicts
+            // (`base + 1 + position`) is exactly where each one lands.
+            let lambda_deferred: std::cell::RefCell<Vec<LambdaDeferred>> =
+                std::cell::RefCell::new(Vec::new());
+            // This method's own final index: nothing pushes functions
+            // while a body is being lowered, so it is known here.
+            let lambda_base = (functions.len() + 1) as u32;
             let ctx = Ctx {
                 table: &table,
+                class_paths: &class_paths,
                 current_class: &class.name,
                 current_info: current_entry(
                     &table,
@@ -2389,6 +2569,9 @@ fn pick_chain_ctor(
                 static_index: &static_index,
                 defines,
                 method_vars: &method.generic_params,
+                type_subst: None,
+                lambda_deferred: Some(&lambda_deferred),
+                lambda_base,
                 // Static local functions of this method (emitted
                 // above); bare calls resolve against them first.
                 local_fns: &local_table,
@@ -2397,63 +2580,7 @@ fn pick_chain_ctor(
             };
 
             lb.scope_mut().push();
-            // TEMP-IRDUMP: print lowered IR for target methods.
-            // `RUBYC_IRDUMP` lists `Method` or `Class.Method` names
-            // (comma-separated; default preserves the legacy
-            // `SetDefaultFallbacks` target). Removed before close.
-            let dump_spec = std::env::var("RUBYC_IRDUMP").unwrap_or_default();
-            let dump_ir = !dump_spec.is_empty()
-                && {
-                    let full = format!("{}.{}", class.name, method.name);
-                    dump_spec.split(',').any(|w| {
-                        w.trim() == method.name || w.trim() == full || w.trim().is_empty() && method.name == "SetDefaultFallbacks"
-                    })
-                };
-            // TEMP-MTRACE: method-entry markers for the UTF8NoBOM trap
-            // hunt. RUBYC_MTRACE=all traces everything; otherwise only
-            // Encoding/Fallback classes. Removed before close.
-            // The `@f{idx}` suffix is the emission function index
-            // (matches TEMP-FIDXDIAG): overloads share `Class.method`
-            // spellings, so the suffix is the only way to tell
-            // `IsEnabled#0` from `IsEnabled#3` in a crash trace.
-            if std::env::var("RUBYC_MTRACE").is_ok()
-                && (std::env::var("RUBYC_MTRACE").unwrap_or_default() == "all"
-                    || class.name.contains("Encoding")
-                    || class.name.contains("Fallback"))
-            {
-                let marker = format!(
-                    "M {}::{}@f{}\n",
-                    class.name,
-                    method.name,
-                    functions.len() + 1
-                );
-                let (off, len) = lb.string_literal(&marker);
-                lb.push_raw(Instr::EWriteStr { off, len });
-            }
-            // TEMP-MTRACEVALS2: raw argument values (vregs 1..=4,
-            // comma-separated) for count/address verification.
-            // Removed before close.
-            if std::env::var("RUBYC_MTRACEVALS").is_ok()
-                && (method.name == "TranscodeToUtf8"
-                    || method.name == "GetBytesFast"
-                    || method.name == "Rent"
-                    || method.name == "Span"
-                    || method.name == "ReadOnlySpan")
-            {
-                let n = method.params.len().min(4) as u32;
-                for i in 1..=n {
-                    lb.push_raw(Instr::EWriteInt { src: VReg(i) });
-                    let (coff, clen) = lb.string_literal(",");
-                    lb.push_raw(Instr::EWriteStr { off: coff, len: clen });
-                }
-            }
-            // Bindings were seeded: vreg 0 = this, 1..=n = params.
-            // `this` binds only in instance methods WITHOUT an `@this`
-            // parameter: `@this` declares an ordinary parameter which
-            // shadows the receiver keyword per C# scoping (static
-            // methods, the common case, never have a receiver). Bare
-            // `this` still resolves via the keyword fallbacks in
-            // eval/static_type_of when unbound.
+
             let has_this_param = method.params.iter().any(|p| p.name == "this");
             if !method.is_static && !has_this_param {
                 lb.scope_mut()
@@ -2465,70 +2592,34 @@ fn pick_chain_ctor(
                     .declare_byref(&p.name, &p.type_name, Access::Default, p.is_byref)
                     .map_err(LowerError::UnsupportedConstruct)?;
             }
-            // TEMP-ARGTRACE: print integer params at entry of a named
-            // method (bisecting arg corruption). Removed before close.
-            // `RUBYC_ARGTRACE=1` keeps the legacy `FromUnits` target;
-            // any other value names a method substring to trace.
-            if (std::env::var("RUBYC_ARGTRACE").is_ok() && method.name == "FromUnits")
-                || (std::env::var("RUBYC_ARGTRACE").is_ok()
-                    && method.name.contains(
-                        &std::env::var("RUBYC_ARGTRACE").unwrap_or_default(),
+            // The method's constraints: a member or indexer on a
+            // type-parameter receiver binds through them.
+            lb.constraints = method.constraints.clone();
+            // Hidden type handles follow the declared parameters. They
+            // are not source names; the scope slot still maps to the
+            // argument register the caller filled.
+            for g in &method.generic_params {
+                let slot = lb
+                    .scope_mut()
+                    .declare(
+                        &format!("__type${g}"),
+                        "System.Type",
+                        Access::Default,
                     )
-                    && std::env::var("RUBYC_ARGTRACE").unwrap_or_default() != "1")
-            {
-                let (off, len) = lb.string_literal(&format!("ARGTRACE {} ", method.name));
-                lb.push_raw(Instr::EWriteStr { off, len });
-                for (i, _p) in method.params.iter().enumerate() {
-                    // Param homes are VReg(i+1) by convention (VReg0 is
-                    // `this`/padding) — read directly, bypassing
-                    // scope/binding lookup (which may itself be under
-                    // test).
-                    let v = crate::native::ir::VReg((i + 1) as u32);
-                    lb.push_raw(Instr::EWriteInt { src: v });
-                    let (off, len) = lb.string_literal(" ");
-                    lb.push_raw(Instr::EWriteStr { off, len });
-                }
-                let (off, len) = lb.string_literal("\n");
-                lb.push_raw(Instr::EWriteStr { off, len });
+                    .map_err(LowerError::UnsupportedConstruct)?;
+                let v = lb.bindings[slot];
+                lb.type_handles.insert(g.clone(), v);
             }
-            // TEMP-ARGTRACE2: dump ReadOnlySpan ctor params (pointer,
-            // length) to bisect the [3] fault. Removed before close.
-            if std::env::var("RUBYC_ARGTRACE2").is_ok()
-                && class.name.contains("ReadOnlySpan")
-                && method.params.len() == 2
             {
-                let tag = format!(
-                    "ROS-ctor({},{}) ",
-                    method
-                        .params
-                        .first()
-                        .map(|p| p.type_name.as_str())
-                        .unwrap_or("?"),
-                    method
-                        .params
-                        .get(1)
-                        .map(|p| p.type_name.as_str())
-                        .unwrap_or("?")
-                );
-                let (off, len) = lb.string_literal(&tag);
-                lb.push_raw(Instr::EWriteStr { off, len });
-                for p in &method.params {
-                    if let Some(sym) = lb.scope_mut().lookup(&p.name) {
-                        let slot = sym.slot;
-                        if slot < lb.bindings.len() {
-                            let v = lb.bindings[slot];
-                            lb.push_raw(Instr::EWriteInt { src: v });
-                            let (off, len) = lb.string_literal("\n");
-                            lb.push_raw(Instr::EWriteStr { off, len });
-                        }
+                let declared_fields: Vec<String> = table
+                    .class(&class.name)
+                    .map(|i| i.fields.iter().map(|f| f.name.clone()).collect())
+                    .unwrap_or_default();
+                for pname in &class.primary_ctor_params {
+                    if !declared_fields.iter().any(|f| f == pname) {
+                        lb.bind_zero_placeholder(pname);
                     }
                 }
-            }
-            // Primary-constructor params are visible in every member
-            // body; their values bind at `new` (field initializers) and
-            // placeholder here (see `bind_zero_placeholder`).
-            for pname in &class.primary_ctor_params {
-                lb.bind_zero_placeholder(pname);
             }
 
             // Constructor chain: `: base(args)` or `: this(args)`. A
@@ -2620,12 +2711,17 @@ fn pick_chain_ctor(
                     // collapsing once routed every
                     // `: base(msg, inner)` into
                     // `Exception(SerializationInfo, StreamingContext)`.
-                    let base_name = class.bases.first().map(|s| s.as_str()).unwrap_or("");
+                    let base_decl = class.bases.first().map(|s| s.as_str()).unwrap_or("");
+                    // A generic base is declared with its arguments
+                    // (`Task<int>`), but its constructors are the
+                    // class's own (`Task`), and their signatures spell
+                    // the base's type parameters (`TResult`). So the
+                    // lookup uses the class name, and the arguments
+                    // stand for the parameters when the candidates
+                    // are ranked.
+                    let (base_name, base_args) = split_generic_spelling(base_decl);
                     if !base_name.is_empty() {
-                        // TEMP-CHAINDBG2: audit base-chain resolution.
-                        // Removed before close.
-                        let chain_dbg = std::env::var("RUBYC_CHAINDBG2").is_ok()
-                            && (class.name.contains("Task") || base_name.contains("Task"));
+                        // A base constructor that does not resolve is reported, not
                         if let Some(cands) =
                             ctor_index.get(&(base_name.to_string(), args.len()))
                         {
@@ -2641,21 +2737,28 @@ fn pick_chain_ctor(
                                 .find(|c| c.name == base_name)
                                 .map(|c| c.generic_params.clone())
                                 .unwrap_or_default();
-                            if let Some(idx) =
-                                pick_chain_ctor(cands, &arg_tys, &table, &base_vars)
+                            // The base's type parameters stand for the
+                            // derived class's arguments: `Task<int>`'s
+                            // constructor takes a `TResult`, which is
+                            // `int` here.
+                            let subst: Vec<(String, String)> = base_vars
+                                .iter()
+                                .cloned()
+                                .zip(base_args.iter().cloned())
+                                .collect();
+                            let cands: Vec<(Vec<String>, usize)> = cands
+                                .iter()
+                                .map(|(sig, idx)| {
+                                    (
+                                        sig.iter()
+                                            .map(|t| substitute_type_vars(t, &subst))
+                                            .collect(),
+                                        *idx,
+                                    )
+                                })
+                                .collect();
+                            if let Some(idx) = pick_chain_ctor(&cands, &arg_tys, &table, &base_vars)
                             {
-                                if chain_dbg {
-                                    eprintln!(
-                                        "[rubyc] TEMP-CHAINDBG2 base-chain {}.{}[generics={}] -> {}#{} fidx={} argtys={:?}",
-                                        class.name,
-                                        method.name,
-                                        class.generic_params.len(),
-                                        base_name,
-                                        args.len(),
-                                        idx,
-                                        arg_tys,
-                                    );
-                                }
                                 let mut argv = vec![VReg(0)]; // this
                                 for a in &args {
                                     // Bare method names (method groups)
@@ -2665,22 +2768,28 @@ fn pick_chain_ctor(
                                     argv.push(lower::eval(a, &mut lb, &ctx)?);
                                 }
                                 lb.call_fn(idx, argv);
-                            } else if chain_dbg {
-                                eprintln!(
-                                    "[rubyc] TEMP-CHAINDBG2 base-chain MISS(no-pick) {}.{} -> {}#{} candidates={} argtys={:?}",
-                                    class.name,
-                                    method.name,
-                                    base_name,
-                                    args.len(),
-                                    cands.len(),
-                                    arg_tys,
-                                );
+                            } else {
+                                // `: base(args)` with no applicable
+                                // constructor: skipping it leaves the
+                                // base half-constructed, which reads as
+                                // a successful construction. Report it.
+                                return Err(LowerError::UnsupportedConstruct(
+                                    format!(
+                                        "no constructor of '{base_name}' accepts {} argument(s) for '{}.{}(: base(...))'",
+                                        args.len(),
+                                        class.name,
+                                        method.name
+                                    ),
+                                ));
                             }
-                        } else if chain_dbg {
-                            eprintln!(
-                                "[rubyc] TEMP-CHAINDBG2 base-chain MISS(no-key) {}.{} -> {}#{}",
-                                class.name, method.name, base_name, args.len(),
-                            );
+                        } else {
+                            // Arity-matched constructor candidates
+                            // exist under no name at all — the base
+                            // type is missing from the unit entirely.
+                            return Err(LowerError::UnsupportedConstruct(format!(
+                                "no constructor candidates for base '{base_name}' in '{}.{}(: base(...))'",
+                                class.name, method.name
+                            )));
                         }
                     }
                 }
@@ -2772,75 +2881,124 @@ fn pick_chain_ctor(
             // FINAL Program::functions layout.
             let idx = functions.len() + 1;
             let mut finished = lb.finish_with(Terminator::Ret(None));
-            // TEMP-MEXIT: return markers pair with the MTRACE entry
-            // above, so a crash dump reconstructs the managed call
-            // stack (unmatched trailing M entries = live frames).
-            // Removed before close. `@f{idx}` matches the entry
-            // marker (emission function index; see TEMP-FIDXDIAG).
-            if std::env::var("RUBYC_MTRACE").unwrap_or_default() == "all" {
-                let marker = format!("R {}.{}@f{}\n", class.name, method.name, idx);
-                let (off, len) = strings.literal(&marker);
-                for bl in finished.blocks.iter_mut() {
-                    if matches!(bl.term, Terminator::Ret(_)) {
-                        bl.instrs.push(Instr::EWriteStr { off, len });
-                    }
-                }
-            }
-            // TEMP-BIGFN: flag giant functions (inlining bloat).
-            // ALSO prints every method start (last line before an
-            // overflow names the culprit).
-            if std::env::var("RUBYC_BIGFN").is_ok() && finished.vregs > 5000 {
-                eprintln!(
-                    "[rubyc] TEMP-BIGFN {}.{} vregs={} blocks={}",
-                    class.name, method.name, finished.vregs, finished.blocks.len()
-                );
-            }
-            if dump_ir {
-                eprintln!("[rubyc] TEMP-IRDUMP {}.{}({}) vregs={} blocks={}",
-                    class.name, method.name,
-                    method.params.iter().map(|p| format!("{}:{}", p.name, p.type_name)).collect::<Vec<_>>().join(", "),
-                    finished.vregs, finished.blocks.len());
-                for (bi, bl) in finished.blocks.iter().enumerate() {
-                    eprintln!("  [block {bi}] term={:?}", bl.term);
-                    for ins in &bl.instrs {
-                        eprintln!("    {ins:?}");
-                    }
-                }
-            }
             functions.push(finished);
-            // TEMP-NULLBASE-IR: scan the finished function for
-            // LoadField/StoreField off a vreg that is provably Const 0
-            // (single-block dataflow is enough for the prologue
-            // patterns). Removed before close.
-            if std::env::var("RUBYC_NULLBASE").is_ok() {
-                let last_fn = functions.last().expect("just pushed");
-                for bl in &last_fn.blocks {
-                    let mut consts: std::collections::BTreeMap<u32, i64> =
-                        Default::default();
-                    for ins in &bl.instrs {
-                        match ins {
-                            Instr::Const { dst, imm } => {
-                                consts.insert(dst.0, *imm);
-                            }
-                            Instr::Mov { dst, a } => {
-                                if let Some(v) = consts.get(&a.0).copied() {
-                                    consts.insert(dst.0, v);
-                                } else {
-                                    consts.remove(&dst.0);
-                                }
-                            }
-                            Instr::LoadField { dst, base, off } => {
-                                if consts.get(&base.0) == Some(&0) {
-                                    eprintln!(
-                                        "[rubyc] TEMP-NULLBASE-IR load off={off} in {}.{}",
-                                        class.name, method.name
-                                    );
-                                }
-                                consts.remove(&dst.0);
-                            }
-                            _ => {}
+
+            // Emit one function per lambda this body created. The indices
+            // `eval` predicted (`base + 1 + position`) are exactly where
+            // these land, because the bodies are lowered in the order they
+            // were met and each may append more (a lambda inside a lambda),
+            // which the index-driven loop handles.
+            {
+                let mut i = 0usize;
+                loop {
+                    let next: Option<LambdaDeferred> = {
+                        let q = lambda_deferred.borrow();
+                        q.get(i).cloned()
+                    };
+                    let Some(lam) = next else { break };
+                    i += 1;
+                    // Arity is the delegate object FIRST, then the
+                    // lambda's declared parameters: the call site passes
+                    // the object so the body can reach its captures.
+                    let mut inf = IrFunction::new(
+                        format!("{}::<lambda{}>", method.name, i),
+                        ReceiverKind::None,
+                        lam.params.len() + 1,
+                    );
+                    let mut fb = lower::Body::new(&mut inf, &mut strings, &type_registry);
+                    let lctx = Ctx {
+                        current_method: Some(format!(
+                            "{}::<lambda{}>",
+                            method.name, i
+                        )),
+                        current_ret: None,
+                        lambda_deferred: Some(&lambda_deferred),
+                        lambda_base,
+                        ..ctx
+                    };
+                    fb.scope_mut().push();
+                    let mut lowered: Result<(), LowerError> = Ok(());
+                    // Slot 0 is the delegate object (VReg(1) in this ABI:
+                    // VReg(0) is the reserved receiver slot).
+                    let delegate_vreg = VReg(1);
+                    if let Err(e) =
+                        fb.scope_mut().declare("__delegate", "object", crate::models::Access::Default)
+                    {
+                        return Err(LowerError::UnsupportedConstruct(e));
+                    }
+                    for p in &lam.params {
+                        // Parameter types come from the delegate at the
+                        // call site, which lowering does not see; `object`
+                        // keeps them addressable and 8 bytes wide, which is
+                        // what the ABI passes.
+                        if let Err(e) = fb.scope_mut().declare(
+                            p,
+                            "object",
+                            crate::models::Access::Default,
+                        ) {
+                            lowered = Err(LowerError::UnsupportedConstruct(e));
+                            break;
                         }
                     }
+                    for (k, cname) in lam.captures.iter().enumerate() {
+                        // Captured names are BY-REFERENCE locals whose
+                        // binding is the address stored in the delegate
+                        // object, so the body's reads dereference and its
+                        // writes store through — C# capture semantics.
+                        let slot = match fb.scope_mut().declare(
+                            cname,
+                            "object",
+                            crate::models::Access::Default,
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => return Err(LowerError::UnsupportedConstruct(e)),
+                        };
+                        let addr = fb.fresh();
+                        fb.push_raw(Instr::LoadField {
+                            dst: addr,
+                            base: delegate_vreg,
+                            off: 24 + 8 * k as u32,
+                        });
+                        while fb.bindings.len() <= slot {
+                            let v = fb.fresh();
+                            fb.bindings.push(v);
+                        }
+                        fb.bindings[slot] = addr;
+                        fb.scopes.make_byref(cname);
+                    }
+                    if lowered.is_ok() {
+                        lowered = match &lam.body {
+                            crate::models::ast::expression::LambdaBody::Expr(e) => {
+                                // The body's value IS the return value:
+                                // terminate with it rather than moving it
+                                // into a vreg (`VReg(0)` is the receiver
+                                // slot, not a return register, so writing
+                                // there discarded the result).
+                                lower::eval(e, &mut fb, &lctx).map(|v| {
+                                    fb.terminate(Terminator::Ret(Some(v)));
+                                })
+                            }
+                            crate::models::ast::expression::LambdaBody::Block(b) => {
+                                let mut r = Ok(());
+                                for st in &b.stmts {
+                                    if fb.is_sealed() {
+                                        break;
+                                    }
+                                    if let Err(e) = fb.statement(st, &lctx) {
+                                        r = Err(e);
+                                        break;
+                                    }
+                                }
+                                r
+                            }
+                        };
+                    }
+                    fb.scope_mut().pop();
+                    if let Err(e) = lowered {
+                        return Err(e);
+                    }
+                    fb.seal_with_return_zero();
+                    functions.push(inf);
                 }
             }
             fn_index.entry(fname).or_default().push(idx);
@@ -2852,6 +3010,17 @@ fn pick_chain_ctor(
                     if main_upper.is_some() {
                         return Err(LowerError::UnsupportedConstruct(crate::tf!(
                             "rubyc.native.ir.entry.ambiguous"
+                        )));
+                    }
+                    // C# requires an explicit return type on the entry
+                    // point: `static Main()` (no type) is CS0017-adjacent
+                    // and `static void Main()` is the only void form.
+                    // A declaration with no return type at all is a
+                    // different thing from `void`, and accepting it
+                    // silently made a malformed entry point look valid.
+                    if method.ret_type.is_empty() {
+                        return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                            "rubyc.native.ir.entry.main_needs_return_type"
                         )));
                     }
                     main_upper = Some((class.name.clone(), idx, takes_argv(method), method.is_static));
@@ -2894,7 +3063,21 @@ fn pick_chain_ctor(
                     .collect()
             })
             .unwrap_or_default();
-        let max_slot = entry_slots.iter().map(|(s, _, _)| *s).max().unwrap_or(0);
+        // Interface members live ABOVE every class slot: their index is
+        // the same in every row, which is what a call through an
+        // interface-typed receiver needs. Class slots keep their own
+        // numbering below the range.
+        let iface_entries = crate::native::semantic::iface_slot_entries(&table);
+        let iface_end = iface_entries
+            .last()
+            .map(|(_, s)| *s + 1)
+            .unwrap_or(0);
+        let max_slot = entry_slots
+            .iter()
+            .map(|(s, _, _)| *s)
+            .max()
+            .unwrap_or(0)
+            .max(iface_end.saturating_sub(1));
         let mut row = vec![usize::MAX; max_slot + 1];
         for (slot, mname, psig) in &entry_slots {
             // Preserve abstract holes: only fill when an implementation
@@ -2904,7 +3087,40 @@ fn pick_chain_ctor(
                 row[*slot] = idx;
             }
         }
-        let row_len = row.len();
+        if let Some(ci) = table.class(&class.name) {
+            for (iname, _arity) in &ci.interfaces {
+                for ((ikey, mname, msig), slot) in &iface_entries {
+                    if ikey != iname {
+                        continue;
+                    }
+                    let sig: Vec<String> = if msig.is_empty() {
+                        Vec::new()
+                    } else {
+                        msig.split(',').map(|t| t.to_owned()).collect()
+                    };
+                    // An explicit implementation (`int I.M()`, stored
+                    // as `I.M`) wins over a plain same-named method,
+                    // matching C# binding for calls through the
+                    // interface; inherited bodies resolve through
+                    // `impl_index`'s base walk.
+                    let explicit = format!("{iname}.{mname}");
+                    let idx = impl_index(
+                        &all_classes,
+                        &table,
+                        &class.name,
+                        &explicit,
+                        &sig,
+                        &fn_index,
+                    )
+                    .or_else(|| {
+                        impl_index(&all_classes, &table, &class.name, mname, &sig, &fn_index)
+                    });
+                    if let Some(i) = idx {
+                        row[*slot] = i;
+                    }
+                }
+            }
+        }
         vtables.push((
             class_paths
                 .get(&(*class as *const ClassDecl))
@@ -2912,48 +3128,6 @@ fn pick_chain_ctor(
                 .unwrap_or_else(|| class.name.clone()),
             row,
         ));
-        // TEMP-VIDBG: row index audit.
-        if std::env::var("RUBYC_VIDBG").is_ok()
-            && (class.name == "UTF8Encoding" || class.name.ends_with(".UTF8Encoding"))
-        {
-            eprintln!(
-                "[rubyc] TEMP-VIDBG row {} slots={}",
-                vtables.len() - 1,
-                row_len
-            );
-        }
-    }
-
-    // Synthetic placeholder-type row: `typeof(X)` boxes carry this row
-    // instead of X's own, so virtual calls on placeholders (which have
-    // no real implementation) land on a zero stub instead of executing
-    // a foreign slot or faulting past a short row (e.g.
-    // `CreateDefaultEqualityComparer` calling Type virtuals on a
-    // `typeof(object)` box faulted reading past Object's 4-entry row).
-    // Every slot answers the C# default (zero/false/null) — the
-    // documented placeholder grade, crash-free. Appended last, so no
-    // existing function index shifts (direct-call site indices stay
-    // valid); the zero function is vtable-referenced, hence a DCE
-    // root (kept). `typeof` sites compute this index as the
-    // table-backed declaration count (see `placeholder_row` in
-    // lowering). NOTE: `functions.last()` is no longer main — read
-    // entry points by name.
-    let zero_idx = functions.len() + 1;
-    {
-        let mut zf = IrFunction::new("__placeholder_zero", ReceiverKind::None, 0);
-        let dst = zf.fresh_vreg();
-        zf.blocks[0].instrs.push(Instr::Const { dst, imm: 0 });
-        zf.blocks[0].term = Terminator::Ret(Some(dst));
-        functions.push(zf);
-    }
-    {
-        let maxlen = vtables
-            .iter()
-            .map(|(_, r)| r.len())
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        vtables.push(("__placeholder_type".to_owned(), vec![zero_idx; maxlen]));
     }
 
     // ---- @start entry (executables only)
@@ -2987,6 +3161,7 @@ fn pick_chain_ctor(
         } else {
             let init_ctx = Ctx {
                 table: &table,
+                class_paths: &class_paths,
                 current_class: "",
                 current_info: None,
                 current_path: None,
@@ -2997,12 +3172,15 @@ fn pick_chain_ctor(
                 static_index: &static_index,
                 defines,
                 method_vars: &[],
+                type_subst: None,
                 local_fns: &local_table,
                 current_method: None,
                 current_ret: None,
+                lambda_deferred: None,
+                    lambda_base: 0,
             };
             let mut inf = IrFunction::new("@init", ReceiverKind::None, 0);
-            let mut ib = lower::Body::new(&mut inf, &mut strings);
+            let mut ib = lower::Body::new(&mut inf, &mut strings, &type_registry);
             ib.scope_mut().push();
 
     for class in &all_classes {
@@ -3031,6 +3209,9 @@ fn pick_chain_ctor(
                     // Same declaring-class viewer rule as `@start`.
                     let field_ctx = Ctx {
                         current_class: &class.name,
+                        current_path: class_paths
+                            .get(&(*class as *const ClassDecl))
+                            .map(|s| s.as_str()),
                         current_method: init_ctx.current_method.clone(),
                         current_ret: None,
                         ..init_ctx
@@ -3043,19 +3224,7 @@ fn pick_chain_ctor(
                             ib.statement(pre, &field_ctx)?;
                         }
                     }
-                    let cp = ib.checkpoint();
-                    let v = match lower::eval(minit, &mut ib, &field_ctx) {
-                        Ok(v) => v,
-                        Err(e) if is_prop => {
-                            ib.restore(cp);
-                            eprintln!(
-                                "[rubyc] warning: static initializer for {}.{} failed to lower ({}); leaving zeroed storage",
-                                class.name, mname, e
-                            );
-                            ib.const_i64(0)
-                        }
-                        Err(e) => return Err(e),
-                    };
+                    let v = lower::eval(minit, &mut ib, &field_ctx)?;
                     ib.store_static(idx, v);
                 }
             }
@@ -3063,7 +3232,8 @@ fn pick_chain_ctor(
             functions.push(ib.finish_with(Terminator::Ret(None)));
             Some(init_idx)
         };
-        return Ok(Program {
+        append_type_slots(&type_registry, &mut statics);
+        let program = Program {
             functions,
             statics: statics.clone(),
             vtables,
@@ -3080,7 +3250,9 @@ fn pick_chain_ctor(
             names: Vec::new(),
             entry: None,
             init,
-        });
+        };
+        verify::verify(&program).map_err(LowerError::IrInvalid)?;
+        return Ok(program);
     };
     let Some(entry_decl) = classes.iter().find(|c| c.name == entry_class) else {
         return Err(LowerError::NoMainMethod);
@@ -3089,9 +3261,10 @@ fn pick_chain_ctor(
         return Err(LowerError::NoMainMethod);
     };
 
-    let object_bytes = (info.fields.len() + 2) as u64 * 8;
+    let object_bytes = (info.fields.len() + INSTANCE_HEADER_SLOTS) as u64 * 8;
     let start_ctx = Ctx {
         table: &table,
+        class_paths: &class_paths,
         current_class: &entry_class,
         current_info: None,
         current_path: None,
@@ -3110,13 +3283,16 @@ fn pick_chain_ctor(
         static_index: &static_index,
         defines,
         method_vars: &[],
+                type_subst: None,
         local_fns: &local_table,
         current_method: None,
         current_ret: None,
+        lambda_deferred: None,
+                    lambda_base: 0,
     };
 
     let mut sf = IrFunction::new("@start", ReceiverKind::None, 0);
-    let mut sl = lower::Body::new(&mut sf, &mut strings);
+    let mut sl = lower::Body::new(&mut sf, &mut strings, &type_registry);
     sl.scope_mut().push();
 
     // Source-level assembly blocks execute in declaration order before the
@@ -3151,20 +3327,18 @@ fn pick_chain_ctor(
             // storage, nothing to run). Without the property arm,
             // static auto-properties (e.g. COM strategy singletons)
             // stayed null forever and faulted first use.
-            // `is_prop` marks the property arm: its initializers may
-            // use `out`-var declarations the parser only drains for
-            // fields (proper support is future work) — on lowering
-            // failure they fail soft to zeroed storage with a loud
-            // warning (same divergence grade as swallowed runtime
-            // throws), never a build break. Fields keep hard errors.
-            let (mname, minit, mpre, is_prop): (
+            // A static initializer that cannot be lowered is a build error.
+            // Properties used to fail soft to zeroed storage here (their
+            // `out`-var pre-statements are only drained for fields), but
+            // a warning plus a silent 0 is indistinguishable from a
+            // successful initialization at runtime.
+            let (mname, minit, mpre): (
                 &String,
                 &crate::models::Expr,
                 Option<&Vec<crate::models::Stmt>>,
-                bool,
             ) = match m {
                 ClassMember::Field(fd) if fd.is_static => {
-                    (&fd.name, &fd.init, Some(&fd.init_pre), false)
+                    (&fd.name, &fd.init, Some(&fd.init_pre))
                 }
                 ClassMember::Property(pd)
                     if pd.is_static
@@ -3172,102 +3346,33 @@ fn pick_chain_ctor(
                         && pd.set.is_none()
                         && pd.get_expr.is_none() =>
                 {
-                    (&pd.name, &pd.init, None, true)
+                    (&pd.name, &pd.init, None)
                 }
                 _ => continue,
             };
-            // TEMP-STATICDIAG3: audit static-index misses (a miss
-            // silently skips the initializer — zeroed storage
-            // forever). Removed before close.
-            if std::env::var("RUBYC_STATICDIAG").is_ok()
-                && (class.name.contains("CultureInfo")
-                    && !class.name.contains("Data")
-                    // TEMP-SENTDIAG3. Removed before close.
-                    || class.name.contains("ManualResetValueTaskSourceCoreShared")
-                    // TEMP-SWDIAG4. Removed before close.
-                    || class.name.contains("TextWriter")
-                    || class.name.contains("Environment"))
-            {
-                eprintln!(
-                    "[rubyc] TEMP-STATICDIAG3 class={} field={} has_idx={}",
-                    class.name,
-                    mname,
-                    static_index.contains_key(&(class.name.clone(), mname.clone()))
-                );
-            }
             let Some(&idx) = static_index.get(&(class.name.clone(), mname.clone())) else {
                 continue;
             };
-            // TEMP-INITTRACE: mark each EXECUTED static initializer on
-            // stderr so a throw/crash during @start identifies the
-            // culprit by its last line. RUBYC_SKIP_INIT (;-separated
-            // substrings of "Class::field") skips matching initializers
-            // (leaving zeroed storage) to walk past throwers. Gated on
-            // RUBYC_TRACE_INIT; all removed before close.
-            if let Ok(skip) = std::env::var("RUBYC_SKIP_INIT") {
-                let key = format!("{}::{}", class.name, mname);
-                if !skip.is_empty() && skip.split(';').any(|s| !s.is_empty() && key.contains(s)) {
-                    continue;
-                }
-            }
-            // TEMP-INITTRACE: zero instead of evaluating (keep the
-            // store) — splits eval-corruption from store-corruption.
-            // Removed before close.
-            let zero_init = std::env::var("RUBYC_ZERO_INIT").map(|z| {
-                let key = format!("{}::{}", class.name, mname);
-                !z.is_empty() && z.split(';').any(|s| !s.is_empty() && key.contains(s))
-            }).unwrap_or(false);
-            // TEMP-INITTRACE: allowlist — only initialize matching
-            // classes (semicolon substrings). Removed before close.
-            if let Ok(only) = std::env::var("RUBYC_ONLY_INIT") {
-                let key = format!("{}::{}", class.name, mname);
-                if !only.is_empty() && !only.split(';').any(|s| !s.is_empty() && key.contains(s)) {
-                    continue;
-                }
-            }
-            if std::env::var("RUBYC_TRACE_INIT").is_ok() {
-                let marker = format!("INIT {}::{}\n", class.name, mname);
-                let (off, len) = sl.string_literal(&marker);
-                sl.push_raw(Instr::EWriteStr { off, len });
-            }
-            // The initializer is the declaring class's own code (a
-            // private member call inside it is legal): evaluate with
-            // that class as viewer, not the entry class.
               let field_ctx = Ctx {
                 current_class: &class.name,
+                // The PATH must match the class this context switches
+                // to: inheriting the caller's path made the access
+                // rule compare unrelated types (a private const of
+                // the field's own class was denied).
+                current_path: start_ctx
+                    .table
+                    .class(&class.name)
+                    .map(|i| i.key.path.as_str()),
                 current_method: start_ctx.current_method.clone(),
                 current_ret: None,
                 ..start_ctx
             };
-            // Throwing initializers must not kill the executable:
-            // real runtimes run type initializers lazily on first
-            // access, but @start runs everything eagerly up front, so
-            // a single throwing static (a resource lookup, a host
-            // switch, a not-yet-implemented path) would abort the
-            // program before Main. Wrap each init so a throw leaves
-            // zeroed storage instead (the default(T) the field would
-            // hold had its initializer never run). Swallowing is a
-            // documented divergence, limited to static-init; ordinary
-            // method bodies keep exact throw semantics.
-            // TEMP-INITTRACE: RUBYC_NO_WRAP disables the swallowing
-            // wrapper (plain eval+store). Removed before close.
-            let no_wrap = std::env::var("RUBYC_NO_WRAP").is_ok();
-            let (body_b, join_b, exc_b) = if no_wrap {
-                (None, None, None)
-            } else {
-                let bb = sl.make_block();
-                let jb = sl.make_block();
-                let eb = sl.make_block();
-                let h = sl.fresh();
-                sl.push_raw(Instr::HandlerEnter { dst: h });
-                sl.terminate(Terminator::Branch {
-                    cond: Some(h),
-                    if_true: eb,
-                    if_false: bb,
-                });
-                sl.switch_to(bb);
-                (Some(bb), Some(jb), Some(eb))
-            };
+            // A throwing static initializer propagates, exactly as C#
+            // requires. @start runs every type initializer eagerly,
+            // so a throw here now aborts the program instead of being
+            // swallowed into zeroed storage: a field left at its
+            // default after a failed initializer reads like a
+            // successful initialization that happened to produce 0.
             // Bindings declared while parsing the initializer
             // (`out` vars; fields only — property initializers carry
             // none) lower first so the init sees them.
@@ -3276,45 +3381,15 @@ fn pick_chain_ctor(
                     sl.statement(pre, &field_ctx)?;
                 }
             }
-            let v = if zero_init {
-                sl.const_i64(0)
-            } else {
-                let cp = sl.checkpoint();
-                match lower::eval(minit, &mut sl, &field_ctx) {
-                    Ok(v) => v,
-                    Err(e) if is_prop => {
-                        // Loud fail-soft (see the arm comment): the
-                        // executable builds with zeroed storage for
-                        // this static instead of aborting the build.
-                        sl.restore(cp);
-                        eprintln!(
-                            "[rubyc] warning: static initializer for {}.{} failed to lower ({}); leaving zeroed storage",
-                            class.name, mname, e
-                        );
-                        sl.const_i64(0)
-                    }
-                    Err(e) => return Err(e),
-                }
-            };
+            // A static initializer that cannot be lowered is a build error, for
+            // properties as much as fields: a warning plus zeroed
+            // storage is indistinguishable at runtime from a
+            // successfully-initialized default.
+            let v = lower::eval(minit, &mut sl, &field_ctx)?;
             sl.store_static(idx, v);
-            if !no_wrap {
-                sl.push_raw(Instr::HandlerPop);
-                sl.goto(join_b.unwrap());
-                sl.switch_to(exc_b.unwrap());
-                let e = sl.fresh();
-                sl.push_raw(Instr::LoadExc { dst: e });
-                sl.goto(join_b.unwrap());
-                sl.switch_to(join_b.unwrap());
-            }
-            let _ = (body_b, join_b, exc_b);
         }
     }
     let obj = sl.fresh();
-    // TEMP-INITTRACE: mark @start completion (inits done, Main next).
-    if std::env::var("RUBYC_TRACE_INIT").is_ok() {
-        let (off, len) = sl.string_literal("MAIN\n");
-        sl.push_raw(Instr::EWriteStr { off, len });
-    }
     sl.alloc(obj, object_bytes);
     let vi = vtables
         .iter()
@@ -3324,19 +3399,150 @@ fn pick_chain_ctor(
     sl.vtable_addr(vt, vi as u32);
     sl.push_raw(Instr::StoreField { base: obj, off: 0, src: vt });
 
-    // Field initializers run against the fresh object. Statics are handled
-    // above (they have no object slot).
-    for fd in entry_decl.members.iter().filter_map(|m| match m {
-        // NOTE: `const` fields are compile-time only (no storage):
-        // emitting them here would store e.g. `CharSize = 2` at
-        // offset 0, clobbering the entry object's vtable word (see
-        // the same fix in the `new` path in `lower/eval.rs`).
-        ClassMember::Field(fd) if !fd.is_static && !fd.is_const => Some(fd),
-        _ => None,
-    }) {
-        let v = lower::eval(&fd.init, &mut sl, &start_ctx)?;
-        let off = (info.field(&fd.name).map(|fi| fi.offset_slots).unwrap_or(1) * 8) as u32;
-        sl.push_raw(Instr::StoreField { base: obj, off, src: v });
+    // The entry instance must be CONSTRUCTED, not just allocated. This
+    // used to allocate the object, run the entry class's own field
+    // initializers, and hand it straight to `Main` — which meant an
+    // instance `Main` observed a receiver whose constructor had never
+    // run (`class C { int W; public C() { W = 3; } int Main() { return W; } }`
+    // answered 0) and, when the entry class inherited, whose BASE's
+    // initializers had not run either.
+    //
+    // A constructor function is self-contained: it runs the class's field
+    // initializers and then its body, and chains to the base. So when the
+    // entry class has a parameterless one, calling it is the whole job.
+    // Only when there is no constructor does this fall back to running
+    // the initializers inline — and then it must walk the base chain
+    // (base first), because nothing else will.
+    let entry_ctor = fn_index
+        .get(&format!("{entry_class}::{entry_class}#0"))
+        .and_then(|v| v.last())
+        .copied();
+    if let Some(ctor_idx) = entry_ctor {
+        let call_dst = sl.fresh();
+        sl.push_raw(Instr::CallFn {
+            dst: call_dst,
+            fidx: ctor_idx as u32,
+            args: vec![obj],
+        });
+    } else {
+        // EVERY base, not just the first: a type with several bases has
+        // a constructor (or initializers) in each, and following only
+        // `bases.first()` left the others uninitialized
+        // (`class C : A, B` ran A's constructor and silently skipped
+        // B's). Depth-first, dependencies first, so each class is
+        // visited after everything it derives from; the `seen` set
+        // terminates on the diamond case and on cycles.
+        let mut chain: Vec<&ClassDecl> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        fn collect<'a>(
+            decl: &'a ClassDecl,
+            classes: &[&'a ClassDecl],
+            seen: &mut Vec<String>,
+            out: &mut Vec<&'a ClassDecl>,
+        ) {
+            if seen.iter().any(|n| n == &decl.name) {
+                return;
+            }
+            seen.push(decl.name.clone());
+            for b in &decl.bases {
+                let simple = b.split('<').next().unwrap_or(b).trim();
+                if let Some(base) = classes.iter().find(|d| d.name == simple) {
+                    collect(base, classes, seen, out);
+                }
+            }
+            out.push(decl);
+        }
+        collect(entry_decl, &classes, &mut seen, &mut chain);
+        // Base first, so a derived initializer sees a filled base. Each
+        // class in the chain contributes exactly one of the two: its
+        // constructor if it declares a parameterless one (a constructor
+        // runs its own field initializers and chains to ITS base), or
+        // its initializers inline. Without this, a base whose
+        // initialisation lives in a constructor body — the common case
+        // — was skipped entirely.
+        // Where each class's subobject begins inside the entry object.
+        // `chain` is ancestors-first, and the layout puts each class's
+        // fields after its ancestors', so a base's subobject starts at
+        // 16 + 8 * (field slots before it). A constructor is emitted once
+        // and writes at ITS class's offsets, so the receiver handed to a
+        // base constructor must be adjusted by this amount — otherwise
+        // every base writes at the same offsets and they collide (which
+        // is exactly what `class C : A, B` did).
+        let mut base_off: std::collections::BTreeMap<String, u32> = Default::default();
+        {
+            let mut slots: u32 = 0; // field slots, not object slots
+            for decl_in_chain in chain.iter() {
+                // RELATIVE to the first field slot: a class compiled on
+                // its own puts its first field at object slot 2, so a
+                // base whose subobject also starts at slot 2 needs no
+                // adjustment, and only bases sitting behind another
+                // base's fields are shifted.
+                base_off.insert(decl_in_chain.name.clone(), slots * 8);
+                let n = decl_in_chain
+                    .members
+                    .iter()
+                    .filter(|m| {
+                        matches!(
+                            m,
+                            ClassMember::Field(fd) if !fd.is_static && !fd.is_const
+                        )
+                    })
+                    .count() as u32;
+                slots += n;
+            }
+        }
+        for decl_in_chain in chain.iter() {
+            let ctor = fn_index
+                .get(&format!(
+                    "{name}::{name}#0",
+                    name = decl_in_chain.name
+                ))
+                .and_then(|v| v.last())
+                .copied();
+            if let Some(cidx) = ctor {
+                if decl_in_chain.name != entry_class {
+                    let off = base_off
+                        .get(&decl_in_chain.name)
+                        .copied()
+                        .unwrap_or(0);
+                    let recv = if off == 0 {
+                        obj
+                    } else {
+                        let o = sl.const_i64(off as i64);
+                        sl.emit(Instr::Bin {
+                            dst: VReg(0),
+                            op: crate::native::ir::BinOp::Add,
+                            a: obj,
+                            b: o,
+                        })
+                    };
+                    let call_dst = sl.fresh();
+                    sl.push_raw(Instr::CallFn {
+                        dst: call_dst,
+                        fidx: cidx as u32,
+                        args: vec![recv],
+                    });
+                }
+                continue;
+            }
+            for fd in decl_in_chain.members.iter().filter_map(|m| match m {
+                // NOTE: `const` fields are compile-time only (no
+                // storage): emitting them here would store e.g.
+                // `CharSize = 2` at offset 0, clobbering the entry
+                // object's vtable word (see the same fix in the `new`
+                // path in `lower/eval.rs`).
+                ClassMember::Field(fd) if !fd.is_static && !fd.is_const => Some(fd),
+                _ => None,
+            }) {
+                let v = lower::eval(&fd.init, &mut sl, &start_ctx)?;
+                let off = (info
+                    .field(&fd.name)
+                    .map(|fi| fi.offset_slots)
+                    .unwrap_or(1)
+                    * 8) as u32;
+                sl.push_raw(Instr::StoreField { base: obj, off, src: v });
+            }
+        }
     }
 
     let main_ret = if main_argv {
@@ -3360,141 +3566,12 @@ fn pick_chain_ctor(
     // An int-returning entry point becomes the process exit code.
     sl.exit_with(main_ret);
 
-    // TEMP-STARTDUMP: print the @start function IR (static-init
-    // prologue) for init-evaluation debugging. Removed before close.
-    if std::env::var("RUBYC_IRDUMP").unwrap_or_default().split(',').any(|w| w.trim() == "@start") {
-        eprintln!("[rubyc] TEMP-STARTDUMP @start vregs={} blocks={}", sl.f.vregs, sl.f.blocks.len());
-        for (bi, bl) in sl.f.blocks.iter().enumerate() {
-            eprintln!("  [block {bi}] term={:?}", bl.term);
-            for ins in &bl.instrs {
-                eprintln!("    {ins:?}");
-            }
-        }
-    }
 
     functions.insert(0, sl.finish_with(Terminator::Exit));
 
-    // TEMP-FNMAP: index to name for DCE drop correlation.
-    // Removed before close.
-    if std::env::var("RUBYC_DCEAUDIT").unwrap_or_default().contains("list") {
-        for (i, f) in functions.iter().enumerate() {
-            if f.name.contains("UTF8Encoding")
-                || f.name.contains("SetDefaultFallbacks")
-                || f.name.contains("ThrowIfNegative")
-                || f.name.contains("IsNullOrEmpty")
-                || f.name.contains("EncoderReplacementFallback")
-            {
-                eprintln!("[rubyc] TEMP-FNMAP idx={i} {}", f.name);
-            }
-        }
-    }
 
-    // TEMP-FIDXDIAG: resolve call-site fidx to function names
-    // (bisecting wrong-target static calls). `RUBYC_FIDXDIAG=1,2,3`.
-    // Removed before close.
-    if let Ok(spec) = std::env::var("RUBYC_FIDXDIAG") {
-        for w in spec.split(',') {
-            if let Ok(i) = w.trim().parse::<usize>() {
-                eprintln!(
-                    "[rubyc] TEMP-FIDXDIAG idx={i} -> {}",
-                    functions.get(i).map(|f| f.name.as_str()).unwrap_or("<OOB>")
-                );
-            }
-        }
-    }
-    if std::env::var("RUBYC_VTROWDBG").is_ok() {
-        // Reverse index for slot inspection.
-        let mut names_by_idx: std::collections::BTreeMap<usize, &str> = Default::default();
-        for class in &all_classes {
-            for m in &class.members {
-                if let ClassMember::Method(mm) = m {
-                    let key = format!("{}::{}#{}", class.name, mm.name, mm.params.len());
-                    if let Some(fn_vec) = fn_index.get(&key) {
-                        for fidx in fn_vec {
-                            names_by_idx.insert(*fidx, &mm.name);
-                        }
-                    }
-                }
-            }
-        }
-        for (i, (n, row)) in vtables.iter().enumerate() {
-            // TEMP-GBSLOT-OUTER: let the GetBytes audit run standalone.
-            // Removed before close.
-            if n.contains("UTF8Encoding") || n.contains("EncoderFallback") || std::env::var("RUBYC_GBSLOT").is_ok() || std::env::var("RUBYC_VTROWDBG").is_ok_and(|v| v.contains("DateTime")) && n.contains("DateTime") || std::env::var("RUBYC_VTROWDBG").is_ok_and(|v| v == "ALL") || std::env::var("RUBYC_VTROWDBG2").is_ok_and(|v| v.contains("Encoding")) && (n == "System.Text.Encoding" || n == "System.Text.Latin1Encoding" || n == "System.Text.UnicodeEncoding" || n == "System.Text.ConsoleEncoding" || n == "Encoding" || n == "Latin1Encoding" || n == "UnicodeEncoding" || n == "ConsoleEncoding") {
-                // TEMP-VTROWDBG2: entry-slot audit (slot
-                // disagreement between table and emitted rows).
-                // Removed before close.
-                // TEMP-SENTDIAG5: include ConsoleEncoding (bisecting the
-                // SetDefaultFallbacks slot-35 fault). Removed before close.
-                // TEMP-GBSLOT: dump every GetBytes slot+params for the
-                // encoder misroute (slot 17 vs true base-5 slot).
-                // Removed before close.
-                if std::env::var("RUBYC_GBSLOT").is_ok()
-                    && (n == "System.Text.Encoding" || n == "Encoding")
-                {
-                    for e in table.classes.iter().filter(|c| c.key.path == *n) {
-                        for m in e.methods.iter().filter(|m| m.name == "GetBytes") {
-                            eprintln!(
-                                "[rubyc] TEMP-GBSLOT {}.GetBytes({:?}) slot={} static={} body={}",
-                                e.key.path,
-                                m.param_types,
-                                m.vtable_slot,
-                                m.is_static,
-                                m.has_body
-                            );
-                        }
-                    }
-                }
-                // TEMP-GBSLOT2: same for the sealed rows (is base-5
-                // inherited into the entry?).
-                // Removed before close.
-                if std::env::var("RUBYC_GBSLOT").is_ok()
-                    && n.contains("Sealed")
-                {
-                    for e in table.classes.iter().filter(|c| c.key.path == *n) {
-                        for m in e.methods.iter().filter(|m| m.name == "GetBytes") {
-                            eprintln!(
-                                "[rubyc] TEMP-GBSLOT2 {}.GetBytes({:?}) slot={} body={}",
-                                e.key.path,
-                                m.param_types,
-                                m.vtable_slot,
-                                m.has_body
-                            );
-                        }
-                    }
-                }
-                if std::env::var("RUBYC_VTROWDBG2").is_ok_and(|v| v.contains("Encoding")) && (n == "System.Text.Encoding" || n == "System.Text.Latin1Encoding" || n == "System.Text.UnicodeEncoding" || n == "System.Text.ConsoleEncoding" || n == "Encoding" || n == "Latin1Encoding" || n == "UnicodeEncoding" || n == "ConsoleEncoding")
-                {
-                    let matches: Vec<String> = table.classes.iter().filter(|c| c.key.path == *n).map(|c| format!("{}[{}]", c.name, c.methods.len())).collect();
-                    eprintln!("[rubyc] TEMP-VTROWDBG2 rowname={n} entries={:?}", matches);
-                    for e in table.classes.iter().filter(|c| c.key.path == *n) {
-                        let mut parts: Vec<String> = Vec::new();
-                        for m in e.methods.iter().take(6) {
-                            parts.push(format!("{}#{}:{}", m.name, m.param_types.len(), m.vtable_slot));
-                        }
-                        let slot = |nm: &str| e.methods.iter().find(|m| m.name == nm).map(|m| m.vtable_slot.to_string()).unwrap_or("MISSING".to_owned());
-                        let has_gettype = e.methods.iter().any(|m| m.name == "GetType");
-                        let has_sdf = e.methods.iter().any(|m| m.name == "SetDefaultFallbacks");
-                        eprintln!("[rubyc] TEMP-VTROWDBG2 entry={} methods={} slot_GetType={} slot_SDF={} slot_GetEnc={} first6=[{}]", e.key.path, e.methods.len(), slot("GetType"), slot("SetDefaultFallbacks"), slot("GetEncodings"), parts.join(" "));
-                    }
-                }
-                let slots: Vec<String> = row
-                    .iter()
-                    .enumerate()
-                    .map(|(s, f)| {
-                        format!(
-                            "{s}={}:{}",
-                            f,
-                            names_by_idx.get(f).copied().unwrap_or("?")
-                        )
-                    })
-                    .collect();
-                eprintln!("[rubyc] TEMP-VTROWDBG row={i} {n} [{}]", slots.join(" "));
-            }
-        }
-    }
-
-    Ok(Program {
+    append_type_slots(&type_registry, &mut statics);
+    let program = Program {
         functions,
         statics,
         vtables,
@@ -3519,7 +3596,9 @@ fn pick_chain_ctor(
         names: Vec::new(),
         entry: Some(0), // @start is always function 0 for executables.
         init: None, // Executables run initializers from @start instead.
-    })
+    };
+    verify::verify(&program).map_err(LowerError::IrInvalid)?;
+    Ok(program)
 }
 
 /// Collect `(symbol, function index, arity)` for public body-bearing
@@ -3554,6 +3633,17 @@ fn exports_from(
             }
             if let Some(arity) = method_arity(class, &name)
                 && method_has_body(class, &name)
+                // Generic methods take hidden type handles. The image
+                // export table and the consumer's import path do not
+                // yet carry them, so exporting one would publish an
+                // ABI that the other side cannot call correctly.
+                && !table.class(&class.name).is_some_and(|c| {
+                    c.methods.iter().any(|m| {
+                        m.name == name
+                            && m.param_types.len() == arity
+                            && !m.generic_params.is_empty()
+                    })
+                })
                 && let Some(&idx) = fn_index
                     .get(&format!("{}::{}#{}", class.name, name, arity))
                     .and_then(|v| v.last())
@@ -3594,6 +3684,7 @@ fn qualified_exports_from(
         for m in &entry.methods {
             if m.access != Access::Public
                 || !m.has_body
+                || !m.generic_params.is_empty()
                 || m.name == "main"
                 || m.name == "Main"
                 || m.name.starts_with('~')

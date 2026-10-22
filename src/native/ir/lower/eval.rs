@@ -4,8 +4,14 @@ use super::super::{CmpOp, FBinOp, FCmpOp, Instr, LowerError, Terminator, VReg};
 use crate::models::{Block, ClassMember, Expr, InterpPart, Literal, UnOp};
 use crate::native::ir::BinOp as IrBinOp;
 use crate::native::ir::Ctx;
-use crate::native::semantic::{ConstValue};
+use crate::native::semantic::{
+    ConstValue, FIRST_FIELD_SLOT, INSTANCE_HEADER_SLOTS, RUNTIME_TYPE_SLOT,
+};
 use super::{body::*, calls::*, select::*, span::*, types::*};
+use super::typeinfo::{
+    is_type_receiver as is_descriptor_receiver, primitive_id, type_member, type_meta, BOX_FLAG,
+    TYPE_TAG,
+};
 /// Constant-fold a non-comparison binary op. `None` means "leave to the
 /// runtime": undefined division/rem and everything unhandled.
 pub(super) fn fold_arith(op: &crate::models::BinOp, va: i64, vb: i64) -> Option<i64> {
@@ -348,6 +354,85 @@ fn is_pure_arg(e: &Expr) -> bool {
 /// every `Narrow*` byte write). Only pure shapes (re-evaluation is
 /// side-effect-free); anything else keeps the boxing path. Returns
 /// `None` when not applicable.
+/// The address of a bare instance field — the implicit-`this`
+/// spelling `this.field`: the receiver plus the field's slot offset.
+/// `ref_target_address` cannot see it, since that only walks explicit
+/// `x.f` members.
+fn implicit_this_field_address(
+    b: &mut Body<'_>,
+    ctx: &Ctx<'_>,
+    name: &str,
+) -> Result<Option<VReg>, LowerError> {
+    let Some(info) = ctx.current_info else {
+        return Ok(None);
+    };
+    let Some(f) = info.field(name) else {
+        return Ok(None);
+    };
+    if f.is_static {
+        return Ok(None);
+    }
+    if f.is_byref {
+        // A ref field holds the address itself (ref-of-ref collapses in
+        // C#).
+        let addr = b.fresh();
+        b.push_raw(Instr::LoadField {
+            dst: addr,
+            base: VReg(0),
+            off: (f.offset_slots * 8) as u32,
+        });
+        return Ok(Some(addr));
+    }
+    let off = b.const_i64((f.offset_slots * 8) as i64);
+    Ok(Some(b.emit(Instr::Bin {
+        dst: VReg(0),
+        op: IrBinOp::Add,
+        a: VReg(0),
+        b: off,
+    })))
+}
+
+/// The ADDRESS of the object a member access reads: the object's own
+/// value for a local or a local's field, but the object's ADDRESS when
+/// the object is itself a field (`&this.a.b` — the field's address is
+/// the address of `a` plus the offset, and `a`'s value is not its
+/// address).
+fn member_base_address(
+    b: &mut Body<'_>,
+    ctx: &Ctx<'_>,
+    object: &Expr,
+) -> Result<VReg, LowerError> {
+    if let Expr::Ident { name, .. } = object {
+        if name == "this" {
+            return Ok(VReg(0));
+        }
+        // A field of the receiver. A reference-typed field holds the
+        // object it points at, so the member's base is the field's
+        // VALUE. A value-typed field (a struct) IS the member's base,
+        // so the base is the field's ADDRESS.
+        if let Some(info) = ctx.current_info
+            && let Some(f) = info.field(name)
+            && !f.is_static
+        {
+            let is_value = ctx
+                .table
+                .class(&f.type_name)
+                .is_some_and(|entry| entry.is_struct);
+            if is_value {
+                if let Some(addr) = implicit_this_field_address(b, ctx, name)? {
+                    return Ok(addr);
+                }
+            } else {
+                return eval(object, b, ctx);
+            }
+        }
+    }
+    if let Some(addr) = ref_target_address(b, ctx, object)? {
+        return Ok(addr);
+    }
+    eval(object, b, ctx)
+}
+
 pub(super) fn ref_target_address(
     b: &mut Body<'_>,
     ctx: &Ctx<'_>,
@@ -447,7 +532,10 @@ pub(super) fn ref_target_address(
             return Ok(None);
         }
         let recv_ty = static_type_of(object, b, ctx)?;
-        if let Some(info) = ctx.table.class(&recv_ty) {
+        // A nullable annotation is not part of the type's name
+        // (`CompletionState?` is `CompletionState`).
+        let recv_base = recv_ty.trim().trim_end_matches('?');
+        if let Some(info) = ctx.table.class(recv_base) {
             if let Some(f) = info.field(name) {
                 if !f.is_static {
                     // `ref` fields hold addresses: `ref field`
@@ -465,7 +553,7 @@ pub(super) fn ref_target_address(
                         });
                         return Ok(Some(addr));
                     }
-                    let base = eval(object, b, ctx)?;
+                    let base = member_base_address(b, ctx, object)?;
                     let off = b.const_i64((f.offset_slots * 8) as i64);
                     return Ok(Some(b.emit(Instr::Bin {
                         dst: VReg(0),
@@ -623,7 +711,7 @@ pub(super) fn ensure_struct_base(
         if_false: done_b,
     });
     b.switch_to(box_b);
-    let boxed = b.alloc_struct_box(ctx, entry);
+    let boxed = b.alloc_struct_box(ctx, entry, Some(type_name));
     b.mov(home, boxed);
     b.goto(done_b);
     b.switch_to(done_b);
@@ -700,7 +788,7 @@ pub(super) fn index_struct_box(
         if_false: done_b,
     });
     b.switch_to(box_b);
-    let boxed = b.alloc_struct_box(ctx, entry);
+    let boxed = b.alloc_struct_box(ctx, entry, Some(&elem));
     b.push_raw(Instr::StoreField {
         base: addr,
         off: 0,
@@ -772,6 +860,16 @@ fn is_type_receiver(object: &Expr, type_name: &str, b: &Body<'_>, ctx: &Ctx<'_>)
     if root_name == "this" || root_name == "base" || root_name == "_" {
         return false;
     }
+    // A type variable that a generic-inlined body has substituted
+    // (`T -> IntNum`) names a TYPE: `T.StaticMember(...)` is static
+    // syntax, not a call on a value.
+    if ctx.is_type_var(root_name)
+        && ctx
+            .type_subst
+            .is_some_and(|s| s.iter().any(|(v, _)| v == root_name))
+    {
+        return true;
+    }
     if b.scopes.lookup(root_name).is_some() {
         return false;
     }
@@ -795,9 +893,15 @@ fn is_type_receiver(object: &Expr, type_name: &str, b: &Body<'_>, ctx: &Ctx<'_>)
             .split('<')
             .next()
             .unwrap_or(&spelled);
-        return ctx.table.class(base).is_some();
+        return ctx.table.class(base).is_some()
+            || !ctx.table.alias_targets(base).is_empty();
     }
+    // A `using`-alias names no entry of its own, so the bare class-exists
+    // check misses it: `NativeType.IsFinite(...)` must still be a
+    // static-style receiver, or the call is mistaken for an instance
+    // call on a value and fails member resolution.
     ctx.table.class(type_name).is_some()
+        || !ctx.table.alias_targets(type_name).is_empty()
 }
 
 /// Bind the `field` contextual keyword (C# 14 backing-field) as a
@@ -837,6 +941,19 @@ fn most_derived_prop_decl(
     name: &str,
 ) -> Option<(crate::models::ast::PropertyDecl, Vec<String>)> {
     most_derived_prop_accessor(ctx, info, name, false)
+        .map(|(decl, params, _)| (decl, params))
+}
+
+/// The QUALIFIED path of the class that declares the property — the
+/// class whose getter body is inlined, and so the class a member read
+/// inside that body belongs to.
+fn most_derived_prop_decl_path<'a>(
+    ctx: &'a Ctx<'a>,
+    info: &crate::native::semantic::ClassInfo,
+    name: &str,
+) -> Option<&'a str> {
+    most_derived_prop_accessor(ctx, info, name, false)
+        .and_then(|(_, _, path)| path)
 }
 
 /// Most-derived PROPERTY SETTER declaration (mirrors the getter
@@ -849,17 +966,79 @@ pub(super) fn most_derived_prop_setter_decl(
     name: &str,
 ) -> Option<(crate::models::ast::PropertyDecl, Vec<String>)> {
     most_derived_prop_accessor(ctx, info, name, true)
+        .map(|(decl, params, _)| (decl, params))
 }
 
-fn most_derived_prop_accessor(
+fn most_derived_prop_accessor<'a>(
+    ctx: &'a Ctx<'a>,
+    info: &crate::native::semantic::ClassInfo,
+    name: &str,
+    setter: bool,
+) -> Option<(crate::models::ast::PropertyDecl, Vec<String>, Option<&'a str>)> {
+    let (class_index, member_index, params) = most_derived_prop_accessor_idx(ctx, info, name, setter)?;
+    let decl = property_decl_at(ctx, class_index, member_index)?;
+    let path = ctx
+        .class_paths
+        .get(&(ctx.classes[class_index] as *const crate::models::ClassDecl))
+        .map(|s| s.as_str());
+    Some((decl.clone(), params, path))
+}
+
+/// The declaration at a (class, member) index, if it is a property.
+fn property_decl_at<'a>(
+    ctx: &'a Ctx<'a>,
+    class_index: usize,
+    member_index: usize,
+) -> Option<&'a crate::models::ast::PropertyDecl> {
+    match ctx.classes.get(class_index)?.members.get(member_index)? {
+        crate::models::ClassMember::Property(decl) => Some(decl),
+        _ => None,
+    }
+}
+
+/// The class and member indices of the declaration that carries a
+/// class's property, plus the declaring class's primary-constructor
+/// parameters. The walk covers the class's base chain and scans every
+/// declaration in the unit at each step, so the answer is cached for
+/// the run.
+fn most_derived_prop_accessor_idx(
     ctx: &Ctx<'_>,
     info: &crate::native::semantic::ClassInfo,
     name: &str,
     setter: bool,
-) -> Option<(crate::models::ast::PropertyDecl, Vec<String>)> {
+) -> Option<(usize, usize, Vec<String>)> {
+    let key = (info.key.path.clone(), name.to_owned(), setter);
+    if let Some(hit) = with_lookup_cache(ctx, |cache| cache.props.get(&key).cloned()) {
+        return Some(hit);
+    }
+    let found = scan_most_derived_prop_accessor(ctx, info, name, setter);
+    if let Some((class_index, member_index, params)) = &found {
+        with_lookup_cache(ctx, |cache| {
+            cache
+                .props
+                .insert(key, (*class_index, *member_index, params.clone()));
+        });
+    }
+    found
+}
+
+/// The walk behind [`most_derived_prop_accessor_idx`].
+fn scan_most_derived_prop_accessor(
+    ctx: &Ctx<'_>,
+    info: &crate::native::semantic::ClassInfo,
+    name: &str,
+    setter: bool,
+) -> Option<(usize, usize, Vec<String>)> {
     let mut queue: Vec<String> = vec![info.name.clone(), info.key.path.clone()];
     let mut seen_curs: Vec<String> = Vec::new();
-    let mut seen_decls: Vec<String> = Vec::new();
+    // Visited declarations are tracked by position, not by name: two
+    // classes can share a simple name across namespaces, and each one
+    // carries its own base chain. Keying on the name let the first
+    // same-named declaration suppress the rest, so a decoy
+    // `System.Runtime.InteropServices.TypeMapping` (empty, no bases)
+    // declared before `t.TypeMapping` cut the walk short and hid the
+    // inherited `TypeDesc` getter entirely.
+    let mut seen_decls: Vec<usize> = Vec::new();
     let mut head: usize = 0;
     while head < queue.len() {
         let cur = queue[head].clone();
@@ -868,35 +1047,37 @@ fn most_derived_prop_accessor(
             continue;
         }
         seen_curs.push(cur.clone());
-        let mut matches: Vec<&&crate::models::ClassDecl> = ctx
+        let mut matches: Vec<(usize, &crate::models::ClassDecl)> = ctx
             .classes
             .iter()
-            .filter(|c| {
+            .enumerate()
+            .filter(|(_, c)| {
                 c.name == cur
                     || format!("{}.{}", info.key.path, cur) == c.name
                     || c.name.ends_with(&format!(".{cur}"))
             })
+            .map(|(i, c)| (i, *c))
             .collect();
         // Prefer the entry's own spelling (same-named siblings in
         // other namespaces never donate the body).
-        matches.sort_by_key(|c| {
+        matches.sort_by_key(|(_, c)| {
             if c.name == info.name || c.name == info.key.path {
                 0
             } else {
                 1
             }
         });
-        for c in matches {
-            if seen_decls.iter().any(|s| s == &c.name) {
+        for (idx, c) in matches {
+            if seen_decls.contains(&idx) {
                 continue;
             }
-            seen_decls.push(c.name.clone());
-            for m in &c.members {
+            seen_decls.push(idx);
+            for (member_index, m) in c.members.iter().enumerate() {
                 if let crate::models::ClassMember::Property(decl) = m
                     && decl.name == name
                     && (!setter || decl.set.is_some())
                 {
-                    return Some((decl.clone(), c.primary_ctor_params.clone()));
+                    return Some((idx, member_index, c.primary_ctor_params.clone()));
                 }
             }
             for b in &c.bases {
@@ -968,6 +1149,47 @@ pub(super) fn strict_subclass_has_explicit_setter(
     strict_subclass_has_accessor(ctx, info, name, true)
 }
 
+
+/// Whether `sub` OVERRIDES the property `name`, so its implementation
+/// serves a base-typed receiver.
+///
+/// C# distinguishes three shapes: `override` replaces the base member,
+/// `new` HIDES it (the base's implementation still serves a base-typed
+/// receiver), and a plain redeclaration in a class that has no such
+/// member is an implicit interface implementation. Treating every
+/// same-named declaration as an override made a hiding property serve
+/// the derived body — the base's answer was never used.
+fn prop_overrides_base(
+    ctx: &Ctx<'_>,
+    sub: &crate::native::semantic::ClassInfo,
+    base: &crate::native::semantic::ClassInfo,
+    name: &str,
+) -> bool {
+    let Some(decl) = construction_decl_arity(ctx, &sub.key.path, sub.key.arity)
+        .or_else(|| construction_decl_arity(ctx, &sub.name, sub.key.arity))
+    else {
+        return false;
+    };
+    let Some(prop) = decl.members.iter().find_map(|m| match m {
+        crate::models::ClassMember::Property(p) if p.name == name => Some(p),
+        _ => None,
+    }) else {
+        return false;
+    };
+    if prop.is_hiding {
+        return false;
+    }
+    if prop.is_override {
+        return true;
+    }
+    // An implicit interface implementation: the base member has no
+    // implementation of its own, so this body IS the implementation.
+    let base_is_interface = ctx.table.interfaces.iter().any(|i| {
+        i.name == base.name || i.name == base.key.path
+    });
+    base_is_interface && (prop.get_expr.is_some() || prop.get.is_some())
+}
+
 fn strict_subclass_has_accessor(
     ctx: &Ctx<'_>,
     info: &crate::native::semantic::ClassInfo,
@@ -979,6 +1201,9 @@ fn strict_subclass_has_accessor(
             continue;
         };
         if sub.key.path == info.key.path {
+            continue;
+        }
+        if !prop_overrides_base(ctx, sub, info, name) {
             continue;
         }
         if setter {
@@ -1002,7 +1227,7 @@ fn strict_subclass_has_accessor(
 /// name-first-match picks a different decl than `new`'s call-site
 /// spelling, and every arm misses at runtime).
 fn construction_decl<'a>(
-    ctx: &Ctx<'a>,
+    ctx: &'a Ctx<'a>,
     class_name: &str,
 ) -> Option<&'a crate::models::ClassDecl> {
     let arity = crate::native::semantic::split_arity(class_name).1;
@@ -1015,10 +1240,41 @@ fn construction_decl<'a>(
 /// receiver must resolve the arity-1 definition's row, or every arm
 /// misses at runtime and reads fall to zero).
 fn construction_decl_arity<'a>(
-    ctx: &Ctx<'a>,
+    ctx: &'a Ctx<'a>,
     class_name: &str,
     arity: usize,
 ) -> Option<&'a crate::models::ClassDecl> {
+    let index = construction_decl_index(ctx, class_name, arity)?;
+    ctx.classes.get(index).copied()
+}
+
+/// The index of the declaration a class NAME resolves to (the
+/// construction and the virtual dispatch both ask). The answer
+/// depends only on the unit, so it is cached for the run.
+fn construction_decl_index(
+    ctx: &Ctx<'_>,
+    class_name: &str,
+    arity: usize,
+) -> Option<usize> {
+    let key = (class_name.to_owned(), arity);
+    if let Some(index) = with_lookup_cache(ctx, |cache| cache.decls.get(&key).copied()) {
+        return Some(index);
+    }
+    let found = scan_construction_decl(ctx, class_name, arity);
+    if let Some(index) = found {
+        with_lookup_cache(ctx, |cache| {
+            cache.decls.insert(key, index);
+        });
+    }
+    found
+}
+
+/// The scan behind [`construction_decl_index`].
+fn scan_construction_decl(
+    ctx: &Ctx<'_>,
+    class_name: &str,
+    arity: usize,
+) -> Option<usize> {
     let alias_simple: Option<String> = ctx.table.alias_target(class_name).map(|t| {
         let base = t.split('<').next().unwrap_or(t);
         base.rsplit('.').next().unwrap_or(base).to_owned()
@@ -1041,30 +1297,88 @@ fn construction_decl_arity<'a>(
         .rsplit('.')
         .next()
         .unwrap_or(def_base.as_str());
-    let mut arity_match: Option<&crate::models::ClassDecl> = None;
-    let mut out: Option<&crate::models::ClassDecl> = None;
-    for c in ctx.classes.iter() {
+    let mut arity_match: Option<usize> = None;
+    let mut out: Option<usize> = None;
+    for (i, c) in ctx.classes.iter().enumerate() {
         let c: &crate::models::ClassDecl = c;
         if c.name == *class_name
             || c.name == simple_name
             || alias_simple.as_deref() == Some(c.name.as_str())
         {
-            return Some(c);
+            return Some(i);
         }
         if arity > 0
             && (c.name == def_simple || c.name == def_base)
             && c.generic_params.len() == arity
             && arity_match.is_none()
         {
-            arity_match = Some(c);
+            arity_match = Some(i);
         }
         if out.is_none()
             && (c.name == def_simple || c.name == def_base)
         {
-            out = Some(c);
+            out = Some(i);
         }
     }
     arity_match.or(out)
+}
+
+/// The per-run lookup caches. Three questions cost a walk of every
+/// declaration in the unit, and the walks dominate the compile time
+/// at CoreLib scale (one `Stream` method took 14 seconds):
+///
+/// - which declaration a class NAME resolves to (the construction and
+///   the virtual dispatch both ask),
+/// - a declaration's vtable ROW (every `new` asks),
+/// - which declaration carries a class's PROPERTY (every property
+///   read asks).
+///
+/// The answers depend only on the unit, so they are cached for the
+/// run and dropped when it ends.
+struct LookupCache {
+    /// The class table the caches were filled for.
+    table: usize,
+    /// (class name, arity) -> the declaration's index in the unit.
+    decls: std::collections::HashMap<(String, usize), usize>,
+    /// declaration address -> its construction row.
+    rows: std::collections::HashMap<usize, u32>,
+    /// (class path, property name, setter) -> (class index, member
+    /// index, the declaring class's primary-constructor parameters).
+    props: std::collections::HashMap<(String, String, bool), (usize, usize, Vec<String>)>,
+}
+
+thread_local! {
+    static LOOKUP_CACHE: std::cell::RefCell<Option<LookupCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Drop the lookup caches: called once per lowering entry, so a new
+/// unit never reads a previous run's answers.
+pub(crate) fn clear_lookup_cache() {
+    LOOKUP_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+/// Run `f` with the caches for `ctx`'s class table, filling them as
+/// needed.
+fn with_lookup_cache<R>(
+    ctx: &Ctx<'_>,
+    f: impl FnOnce(&mut LookupCache) -> R,
+) -> R {
+    let table = ctx.table as *const _ as usize;
+    LOOKUP_CACHE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let fresh = !matches!(slot.as_ref(), Some(c) if c.table == table);
+        if fresh {
+            *slot = Some(LookupCache {
+                table,
+                decls: std::collections::HashMap::new(),
+                rows: std::collections::HashMap::new(),
+                props: std::collections::HashMap::new(),
+            });
+        }
+        let cache = slot.as_mut().expect("the cache was just installed");
+        f(cache)
+    })
 }
 
 /// Vtable row for a declaration: position among table-backed
@@ -1073,36 +1387,74 @@ fn construction_decl_arity<'a>(
 /// definition, no divergence.
 fn construction_row(ctx: &Ctx<'_>, decl: &crate::models::ClassDecl) -> u32 {
     let target = (decl as *const crate::models::ClassDecl) as usize;
-    ctx.classes
+    let cached = with_lookup_cache(ctx, |cache| cache.rows.get(&target).copied());
+    if let Some(row) = cached {
+        return row;
+    }
+    let row = ctx
+        .classes
         .iter()
         .take_while(|c| {
             (**c as *const crate::models::ClassDecl) as usize != target
         })
         .filter(|c| ctx.table.class(&c.name).is_some())
-        .count() as u32
+        .count() as u32;
+    with_lookup_cache(ctx, |cache| {
+        cache.rows.insert(target, row);
+    });
+    row
 }
 
-/// Universal equality comparer (`new ObjectEqualityComparer<object>()`):
-/// value-correct via virtual dispatch on the compared values (strings
-/// compare by value, value types unbox-compare, objects by identity),
-/// deterministic (no randomization seed). Used when runtime comparer
-/// selection degrades on placeholders (generic construction null,
-/// typeof identity false) — see both call sites.
-fn new_universal_comparer(
-    b: &mut Body<'_>,
-    ctx: &Ctx<'_>,
-) -> Result<VReg, LowerError> {
-    // Bare name (type args erased, mirroring parsed `new
-    // Dictionary<string, int>` → `class_name: "Dictionary"`).
-    let new_cmp = Expr::New {
-        class_name: "ObjectEqualityComparer".to_owned(),
-        args: vec![],
-        init: Vec::new(),
-        span: crate::models::Span::new(0, 0),
-    };
-    eval(&new_cmp, b, ctx)
+thread_local! {
+    /// Count of property reads during lowering (diagnostic).
+    pub(crate) static PROP_READ_COUNT: std::cell::RefCell<usize> = const { std::cell::RefCell::new(0) };
 }
+
 pub(super) fn virtual_subclasses(ctx: &Ctx<'_>, info: &crate::native::semantic::ClassInfo) -> Vec<String> {
+    // The walk is O(classes^2) and the virtual property dispatch asks
+    // for it on EVERY property read: at CoreLib scale that was
+    // minutes of compile time (one `Stream` method took 24 seconds).
+    // The result depends only on the class table, so it is cached per
+    // class for the run.
+    let key = info.key.path.clone();
+    SUBCLASS_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let table = ctx.table as *const _ as usize;
+        let fresh = !matches!(cache.as_ref(), Some((t, _)) if *t == table);
+        if fresh {
+            *cache = Some((table, std::collections::HashMap::new()));
+        }
+        let Some((_, map)) = cache.as_mut() else {
+            return Vec::new();
+        };
+        if let Some(hit) = map.get(&key) {
+            return hit.clone();
+        }
+        let subs = compute_virtual_subclasses(ctx, info);
+        map.insert(key, subs.clone());
+        subs
+    })
+}
+
+/// Drop the cached subclass sets: called once per lowering entry, so
+/// a new class table never reads a previous run's answer.
+pub(crate) fn clear_subclass_cache() {
+    SUBCLASS_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+thread_local! {
+    /// Subclass sets per class path, for the run's class table.
+    static SUBCLASS_CACHE: std::cell::RefCell<
+        Option<(usize, std::collections::HashMap<String, Vec<String>>)>,
+    > = std::cell::RefCell::new(None);
+}
+
+/// The subclasses of a class: its own declarations plus every
+/// declaration that derives from them.
+fn compute_virtual_subclasses(
+    ctx: &Ctx<'_>,
+    info: &crate::native::semantic::ClassInfo,
+) -> Vec<String> {
     let matches_info = |n: &str| {
         n == info.name
             || n == info.key.path
@@ -1162,21 +1514,15 @@ fn eval_virtual_getter(
     name: &str,
     object: Option<&Expr>,
 ) -> Result<Option<VReg>, LowerError> {
-    // Outer cycle guard (mirrors the static path): nested reads of a
-    // DIFFERENT (class, property) terminate via the arm guards and
-    // the depth cap; the same-key case is special-cased in the arm
-    // loop below (it must inline, not trip).
-    if b.prop_inline_stack
-        .iter()
-        .any(|(c, p)| c == &info.key.path && p == name)
-    {
-        return Ok(None);
-    }
-    b.prop_inline_stack
-        .push((info.key.path.clone(), name.to_owned()));
-    let result = eval_virtual_getter_inner(b, ctx, info, name, object);
-    b.prop_inline_stack.pop();
-    result
+    // The dispatch frame is NOT a recursion marker. A getter may read
+    // the same property on ANOTHER object (`SyncStream.Position` reads
+    // the wrapped stream's position, and the wrapped stream is not a
+    // SyncStream). Marking the BASE class as "being inlined" refused
+    // that read, so the property had no value at all. Recursion is per
+    // CLASS, and `eval_property_getter` guards exactly that when it
+    // inlines a getter (the same class and property again is the
+    // cycle).
+    eval_virtual_getter_inner(b, ctx, info, name, object)
 }
 
 /// Body of virtual dispatch (guard handling above).
@@ -1187,12 +1533,17 @@ fn eval_virtual_getter_inner(
     name: &str,
     object: Option<&Expr>,
 ) -> Result<Option<VReg>, LowerError> {
-    // Effective explicit body per subclass entry.
+    // Arms: the subclasses that OVERRIDE the property. A declaration
+    // that merely repeats the name HIDES the base member, so it is not
+    // an arm.
     let mut arms: Vec<(&crate::native::semantic::ClassInfo, (u32, u32))> = Vec::new();
     for sub_name in virtual_subclasses(ctx, info) {
         let Some(sub) = ctx.table.class(&sub_name) else {
             continue;
         };
+        if !prop_overrides_base(ctx, sub, info, name) {
+            continue;
+        }
         if let Some((decl, _)) = most_derived_prop_decl(ctx, sub, name)
             && (decl.get_expr.is_some() || decl.get.is_some())
         {
@@ -1200,84 +1551,30 @@ fn eval_virtual_getter_inner(
             arms.push((sub, key));
         }
     }
-    if arms.is_empty() {
-        return Ok(None);
-    }
-    // TEMP-VIRDBG7: virtual dispatch audit (arms + rows). Removed
-    // before close.
-    // TEMP-SENTDIAG4: also audit inside IndexOfValueType (bisecting
-    // the GetCharset IndexOf crash). Removed before close.
-    if std::env::var("RUBYC_VIRDBG7").is_ok()
-        && (name == "CanWrite" || name == "Capacity" || name == "Length"
-            || ctx
-                .current_method
-                .clone()
-                .unwrap_or_default()
-                .contains("IndexOf"))
-    {
-        let descs: Vec<String> = arms
-            .iter()
-            .map(|(sub, _)| {
-                let row = construction_decl_arity(ctx, &sub.key.path, sub.key.arity)
-                    .or_else(|| construction_decl_arity(ctx, &sub.name, sub.key.arity))
-                    .map(|d| construction_row(ctx, d).to_string())
-                    .unwrap_or("MISS".to_owned());
-                format!(
-                    "{}/n={}(row={},f={})",
-                    sub.key.path,
-                    sub.name,
-                    row,
-                    sub.fields.len()
-                )
-            })
-            .collect();
-        eprintln!(
-            "[rubyc] TEMP-VIRDBG7 prop={name} recv={}({})(rf={}) arms={:?} in={}",
-            info.key.path,
-            info.name,
-            info.fields.len(),
-            descs,
-            ctx.current_method.clone().unwrap_or_default(),
-        );
-    }
-    // Receiver into VReg(0) (the inline contract); restored after.
     let recv = match object {
         Some(o) => eval(o, b, ctx)?,
         None => VReg(0),
     };
-    let tmp = b.fresh();
-    b.mov(tmp, VReg(0));
+    let saved_this = b.save_this();
     b.mov(VReg(0), recv);
-    // Single implementation program-wide: the deform is direct (no
-    // chain). Sound: every concrete class inherits it or nothing
-    // (abstract leaves can't instantiate).
-    let first_key = arms[0].1;
-    if arms.iter().all(|(_, k)| *k == first_key) {
-        let sub = arms[0].0;
-        // Same-key arm (receiver's own class): suspend the outer
-        // virtual guard while inlining, else it trips the
-        // legitimate arm to zero. The arm's own getter-guard still
-        // catches self-recursion; restore afterwards.
-        let suspended = sub.key.path == info.key.path
-            && b.prop_inline_stack.last().is_some_and(|(c, p)| {
-                c == &info.key.path && p == name
-            });
-        if suspended {
-            b.prop_inline_stack.pop();
-        }
-        let val = match eval_property_getter(b, ctx, sub, &sub.name, name, None)? {
+    if arms.is_empty() {
+        // No override in this unit: the BASE's implementation serves
+        // (a hiding declaration does not replace it).
+        let val = match eval_property_getter(b, ctx, info, &info.name, name, None)? {
             Some(v) => v,
-            None => b.const_i64(0),
+            None => {
+                // No implementation anywhere in this unit: the member
+                // is unimplemented, which a well-typed program cannot
+                // read. Report it rather than answer a fabricated zero.
+                b.restore_this(saved_this);
+                return Ok(None);
+            }
         };
-        if suspended {
-            b.prop_inline_stack
-                .push((info.key.path.clone(), name.to_owned()));
-        }
-        b.mov(VReg(0), tmp);
+        b.restore_this(saved_this);
         return Ok(Some(val));
     }
-    // Row dispatch: one arm per subclass, join value via home vreg
-    // (same shape as ternary lowering). Receivers carry their
+    // Row dispatch: one arm per overriding class, join value via home
+    // vreg (same shape as ternary lowering). Receivers carry their
     // vtable ADDRESS at [+0] (not a row index), so arms compare
     // against per-class vtable addresses. Rows come from
     // `construction_decl`/`construction_row` — the exact resolution
@@ -1292,12 +1589,20 @@ fn eval_virtual_getter_inner(
     let home = b.fresh();
     let end_b = b.make_block();
     for (sub, _) in arms {
+        // A getter that reads the same property of the SAME class is a
+        // cycle; that arm cannot be inlined here.
+        if b
+            .prop_inline_stack
+            .iter()
+            .any(|(c, p)| c == &sub.key.path && p == name)
+        {
+            continue;
+        }
         let Some(decl) = construction_decl_arity(ctx, &sub.key.path, sub.key.arity)
             .or_else(|| construction_decl_arity(ctx, &sub.name, sub.key.arity))
         else {
             // No local declaration (cross-image): skip the arm —
-            // a wrong row could match another class; falling
-            // through to placeholder matches legacy behavior.
+            // a wrong row could match another class.
             continue;
         };
         let row = construction_row(ctx, decl);
@@ -1317,37 +1622,9 @@ fn eval_virtual_getter_inner(
             if_false: next_b,
         });
         b.switch_to(hit_b);
-        // TEMP-VTRACE: log which arm hits at runtime (row number;
-        // strings go stale — the table grows after method lowering).
-        // Removed before close.
-        if std::env::var("RUBYC_VTRACE").is_ok() {
-            if let Some(vdecl) = construction_decl_arity(ctx, &sub.key.path, sub.key.arity)
-                .or_else(|| construction_decl_arity(ctx, &sub.name, sub.key.arity))
-            {
-                let vrow = construction_row(ctx, vdecl);
-                let rv = b.const_i64(vrow as i64);
-                b.push_raw(Instr::EWriteInt { src: rv });
-            }
-        }
-        match {
-            // Same-key arm (receiver's own class): suspend the outer
-            // virtual guard while inlining (see the direct path
-            // above); the arm's own getter-guard still catches
-            // self-recursion.
-            let suspended = sub.key.path == info.key.path
-                && b.prop_inline_stack.last().is_some_and(|(c, p)| {
-                    c == &info.key.path && p == name
-                });
-            if suspended {
-                b.prop_inline_stack.pop();
-            }
-            let r = eval_property_getter(b, ctx, sub, &sub.name, name, None);
-            if suspended {
-                b.prop_inline_stack
-                    .push((info.key.path.clone(), name.to_owned()));
-            }
-            r
-        }? {
+        // The arm's own getter guard (in `eval_property_getter`) catches
+        // a getter that reads the same property on the same class.
+        match eval_property_getter(b, ctx, sub, &sub.name, name, None)? {
             Some(v) => b.mov(home, v),
             None => {
                 let z = b.const_i64(0);
@@ -1359,13 +1636,27 @@ fn eval_virtual_getter_inner(
         }
         b.switch_to(next_b);
     }
-    let z = b.const_i64(0);
-    b.mov(home, z);
+    // No override matched: the BASE's implementation serves. Answering
+    // zero here invented a value for a property that legitimately holds
+    // something else — and a `new`-hiding declaration lands here, where
+    // C# uses the base's member.
+    match eval_property_getter(b, ctx, info, &info.name, name, None)? {
+        Some(v) => b.mov(home, v),
+        None => {
+            // The base has no implementation and no override matched:
+            // the receiver's runtime type does not implement the
+            // member, which a well-typed program cannot do. Trap
+            // rather than answer a fabricated value.
+            b.raw(vec![0xCC]);
+            let z = b.const_i64(0);
+            b.mov(home, z);
+        }
+    }
     if !b.is_sealed() {
         b.goto(end_b);
     }
     b.switch_to(end_b);
-    b.mov(VReg(0), tmp);
+    b.restore_this(saved_this);
     Ok(Some(home))
 }
 
@@ -1386,51 +1677,31 @@ pub(super) fn eval_virtual_setter_inner(
         let Some(sub) = ctx.table.class(&sub_name) else {
             continue;
         };
+        if !prop_overrides_base(ctx, sub, info, name) {
+            continue;
+        }
         if most_derived_prop_setter_decl(ctx, sub, name)
             .is_some_and(|(decl, _)| decl.set.is_some())
         {
             arms.push(sub);
         }
     }
-    if arms.is_empty() {
-        return Ok(false);
-    }
     // Receiver into VReg(0) (the inline contract); restored after.
     let recv = match object {
         Some(o) => eval(o, b, ctx)?,
         None => VReg(0),
     };
-    let tmp = b.fresh();
-    b.mov(tmp, VReg(0));
+    let saved_this = b.save_this();
     b.mov(VReg(0), recv);
-    // Single implementation program-wide: direct inline (no chain).
-    if arms.len() == 1 {
-        let sub = arms[0];
-        let suspended = sub.key.path == info.key.path
-            && b.prop_inline_stack.last().is_some_and(|(c, p)| {
-                c == &info.key.path && p == name
-            });
-        if suspended {
-            b.prop_inline_stack.pop();
-        }
-        let done = eval_property_setter(
-            b,
-            ctx,
-            sub,
-            &sub.name,
-            name,
-            None,
-            value,
-        );
-        if suspended {
-            b.prop_inline_stack
-                .push((info.key.path.clone(), name.to_owned()));
-        }
-        b.mov(VReg(0), tmp);
+    if arms.is_empty() {
+        // No override in this unit: the BASE's setter serves. Dropping
+        // the write (the old behavior) lost it silently.
+        let done = eval_property_setter(b, ctx, info, &info.name, name, None, value);
+        b.restore_this(saved_this);
         return Ok(done);
     }
-    // Row dispatch: one arm per subclass; fallthrough keeps prior
-    // behavior (drop). Rows come from `construction_decl` /
+    // Row dispatch: one arm per overriding class; when none matches,
+    // the BASE's setter serves. Rows come from `construction_decl` /
     // `construction_row`, exactly like the getter path.
     let rowv = b.fresh();
     b.push_raw(Instr::LoadField {
@@ -1440,6 +1711,15 @@ pub(super) fn eval_virtual_setter_inner(
     });
     let end_b = b.make_block();
     for sub in arms {
+        // A setter that writes the same property of the SAME class is a
+        // cycle; that arm cannot be inlined here.
+        if b
+            .prop_inline_stack
+            .iter()
+            .any(|(c, p)| c == &sub.key.path && p == name)
+        {
+            continue;
+        }
         let Some(decl) = construction_decl_arity(ctx, &sub.key.path, sub.key.arity)
             .or_else(|| construction_decl_arity(ctx, &sub.name, sub.key.arity))
         else {
@@ -1462,29 +1742,19 @@ pub(super) fn eval_virtual_setter_inner(
             if_false: next_b,
         });
         b.switch_to(hit_b);
-        let suspended = sub.key.path == info.key.path
-            && b.prop_inline_stack.last().is_some_and(|(c, p)| {
-                c == &info.key.path && p == name
-            });
-        if suspended {
-            b.prop_inline_stack.pop();
-        }
-        let done = eval_property_setter(b, ctx, sub, &sub.name, name, None, value);
-        if suspended {
-            b.prop_inline_stack
-                .push((info.key.path.clone(), name.to_owned()));
-        }
-        let _ = done;
+        let _ = eval_property_setter(b, ctx, sub, &sub.name, name, None, value);
         if !b.is_sealed() {
             b.goto(end_b);
         }
         b.switch_to(next_b);
     }
+    // No override matched: the BASE's setter serves.
+    let _ = eval_property_setter(b, ctx, info, &info.name, name, None, value);
     if !b.is_sealed() {
         b.goto(end_b);
     }
     b.switch_to(end_b);
-    b.mov(VReg(0), tmp);
+    b.restore_this(saved_this);
     Ok(true)
 }
 
@@ -1506,14 +1776,6 @@ pub(super) fn eval_virtual_setter(
     }
     b.prop_inline_stack
         .push((info.key.path.clone(), name.to_owned()));
-    // TEMP-SETTRACE: announce virtual setter dispatch at runtime so a
-    // hang can be attributed to the executing setter. Gated on
-    // RUBYC_SETTRACE at build time; removed before close.
-    if std::env::var("RUBYC_SETTRACE").is_ok() {
-        let msg = format!("SV {}.{}\n", info.key.path, name);
-        let (off, len) = b.string_literal(&msg);
-        b.push_raw(Instr::EWriteStr { off, len });
-    }
     let result = eval_virtual_setter_inner(b, ctx, info, name, object, value);
     b.prop_inline_stack.pop();
     result
@@ -1544,79 +1806,42 @@ fn eval_property_getter(
     let prop = match info.property(name) {
         Some(p) => p,
         None => {
-            // TEMP-GETDBG.
-            if std::env::var("RUBYC_GETDBG").is_ok() {
-                eprintln!("[rubyc] TEMP-GETDBG {name} type={type_name} NO_PROP");
-            }
             return Ok(None);
         }
     };
-    // TEMP-NOOPDIAG2: null out ExceptionFallback reads (bisecting
-    // the UTF8NoBOM trap). Removed before close.
-    if std::env::var("RUBYC_NOOP_FB").is_ok() && name == "ExceptionFallback" {
-        if let Some(o) = object {
-            let _ = eval(o, b, ctx)?;
-        }
-        return Ok(Some(b.const_i64(0)));
-    }
-    // Cycle guard: `A => B`, `B => A` (or self-reference) would
-    // recurse forever in lowering. Break the cycle with a
-    // placeholder (the restore path truncates on error).
-    // TEMP-CYCLEDBG: print runaway chains.
+    // A property getter that reads itself (`int P => P`) would recurse
+    // forever while lowering. A chain that has grown far past any real
+    // inheritance depth is the same thing. Both used to break the cycle
+    // by answering 0, which reads at run time like a property that
+    // legitimately holds zero; report instead.
     if b.prop_inline_stack.len() > 25 {
-        if std::env::var("RUBYC_CYCLEDBG").is_ok() {
-            let chain: Vec<String> = b
-                .prop_inline_stack
-                .iter()
-                .map(|(c, p)| format!("{c}.{p}"))
-                .collect();
-            eprintln!("[rubyc] TEMP-CYCLEDBG depth={} chain={}", chain.len(), chain.join(" -> "));
-        }
-        return Ok(None);
-    }
-    // TEMP-INLINECOUNT: hard cap with identity (bisect overflow).
-    if std::env::var("RUBYC_INLINECOUNT").is_ok() {
-        static INLINE_COUNT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let n = INLINE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if n > 500 {
-            eprintln!(
-                "[rubyc] TEMP-INLINECOUNT overflow at {} prop={}.{}",
-                n, info.key.path, name
-            );
-            std::process::abort();
-        }
+        let chain: Vec<String> = b
+            .prop_inline_stack
+            .iter()
+            .map(|(c, p)| format!("{c}.{p}"))
+            .collect();
+        return Err(LowerError::UnsupportedConstruct(crate::tf!(
+            "rubyc.native.ir.lower_expr.property_inline_cycle",
+            info.key.path.clone(),
+            name.to_string(),
+            chain.join(" -> ")
+        )));
     }
     if b.prop_inline_stack.iter().any(|(c, p)| c == &info.key.path && p == name) {
-        // TEMP-INLINEDBG: audit guard trips. Removed before close.
-        if std::env::var("RUBYC_INLINEDBG").is_ok()
-            && (name == "Capacity" || name == "CanWrite")
-        {
-            eprintln!(
-                "[rubyc] TEMP-INLINEDBG getter-guard-trip {}.{} in {}.{} stack={:?}",
-                info.key.path,
-                name,
-                ctx.current_class,
-                ctx.current_method.clone().unwrap_or_default(),
-                b.prop_inline_stack,
-            );
-        }
-        return Ok(None);
+        let chain: Vec<String> = b
+            .prop_inline_stack
+            .iter()
+            .map(|(c, p)| format!("{c}.{p}"))
+            .collect();
+        return Err(LowerError::UnsupportedConstruct(crate::tf!(
+            "rubyc.native.ir.lower_expr.property_inline_cycle",
+            info.key.path.clone(),
+            name.to_string(),
+            chain.join(" -> ")
+        )));
     }
     b.prop_inline_stack
         .push((info.key.path.clone(), name.to_owned()));
-    // TEMP-SPANDBG: table visibility for span fields.
-    if std::env::var("RUBYC_SPANDBG").is_ok() {
-        eprintln!(
-            "[rubyc] TEMP-SPANDBG member={} type={} entry={} path={} fields={} props={}",
-            name,
-            type_name,
-            info.name,
-            info.key.path,
-            info.fields.len(),
-            info.properties.len()
-        );
-    }
     ctx.check_access(true, type_name, name)?;
     // Getter body from the most-derived declaration (see
     // `most_derived_prop_decl`): the override's body wins over the
@@ -1626,41 +1851,15 @@ fn eval_property_getter(
     // zero placeholders (see the call-site binding in `ir/mod.rs`).
     let mut getter: Option<GetterBody> = None;
     let mut primary_params: Vec<String> = Vec::new();
-    // TEMP-GETDBG3: decl search audit.
-    if std::env::var("RUBYC_GETDBG").is_ok() {
-        eprintln!(
-            "[rubyc] TEMP-GETDBG3 prop={name} info.name={} info.path={}",
-            info.name, info.key.path
-        );
-    }
     if let Some((decl, params)) = most_derived_prop_decl(ctx, info, name) {
-        if std::env::var("RUBYC_GETDBG").is_ok() {
-            eprintln!(
-                "[rubyc] TEMP-GETDBG5 prop-decl {} has_get_expr={} has_get={} propdecl={} declarer={:?}",
-                decl.name,
-                decl.get_expr.is_some(),
-                decl.get.is_some(),
-                info.property(name).map(|p| p.declaring_class.clone()).unwrap_or_default(),
-                ctx.table.class(
-                    &info.property(name).map(|p| p.declaring_class.clone()).unwrap_or_default()
-                ).map(|e| (e.name.clone(), e.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>())),
-            );
-        }
         primary_params = params;
         if let Some(e) = decl.get_expr.clone() {
             getter = Some(GetterBody::Expr(e));
-        } else {
+        } else if let Some(block) = decl.get.clone() {
             // Block bodies inline whole (return capture below);
             // `LocalFunction` declarations inside ride along for
             // call resolution (emitted separately by the pre-scan).
-            // TEMP-NOBLOCKGETTER (diagnostic): disable block inlining.
-            if std::env::var("RUBYC_NOBLOCKGETTER").is_ok() {
-                b.prop_inline_stack.pop();
-                return Ok(None);
-            }
-            if let Some(block) = decl.get.clone() {
-                getter = Some(GetterBody::Block(block));
-            }
+            getter = Some(GetterBody::Block(block));
         }
     }
     let Some(body) = getter else {
@@ -1668,48 +1867,71 @@ fn eval_property_getter(
         // pushed above — leaking it poisons later virtual dispatch
         // for the same property (guard trips on the stale entry).
         b.prop_inline_stack.pop();
-        // TEMP-INLINEDBG: audit inline failures. Removed before close.
-        if std::env::var("RUBYC_INLINEDBG").is_ok()
-            && (name == "Capacity" || name == "CanWrite")
-        {
-            eprintln!(
-                "[rubyc] TEMP-INLINEDBG no-body {}.{} in {}.{}",
-                info.key.path,
-                name,
-                ctx.current_class,
-                ctx.current_method.clone().unwrap_or_default()
-            );
-        }
         return Ok(None);
     };
-    // Fail-soft: getter bodies may hit unsupported constructs
-    // (unresolvable calls, exotic members). Roll back instead of
-    // failing the build or leaving malformed IR — the caller falls
-    // back to the zero placeholder (legacy behavior).
-    let cp = b.checkpoint();
-    let result = eval_property_body(b, ctx, info, prop, &primary_params[..], type_name, name, object, &body);
-    // Pop the cycle guard (restore truncates on error as backup).
+    // A getter body that will not lower is reported, not rolled back
+    // into a zero. The rollback used to swallow the real failure and
+    // hand the caller a placeholder value that ran like a property
+    // holding default(T).
+    let result = eval_property_body(
+        b,
+        ctx,
+        info,
+        prop,
+        &primary_params[..],
+        type_name,
+        name,
+        object,
+        &body,
+    );
     b.prop_inline_stack.pop();
-    match result {
-        Ok(val) => Ok(Some(val)),
-        Err(e) => {
-            b.restore(cp);
-            // TEMP-INLINEDBG: audit inline failures. Removed before close.
-            if std::env::var("RUBYC_INLINEDBG").is_ok()
-                && (name == "Capacity" || name == "CanWrite")
-            {
-                eprintln!(
-                    "[rubyc] TEMP-INLINEDBG eval-err {}.{} in {}.{}: {:?}",
-                    info.key.path,
-                    name,
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default(),
-                    e,
-                );
-            }
-            Ok(None)
-        }
+    result.map(Some)
+}
+
+
+/// Bind a generic class's type parameters to the type arguments of the
+/// spelling that names it: the getter of `Scalar<int>.AllBitsSet` runs
+/// with `T` = `int`. The spelling's arguments may name the reader's
+/// own type variables, so the reader's substitution applies to them
+/// first — a specialized generic method reads `Scalar<T>`, and its `T`
+/// is already bound.
+fn class_type_subst(
+    ctx: &Ctx<'_>,
+    info: &crate::native::semantic::ClassInfo,
+    spelling: &str,
+) -> Vec<(String, String)> {
+    if info.generic_params.is_empty() {
+        return Vec::new();
     }
+    let args = explicit_type_args(spelling);
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| {
+            ctx.type_subst
+                .and_then(|sub| super::types::subst_type_var(a, sub))
+                .unwrap_or_else(|| a.clone())
+        })
+        .collect();
+    info.generic_params.iter().cloned().zip(args).collect()
+}
+
+/// The table entry of the class that DECLARES a property. A property
+/// declared in the receiver's own class uses the receiver's entry: a
+/// same-named non-generic class would otherwise shadow the generic
+/// declaration (`Scalar` beside `Scalar<T>`), and the getter would run
+/// with no type parameters at all.
+fn declaring_entry<'t>(
+    ctx: &Ctx<'t>,
+    info: &'t crate::native::semantic::ClassInfo,
+    prop: &crate::native::semantic::PropertyInfo,
+) -> Option<&'t crate::native::semantic::ClassInfo> {
+    if info.name == prop.declaring_class {
+        return Some(info);
+    }
+    ctx.table.class(&prop.declaring_class)
 }
 
 /// Lower one getter body (expression or block) with receiver,
@@ -1740,22 +1962,47 @@ fn eval_property_body(
     // simple): qualified paths miss every decl-name lookup, which
     // dropped private helper calls (`EnsureNotClosed`) inside
     // inlined bodies as unknown.
-    let declarer = ctx.table.class(&prop.declaring_class);
+    let declarer = declaring_entry(ctx, info, prop);
+    // The getter is the declaring class's own code, so the class's type
+    // parameters are bound by the RECEIVER's spelling: reading
+    // `Scalar<int>.AllBitsSet` runs the getter with its `T` = `int`.
+    // The spelling may itself name the reader's type variables (a
+    // specialized generic method reads `Scalar<T>`), so the reader's
+    // own substitution applies to the arguments first.
+    let class_subst = class_type_subst(ctx, info, type_name);
     let prop_ctx = Ctx {
         table: ctx.table,
+        class_paths: ctx.class_paths,
+        // The class this context switches to is the property's OWNER,
+        // named by its qualified key path: a bare name cannot be
+        // matched against the owner's path (the access rule compares
+        // two paths), and a nested type's bare name is ambiguous
+        // (Utf8 and Utf16 both declare
+        // `TryWriteInterpolatedStringHandler`).
         current_class: &prop.declaring_class,
         current_info: declarer.or(Some(info)),
-        current_path: ctx.current_path,
+        // The path must name the class that DECLARED the property
+        // (the getter's own class, which may be a base of the
+        // receiver's): a bare class name cannot be matched against
+        // the declaring path (the access rule compares two paths), and
+        // a nested type's bare name is ambiguous (Utf8 and Utf16 both
+        // declare `TryWriteInterpolatedStringHandler`).
+        current_path: most_derived_prop_decl_path(ctx, info, name)
+            .or(declarer.map(|i| i.key.path.as_str()))
+            .or(ctx.current_path),
         classes: ctx.classes,
         import_index: ctx.import_index,
         dep_imports: ctx.dep_imports,
         host_import_count: ctx.host_import_count,
         method_vars: ctx.method_vars,
+                type_subst: (!class_subst.is_empty()).then_some(&class_subst),
         local_fns: ctx.local_fns,
         current_method: Some(name.to_owned()),
         current_ret: Some(prop.type_name.clone()),
         static_index: ctx.static_index,
         defines: ctx.defines,
+        lambda_deferred: None,
+                    lambda_base: 0,
     };
     if prop.is_static {
         // Static property: no receiver, evaluate for side effects.
@@ -1775,11 +2022,6 @@ fn eval_property_body(
                 // (`ReadOnlySpan<uint> P => […]`).
                 let val_ty = static_type_of(e, b, &prop_ctx)
                     .unwrap_or_else(|_| "object".to_owned());
-                // TEMP-SPANDIAG: trace span-return coercion.
-                // Removed before close.
-                if std::env::var("RUBYC_SPANDIAG").is_ok() {
-                    eprintln!("[rubyc] TEMP-SPANDIAG prop={} val_ty={} ret_ty={}", name, val_ty, prop.type_name);
-                }
                 coerce_span_return(b, &prop_ctx, v, &val_ty, &prop.type_name)?
             }
             GetterBody::Block(block) => {
@@ -1799,8 +2041,7 @@ fn eval_property_body(
     // scope bindings — so point VReg(0) at the receiver for the
     // getter body, restoring afterwards (nesting-safe). The scope
     // binding below covers explicit-`this` paths.
-    let tmp = b.fresh();
-    b.mov(tmp, VReg(0));
+    let saved_this = b.save_this();
     b.mov(VReg(0), base);
     b.scope_enter();
     let slot = b
@@ -1829,7 +2070,7 @@ fn eval_property_body(
         GetterBody::Block(block) => eval_block_inline(b, &prop_ctx, block)?,
     };
     b.scope_exit();
-    b.mov(VReg(0), tmp);
+    b.restore_this(saved_this);
     Ok(val)
 }
 
@@ -1841,6 +2082,41 @@ fn eval_property_body(
 /// (same key space as getters; cross get/set recursion degrades to
 /// placeholder rather than hanging).
 #[allow(clippy::too_many_arguments)]
+/// Whether the property `name` declared somewhere on `class_name`'s
+/// inheritance chain has a setter. `None` when no declaring class is in
+/// the table (generic/partial spellings, dependencies): callers then
+/// leave the legacy behaviour instead of rejecting a valid assignment.
+pub(super) fn property_settable_in_chain(
+    ctx: &Ctx<'_>,
+    class_name: &str,
+    name: &str,
+) -> Option<bool> {
+    let mut queue: Vec<String> = vec![class_name.to_owned()];
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(cls) = queue.pop() {
+        if seen.contains(&cls) {
+            continue;
+        }
+        seen.push(cls.clone());
+        for c in ctx.classes.iter().filter(|c| c.name == cls) {
+            for m in &c.members {
+                if let crate::models::ClassMember::Property(p) = m
+                    && p.name == name
+                {
+                    return Some(p.is_settable);
+                }
+            }
+            for b in &c.bases {
+                let simple = b.rsplit('.').next().unwrap_or(b).trim();
+                if !simple.is_empty() {
+                    queue.push(simple.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(super) fn eval_property_setter(
     b: &mut Body<'_>,
     ctx: &Ctx<'_>,
@@ -1871,35 +2147,36 @@ pub(super) fn eval_property_setter(
     };
     // Declarer-relative context (mirrors the getter path): the body
     // is the declaring class's own code.
-    let declarer = ctx.table.class(&prop.declaring_class);
+    let declarer = declaring_entry(ctx, info, prop);
+    // The setter is the declaring class's own code: its type
+    // parameters bind the same way the getter's do.
+    let class_subst = class_type_subst(ctx, info, type_name);
     let prop_ctx = Ctx {
         table: ctx.table,
+        class_paths: ctx.class_paths,
         current_class: &prop.declaring_class,
         current_info: declarer.or(Some(info)),
-        current_path: ctx.current_path,
+        // The path must match the class this context switches to: the
+        // caller's path with the declarer's class mixed in made the
+        // access rule's nesting-family check compare unrelated types.
+        current_path: declarer.map(|i| i.key.path.as_str()).or(ctx.current_path),
         classes: ctx.classes,
         import_index: ctx.import_index,
         dep_imports: ctx.dep_imports,
         host_import_count: ctx.host_import_count,
         method_vars: ctx.method_vars,
+                type_subst: (!class_subst.is_empty()).then_some(&class_subst),
         local_fns: ctx.local_fns,
         current_method: Some(name.to_owned()),
         current_ret: None,
         static_index: ctx.static_index,
         defines: ctx.defines,
+        lambda_deferred: None,
+                    lambda_base: 0,
     };
     b.prop_inline_stack
         .push((info.key.path.clone(), name.to_owned()));
     let cp = b.checkpoint();
-    // TEMP-SETTRACE: bracket the inlined setter body with runtime
-    // entry/exit markers (a hang inside the body shows enter without
-    // exit). Inside the checkpoint so failed inlines vanish cleanly.
-    // Gated on RUBYC_SETTRACE at build time; removed before close.
-    if std::env::var("RUBYC_SETTRACE").is_ok() {
-        let msg = format!("SP {}.{}\n", info.key.path, name);
-        let (off, len) = b.string_literal(&msg);
-        b.push_raw(Instr::EWriteStr { off, len });
-    }
     let result: Result<(), LowerError> = (|| {
         if prop.is_static {
             if let Some(o) = object {
@@ -1931,8 +2208,7 @@ pub(super) fn eval_property_setter(
             Some(o) => eval(o, b, ctx)?,
             None => VReg(0),
         };
-        let tmp = b.fresh();
-        b.mov(tmp, VReg(0));
+        let saved_this = b.save_this();
         b.mov(VReg(0), base);
         b.scope_enter();
         let tslot = b
@@ -1963,15 +2239,9 @@ pub(super) fn eval_property_setter(
             b.statement(s, &prop_ctx)?;
         }
         b.scope_exit();
-        b.mov(VReg(0), tmp);
+        b.restore_this(saved_this);
         Ok(())
     })();
-    // TEMP-SETTRACE exit marker (see above); removed before close.
-    if std::env::var("RUBYC_SETTRACE").is_ok() {
-        let msg = format!("SX {}.{}\n", info.key.path, name);
-        let (off, len) = b.string_literal(&msg);
-        b.push_raw(Instr::EWriteStr { off, len });
-    }
     b.prop_inline_stack.pop();
     match result {
         Ok(()) => true,
@@ -1987,7 +2257,7 @@ pub(super) fn eval_property_setter(
 /// `LocalFunction` declarations and `fn` stubs never execute here.
 /// Unreachable statements after return/throw are skipped like
 /// everywhere else.
-fn eval_block_inline(
+pub(super) fn eval_block_inline(
     b: &mut Body<'_>,
     ctx: &Ctx<'_>,
     block: &Block,
@@ -2208,8 +2478,12 @@ fn combine_binary(    op: &crate::models::BinOp,
     if let Some(pair) = pointer_arith(op, a, acc_ty, bv, curr_ty, b) {
         return Ok(pair);
     }
-    // Constant folding (same rules as the legacy path).
+    // Constant folding (same rules as the legacy path). Unsigned division
+    // is not folded: `fold_arith` divides signed i64, which is wrong above
+    // i64::MAX and would bake in a negative quotient.
+    let unsigned_div = matches!(op, B::Div | B::Rem) && is_unsigned_result(&next_ty);
     if !op.is_comparison()
+        && !unsigned_div
         && let (Some(&va), Some(&vb)) = (b.const_vals.get(&a.0), b.const_vals.get(&bv.0))
     {
         let folded = fold_arith(op, va, vb);
@@ -2266,8 +2540,20 @@ fn combine_binary(    op: &crate::models::BinOp,
         B::Add => IrBinOp::Add,
         B::Sub => IrBinOp::Sub,
         B::Mul => IrBinOp::Mul,
-        B::Div => IrBinOp::Div,
-        B::Rem => IrBinOp::Rem,
+        B::Div => {
+            if is_unsigned_result(&next_ty) {
+                IrBinOp::UDiv
+            } else {
+                IrBinOp::Div
+            }
+        }
+        B::Rem => {
+            if is_unsigned_result(&next_ty) {
+                IrBinOp::URem
+            } else {
+                IrBinOp::Rem
+            }
+        }
         B::BitAnd => IrBinOp::BitAnd,
         B::BitOr => IrBinOp::BitOr,
         B::BitXor => IrBinOp::BitXor,
@@ -2295,6 +2581,14 @@ fn is_integral(t: &str) -> bool {
             | "UInt64" | "IntPtr" | "UIntPtr" | "Char" | "sbyte" | "byte"
             | "short" | "ushort" | "int" | "uint" | "long" | "ulong" | "nint"
             | "nuint" | "char"
+    )
+}
+
+/// Unsigned result types use `div` (not `idiv`) for `/` and `%`.
+fn is_unsigned_result(t: &str) -> bool {
+    matches!(
+        crate::native::ir::lower::select::base_type_name(t).as_str(),
+        "uint" | "UInt32" | "ulong" | "UInt64" | "nuint" | "UIntPtr"
     )
 }
 
@@ -2385,160 +2679,6 @@ fn lower_compare_exchange(
     }
     b.switch_to(end_b);
     Ok(orig)
-}
-
-/// Lower a generic `ThrowIf*` validator (see the interception in
-/// `eval`): compare directly and throw `ArgumentOutOfRangeException`
-/// (via the normal `new` path) on violation. Returns zero (void).
-fn lower_throw_if(
-    name: &str,
-    args: &[Expr],
-    b: &mut Body<'_>,
-    ctx: &Ctx<'_>,
-) -> Result<VReg, LowerError> {
-    let binary = matches!(
-        name,
-        "ThrowIfEqual"
-            | "ThrowIfNotEqual"
-            | "ThrowIfGreaterThan"
-            | "ThrowIfGreaterThanOrEqual"
-            | "ThrowIfLessThan"
-            | "ThrowIfLessThanOrEqual"
-    );
-    let vv = eval(&args[0], b, ctx)?;
-    let ov = if binary {
-        Some(eval(&args[1], b, ctx)?)
-    } else {
-        None
-    };
-    let float = is_float_expr(b, ctx, &args[0])
-        || (binary && args.get(1).is_some_and(|e| is_float_expr(b, ctx, e)));
-    // Violation condition (single compare each; NegativeOrZero folds
-    // into `<=`).
-    enum Cond {
-        I(CmpOp),
-        F(FCmpOp),
-    }
-    let cond = match name {
-        "ThrowIfZero" => {
-            if float {
-                Cond::F(FCmpOp::Eq)
-            } else {
-                Cond::I(CmpOp::Eq)
-            }
-        }
-        "ThrowIfNegative" => {
-            if float {
-                Cond::F(FCmpOp::Lt)
-            } else {
-                Cond::I(CmpOp::Lt)
-            }
-        }
-        "ThrowIfNegativeOrZero" => {
-            if float {
-                Cond::F(FCmpOp::Le)
-            } else {
-                Cond::I(CmpOp::Le)
-            }
-        }
-        "ThrowIfEqual" => {
-            if float {
-                Cond::F(FCmpOp::Eq)
-            } else {
-                Cond::I(CmpOp::Eq)
-            }
-        }
-        "ThrowIfNotEqual" => {
-            if float {
-                Cond::F(FCmpOp::Ne)
-            } else {
-                Cond::I(CmpOp::Ne)
-            }
-        }
-        "ThrowIfGreaterThan" => {
-            if float {
-                Cond::F(FCmpOp::Gt)
-            } else {
-                Cond::I(CmpOp::Gt)
-            }
-        }
-        "ThrowIfGreaterThanOrEqual" => {
-            if float {
-                Cond::F(FCmpOp::Ge)
-            } else {
-                Cond::I(CmpOp::Ge)
-            }
-        }
-        "ThrowIfLessThan" => {
-            if float {
-                Cond::F(FCmpOp::Lt)
-            } else {
-                Cond::I(CmpOp::Lt)
-            }
-        }
-        _ => {
-            if float {
-                Cond::F(FCmpOp::Le)
-            } else {
-                Cond::I(CmpOp::Le)
-            }
-        }
-    };
-    let rhs = match ov {
-        Some(o) => o,
-        None => b.const_i64(0),
-    };
-    let violated = b.fresh();
-    match cond {
-        Cond::I(op) => {
-            b.push_raw(Instr::Cmp {
-                dst: violated,
-                op,
-                a: vv,
-                b: rhs,
-            });
-        }
-        Cond::F(op) => {
-            // Integer zero against a float value: convert (unary
-            // cases compare against literal 0).
-            let rhs = if ov.is_none() {
-                let fz = b.fresh();
-                b.push_raw(Instr::I2F { dst: fz, src: rhs });
-                fz
-            } else {
-                rhs
-            };
-            b.push_raw(Instr::FCmp {
-                dst: violated,
-                op,
-                a: vv,
-                b: rhs,
-            });
-        }
-    }
-    let throw_b = b.make_block();
-    let end_b = b.make_block();
-    b.terminate(Terminator::Branch {
-        cond: Some(violated),
-        if_true: throw_b,
-        if_false: end_b,
-    });
-    b.switch_to(throw_b);
-    // `paramName`: args[1] (unary) or args[2] (binary), else null.
-    let pn = args
-        .get(if binary { 2 } else { 1 })
-        .cloned()
-        .unwrap_or(Expr::Literal(Literal::Null));
-    let new_exc = Expr::New {
-        class_name: "ArgumentOutOfRangeException".to_owned(),
-        args: vec![pn],
-        init: Vec::new(),
-        span: crate::models::Span::new(0, 0),
-    };
-    let exc = eval(&new_exc, b, ctx)?;
-    b.terminate(Terminator::Unwind { src: exc });
-    b.switch_to(end_b);
-    Ok(b.const_i64(0))
 }
 
 /// Bounds check for dynamic array access (`a[i]` read and write):
@@ -2745,6 +2885,30 @@ fn fold_narrow_loop(b: &mut Body<'_>, src: VReg, dst: VReg, count: VReg) -> VReg
     home
 }
 
+/// Primitive spellings that have no class entry (and no boxed tag to
+/// test at runtime).
+fn is_primitive_spelling(name: &str) -> bool {
+    matches!(
+        canonical_primitive(name).as_str(),
+        "Boolean"
+            | "Byte"
+            | "SByte"
+            | "Int16"
+            | "UInt16"
+            | "Int32"
+            | "UInt32"
+            | "Int64"
+            | "UInt64"
+            | "IntPtr"
+            | "UIntPtr"
+            | "Char"
+            | "Single"
+            | "Double"
+            | "Decimal"
+            | "String"
+    )
+}
+
 pub(super) fn narrow_load_mask(ty: &str) -> Option<i64> {    let w = span_elem_width(ty);
     if w >= 8 {
         return None;
@@ -2861,11 +3025,6 @@ fn is_index_raw_target(t: &str) -> bool {    let tr = t.trim();
 /// `get_Item`): only then does index syntax desugar to a call.
 /// Receivers without one (e.g. `ValueStringBuilder`, indexed
 /// through its span) keep the raw path.
-fn has_indexer(ctx: &Ctx<'_>, t: &str, _accessor: &str) -> bool {
-    // Single-index form only (multi-arg `d[a,b]` stays raw).
-    find_indexer(ctx, t, 1).is_some()
-}
-
 /// Inline an indexer setter (`dict[k] = v`): bind the receiver,
 /// the index parameters, and `value`, then lower the `set` block
 /// with the declaring class as context (mirrors property
@@ -2908,6 +3067,42 @@ fn lower_object_inits(
     }
     b.mov(b.bindings[slot], obj);
     for m in init {
+        // Index initializer: `["k"] = v` is `this[k] = v` after
+        // construction — the ordinary index-assignment lowering routes
+        // it through `set_Item`.
+        if let Some(index) = &m.index {
+            let assign = Expr::Assign {
+                target: Box::new(Expr::Index {
+                    object: Box::new(Expr::Ident {
+                        name: "$initobj".to_owned(),
+                        span: m.span,
+                    }),
+                    index: Box::new(index.clone()),
+                    extra: Vec::new(),
+                    is_range: false,
+                    span: m.span,
+                }),
+                value: Box::new(m.value.clone()),
+                span: m.span,
+            };
+            eval(&assign, b, ctx)?;
+            continue;
+        }
+        if m.name.is_empty() {
+            // Collection initializer: `new List<T> { a, b }` is
+            // `Add(a); Add(b)` after construction.
+            let call = Expr::MethodCall {
+                object: Box::new(Expr::Ident {
+                    name: "$initobj".to_owned(),
+                    span: m.span,
+                }),
+                name: "Add".to_owned(),
+                args: vec![m.value.clone()],
+                span: m.span,
+            };
+            eval(&call, b, ctx)?;
+            continue;
+        }
         let assign = Expr::Assign {
             target: Box::new(Expr::Member {
                 object: Box::new(Expr::Ident {
@@ -2933,7 +3128,7 @@ fn eval_indexer_set(
     path: &str,
     decl: &crate::models::IndexerDecl,
     object: &Expr,
-    index: &Expr,
+    indices: &[Expr],
     value: &Expr,
 ) -> Result<Option<VReg>, LowerError> {
     let Some(block) = decl.set.clone() else {
@@ -2948,24 +3143,27 @@ fn eval_indexer_set(
     b.prop_inline_stack.push((path.to_owned(), "[]".to_owned()));
     let set_ctx = Ctx {
         table: ctx.table,
+        class_paths: ctx.class_paths,
         current_class: path,
         current_info: Some(info),
-        current_path: ctx.current_path,
+        current_path: Some(path),
         classes: ctx.classes,
         import_index: ctx.import_index,
         dep_imports: ctx.dep_imports,
         host_import_count: ctx.host_import_count,
         method_vars: ctx.method_vars,
+                type_subst: None,
         local_fns: ctx.local_fns,
         current_method: Some("set_Item".to_owned()),
         current_ret: Some(decl.type_name.clone()),
         static_index: ctx.static_index,
         defines: ctx.defines,
+        lambda_deferred: None,
+                    lambda_base: 0,
     };
     // C# evaluation order: object, index, value.
     let base = eval(object, b, ctx)?;
-    let tmp = b.fresh();
-    b.mov(tmp, VReg(0));
+    let saved_this = b.save_this();
     b.mov(VReg(0), base);
     b.scope_enter();
     let bind = |b: &mut Body<'_>, n: &str, ty: &str, v: VReg| -> Result<(), LowerError> {
@@ -2981,21 +3179,28 @@ fn eval_indexer_set(
         Ok(())
     };
     bind(b, "this", path, base)?;
-    // Single-index form (the gate matched arity 1).
-    let pname = decl.params.first().map(|p| p.name.clone()).unwrap_or("index".to_owned());
-    let pty = decl
-        .params
-        .first()
-        .map(|p| p.type_name.clone())
-        .unwrap_or("object".to_owned());
-    let iv = eval(index, b, ctx)?;
-    bind(b, &pname, &pty, iv)?;
+    // Bind every index parameter, in order: a multi-parameter
+    // indexer's `this[i, j]` reaches the body as two locals.
+    for (k, idx) in indices.iter().enumerate() {
+        let pname = decl
+            .params
+            .get(k)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| format!("index{k}"));
+        let pty = decl
+            .params
+            .get(k)
+            .map(|p| p.type_name.clone())
+            .unwrap_or_else(|| "object".to_owned());
+        let iv = eval(idx, b, ctx)?;
+        bind(b, &pname, &pty, iv)?;
+    }
     let vv = eval(value, b, ctx)?;
     bind(b, "value", &decl.type_name, vv)?;
     let cp = b.checkpoint();
     let result = eval_block_inline(b, &set_ctx, &block);
     b.scope_exit();
-    b.mov(VReg(0), tmp);
+    b.restore_this(saved_this);
     b.prop_inline_stack.pop();
     match result {
         Ok(_) => Ok(Some(vv)),
@@ -3018,7 +3223,7 @@ fn eval_indexer_get(
     path: &str,
     decl: &crate::models::IndexerDecl,
     object: &Expr,
-    index: &Expr,
+    indices: &[Expr],
 ) -> Result<Option<VReg>, LowerError> {
     let has_get = decl.get.is_some() || decl.get_expr.is_some();
     if !has_get {
@@ -3033,23 +3238,28 @@ fn eval_indexer_get(
     b.prop_inline_stack.push((path.to_owned(), "[]".to_owned()));
     let get_ctx = Ctx {
         table: ctx.table,
+        class_paths: ctx.class_paths,
         current_class: path,
         current_info: Some(info),
-        current_path: ctx.current_path,
+        // The path must match the class this context switches to (the
+        // indexer's owner), like the setter's context.
+        current_path: Some(path),
         classes: ctx.classes,
         import_index: ctx.import_index,
         dep_imports: ctx.dep_imports,
         host_import_count: ctx.host_import_count,
         method_vars: ctx.method_vars,
+                type_subst: None,
         local_fns: ctx.local_fns,
         current_method: Some("get_Item".to_owned()),
         current_ret: Some(decl.type_name.clone()),
         static_index: ctx.static_index,
         defines: ctx.defines,
+        lambda_deferred: None,
+                    lambda_base: 0,
     };
     let base = eval(object, b, ctx)?;
-    let tmp = b.fresh();
-    b.mov(tmp, VReg(0));
+    let saved_this = b.save_this();
     b.mov(VReg(0), base);
     b.scope_enter();
     let bind = |b: &mut Body<'_>, n: &str, ty: &str, v: VReg| -> Result<(), LowerError> {
@@ -3065,14 +3275,20 @@ fn eval_indexer_get(
         Ok(())
     };
     bind(b, "this", path, base)?;
-    let pname = decl.params.first().map(|p| p.name.clone()).unwrap_or("index".to_owned());
-    let pty = decl
-        .params
-        .first()
-        .map(|p| p.type_name.clone())
-        .unwrap_or("object".to_owned());
-    let iv = eval(index, b, ctx)?;
-    bind(b, &pname, &pty, iv)?;
+    for (k, idx) in indices.iter().enumerate() {
+        let pname = decl
+            .params
+            .get(k)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| format!("index{k}"));
+        let pty = decl
+            .params
+            .get(k)
+            .map(|p| p.type_name.clone())
+            .unwrap_or_else(|| "object".to_owned());
+        let iv = eval(idx, b, ctx)?;
+        bind(b, &pname, &pty, iv)?;
+    }
     let cp = b.checkpoint();
     let got = if let Some(e) = decl.get_expr.clone() {
         (|| -> Result<VReg, LowerError> {
@@ -3087,7 +3303,7 @@ fn eval_indexer_get(
         Ok(b.const_i64(0))
     };
     b.scope_exit();
-    b.mov(VReg(0), tmp);
+    b.restore_this(saved_this);
     b.prop_inline_stack.pop();
     match got {
         Ok(v) => Ok(Some(v)),
@@ -3098,7 +3314,7 @@ fn eval_indexer_get(
     }
 }
 
-fn find_indexer(
+pub(super) fn find_indexer(
     ctx: &Ctx<'_>,
     t: &str,
     arity: usize,
@@ -3219,43 +3435,6 @@ pub(super) fn interlocked_atomic(
     })())
 }
 
-/// No-op thin-lock primitives for the no-header configuration (see
-/// the `ObjectHeader` interception in `eval`): acquisition always
-/// succeeds uncontended, release is vacuous. Shared by the qualified
-/// path and bare same-class calls (mirrors `interlocked_atomic`).
-/// Returns `None` when the name/arity is not a covered primitive so
-/// callers fall through to normal lowering.
-pub(super) fn monitor_atomic(
-    name: &str,
-    args: &[Expr],
-    b: &mut Body<'_>,
-    ctx: &Ctx<'_>,
-) -> Option<Result<VReg, LowerError>> {
-    let applicable = matches!(
-        (name, args.len()),
-        ("AcquireThinLock", 1)
-            | ("TryAcquireThinLock", 1)
-            | ("TryAcquireThinLock", 2)
-            | ("Release", 1)
-            | ("IsAcquired", 1)
-    );
-    if !applicable {
-        return None;
-    }
-    Some((|| {
-        // Evaluate args for side effects; the values are unused (the
-        // lock state they would consult does not exist here).
-        let _ = eval_args(args, b, ctx)?;
-        // Success-shaped constants: void entries yield zero,
-        // predicates yield true.
-        let v = match name {
-            "TryAcquireThinLock" | "IsAcquired" => 1,
-            _ => 0,
-        };
-        Ok(b.const_i64(v))
-    })())
-}
-
 /// P/Invoke SafeHandle marshaling (`SafeHandle` → OS handle): a/// SafeHandle-derived argument to an integer parameter passes the
 /// underlying handle (`DangerousGetHandle`), not the object pointer
 /// (which faulted `Console.WriteLine` with EBADF — the heap address
@@ -3278,22 +3457,6 @@ pub(super) fn marshal_safehandle_args(
     // When `force_extern`, the integer-param gate is skipped (the
     // native signature takes ints where the managed decl may say
     // `SafeHandle`).
-    // TEMP-MARSHALDIAG2: audit hook reachability. Removed before close.
-    if std::env::var("RUBYC_MARSHALDIAG2").is_ok()
-        && arg_types.iter().any(|t| {
-            base_type_name(t) == "SafeHandle"
-                || base_type_name(t) == "SafeFileHandle"
-                || t.contains("SafeHandle")
-        })
-    {
-        eprintln!(
-            "[rubyc] TEMP-MARSHALDIAG2 hook argtys={:?} force={} in {}.{}",
-            arg_types,
-            force_extern,
-            ctx.current_class,
-            ctx.current_method.clone().unwrap_or_default(),
-        );
-    }
     for (i, (slot, arg_ty)) in argv.iter_mut().zip(arg_types.iter()).enumerate() {
         if !force_extern {
             let Some(param_ty) = param_types.get(i) else {
@@ -3332,13 +3495,6 @@ pub(super) fn marshal_safehandle_args(
                 if f.is_static {
                     continue;
                 }
-                // TEMP-MARSHALDIAG: audit conversions. Removed before close.
-                eprintln!(
-                    "[rubyc] TEMP-MARSHALDIAG {arg_ty} -> {} in {}.{}",
-                    entry.name,
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default()
-                );
                 let dst = b.fresh();
                 b.push_raw(Instr::LoadField {
                     dst,
@@ -4188,9 +4344,1005 @@ pub(super) fn lower_to_array_pack(
     Some(Ok(arr))
 }
 
+/// Function index for a method group used as a value: the declaring class
+/// is searched from the current one outward through its base chain, taking
+/// the first class that declares a method of that name.
+fn method_group_index(name: &str, b: &Body<'_>, ctx: &Ctx<'_>) -> Option<u32> {
+    let _ = b;
+    for class in ctx.classes.iter() {
+        // The arity is the DECLARED parameter count: a group of `Twice(int)`
+        // must resolve `Twice#1`, not `Twice#0` (which does not exist, so
+        // the lookup silently failed and the value was reported missing).
+        for m in class.members.iter() {
+            let crate::models::ClassMember::Method(md) = m else {
+                continue;
+            };
+            if md.name != name {
+                continue;
+            }
+            if let Some(i) = function_index_for(ctx, &class.name, name, md.params.len()) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Emit `value is <type>`: compare the value's vtable-row word against
+/// the row address of the type and of every class deriving from it.
+///
+/// An object's word 0 is the ADDRESS of its row (not an index), so this is
+/// an address comparison per candidate. Exact for classes; an INTERFACE
+/// target is reported because interfaces still have no row of their own
+/// — answering false would be a fabrication.
+pub(super) fn emit_type_test(
+    b: &mut Body<'_>,
+    ctx: &Ctx<'_>,
+    value: VReg,
+    simple: &str,
+    spelling: &str,
+) -> Result<VReg, LowerError> {
+    // A string is a tagged runtime object: the high bit of its refcount
+    // word is set (STRING_REF). Class objects keep a plain positive count,
+    // so this one signed test distinguishes them. Null is not a string.
+    if matches!(simple, "string" | "String") {
+        let zero = b.const_i64(0);
+        let is_null = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Eq,
+            a: value,
+            b: zero,
+        });
+        let res = b.fresh();
+        let null_b = b.make_block();
+        let test_b = b.make_block();
+        let join_b = b.make_block();
+        b.terminate(Terminator::Branch {
+            cond: Some(is_null),
+            if_true: null_b,
+            if_false: test_b,
+        });
+        b.switch_to(null_b);
+        b.mov(res, zero);
+        b.goto(join_b);
+        b.switch_to(test_b);
+        let refc = b.fresh();
+        b.push_raw(Instr::LoadField {
+            dst: refc,
+            base: value,
+            off: 8,
+        });
+        let tagged = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Lt,
+            a: refc,
+            b: zero,
+        });
+        b.mov(res, tagged);
+        b.goto(join_b);
+        b.switch_to(join_b);
+        return Ok(res);
+    }
+    // A native type descriptor is a `System.Type` (and a
+    // `System.RuntimeType` at the API level) even though its first
+    // word is TYPE_TAG rather than a vtable row. Null is not a type.
+    if matches!(simple, "Type" | "RuntimeType") {
+        let zero = b.const_i64(0);
+        let is_null = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Eq,
+            a: value,
+            b: zero,
+        });
+        let res = b.fresh();
+        let null_b = b.make_block();
+        let test_b = b.make_block();
+        let join_b = b.make_block();
+        b.terminate(Terminator::Branch {
+            cond: Some(is_null),
+            if_true: null_b,
+            if_false: test_b,
+        });
+        b.switch_to(null_b);
+        b.mov(res, zero);
+        b.goto(join_b);
+        b.switch_to(test_b);
+        let row = b.fresh();
+        b.push_raw(Instr::LoadField {
+            dst: row,
+            base: value,
+            off: 0,
+        });
+        let tag = b.const_i64(TYPE_TAG);
+        let same = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Eq,
+            a: row,
+            b: tag,
+        });
+        b.mov(res, same);
+        b.goto(join_b);
+        b.switch_to(join_b);
+        return Ok(res);
+    }
+    // An INTERFACE target has no row of its own, but that is not a
+    // blocker for the test: the answer is "is this object an instance of
+    // some class that implements the interface?", which expands to the
+    // row addresses of exactly those classes. Interfaces still get no
+    // rows of their own, but the TEST is
+    // answerable, and answering it is not a guess.
+    let iface_names: Vec<String> = ctx
+        .table
+        .interfaces
+        .iter()
+        .filter(|i| {
+            i.name == simple
+                || i.name == spelling
+                // Interface names are stored as declared, which may be
+                // qualified (`t.I`) while the test spells the simple name.
+                || i.name.rsplit('.').next() == Some(simple)
+        })
+        .map(|i| i.name.clone())
+        .collect();
+    if !iface_names.is_empty() {
+        let mut rows: Vec<u32> = Vec::new();
+        for decl in ctx.classes.iter() {
+            let Some(info) = ctx.table.class(&decl.name) else {
+                continue;
+            };
+            let implements = info.interfaces.iter().any(|(iname, _)| {
+                iface_names.iter().any(|n| iname == n)
+                    || ctx
+                        .table
+                        .interface_derives_from(iname, &simple)
+            });
+            if implements {
+                rows.push(construction_row(ctx, decl));
+            }
+        }
+        if rows.is_empty() {
+            // No class in this unit implements it, so there is no row to
+            // compare against: the object cannot be one, but saying so
+            // would rest on the unit being complete. Report it.
+            return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                "rubyc.native.ir.lower_expr.interface_type_test",
+                simple.to_owned()
+            )));
+        }
+        let rowv = b.fresh();
+        b.push_raw(Instr::LoadField {
+            dst: rowv,
+            base: value,
+            off: 0,
+        });
+        let mut acc: Option<VReg> = None;
+        for row in rows {
+            let vaddr = b.fresh();
+            b.push_raw(Instr::VTableAddr { dst: vaddr, row });
+            let eq = b.emit(Instr::Cmp {
+                dst: VReg(0),
+                op: CmpOp::Eq,
+                a: rowv,
+                b: vaddr,
+            });
+            acc = Some(match acc {
+                None => eq,
+                Some(prev) => b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitOr,
+                    a: prev,
+                    b: eq,
+                }),
+            });
+        }
+        return Ok(acc.unwrap_or_else(|| b.const_i64(0)));
+    }
+    let mut rows: Vec<u32> = Vec::new();
+    for decl in ctx.classes.iter() {
+        let Some(info) = ctx.table.class(&decl.name) else {
+            continue;
+        };
+        let matches = info.name == simple
+            || info.key.path == spelling
+            || ctx.table.derives_from(&info.name, simple);
+        if matches {
+            rows.push(construction_row(ctx, decl));
+        }
+    }
+    // A PRIMITIVE target is a boxed value: refcount bit 62 marks the
+    // box, and the descriptor at +24 is the boxed type. Strings and
+    // class objects fail the box test; null is excluded before the
+    // loads.
+    if primitive_id(simple).is_some() {
+        let desc = b.type_token(simple, ctx)?;
+        let zero = b.const_i64(0);
+        let is_null = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Eq,
+            a: value,
+            b: zero,
+        });
+        let res = b.fresh();
+        let null_b = b.make_block();
+        let test_b = b.make_block();
+        let join_b = b.make_block();
+        b.terminate(Terminator::Branch {
+            cond: Some(is_null),
+            if_true: null_b,
+            if_false: test_b,
+        });
+        b.switch_to(null_b);
+        b.mov(res, zero);
+        b.goto(join_b);
+        b.switch_to(test_b);
+        let refc = b.fresh();
+        b.push_raw(Instr::LoadField { dst: refc, base: value, off: 8 });
+        let flag = b.const_i64(BOX_FLAG);
+        let flagged = b.emit(Instr::Bin {
+            dst: VReg(0),
+            op: IrBinOp::BitAnd,
+            a: refc,
+            b: flag,
+        });
+        let has_box = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Ne,
+            a: flagged,
+            b: zero,
+        });
+        let objdesc = b.fresh();
+        b.push_raw(Instr::LoadField { dst: objdesc, base: value, off: 24 });
+        let same = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Eq,
+            a: objdesc,
+            b: desc,
+        });
+        let ok = b.emit(Instr::Bin {
+            dst: VReg(0),
+            op: IrBinOp::BitAnd,
+            a: has_box,
+            b: same,
+        });
+        b.mov(res, ok);
+        b.goto(join_b);
+        b.switch_to(join_b);
+        return Ok(res);
+    }
+    // A PRIMITIVE target needs a runtime tag. Strings are handled above:
+    // the high bit of their refcount word is the tag. Primitives are
+    // still stored unboxed, so there is nothing to compare and the gap
+    // is named rather than guessed (a length/address heuristic answered
+    // differently on the VM and the static executable once).
+    if rows.is_empty() {
+        // A PRIMITIVE target (`o is int`) has no class entry and no
+        // boxed tag to test: values of primitive types are stored
+        // unboxed, so their runtime type is not recoverable. Name the
+        // feature instead of the generic "no type" message.
+        if is_primitive_spelling(simple) {
+            return Err(LowerError::UnsupportedConstruct(format!(
+                "`{spelling}` is a PRIMITIVE type pattern: values of primitive types are unboxed here, so there is no runtime tag to test. Use a static-type test (`x is not null`) or a class/interface target."
+            )));
+        }
+        // A DELEGATE type: the value carries its runtime type in the
+        // delegate's type word, so the test compares that descriptor
+        // with the target's. A value that is not a delegate at all (a
+        // class instance) carries its own runtime type there, and the
+        // comparison is false - which is the right answer.
+        if ctx.table.is_delegate(&spelling) {
+            let desc = b.type_token(&spelling, ctx)?;
+            let zero = b.const_i64(0);
+            let is_null = b.emit(Instr::Cmp {
+                dst: VReg(0),
+                op: CmpOp::Eq,
+                a: value,
+                b: zero,
+            });
+            let res = b.fresh();
+            let null_b = b.make_block();
+            let test_b = b.make_block();
+            let unset_b = b.make_block();
+            let compare_b = b.make_block();
+            let join_b = b.make_block();
+            b.terminate(Terminator::Branch {
+                cond: Some(is_null),
+                if_true: null_b,
+                if_false: test_b,
+            });
+            b.switch_to(null_b);
+            b.mov(res, zero);
+            b.goto(join_b);
+            b.switch_to(test_b);
+            let actual = b.fresh();
+            b.push_raw(Instr::LoadField {
+                dst: actual,
+                base: value,
+                off: 16,
+            });
+            let is_unset = b.emit(Instr::Cmp {
+                dst: VReg(0),
+                op: CmpOp::Eq,
+                a: actual,
+                b: zero,
+            });
+            b.terminate(Terminator::Branch {
+                cond: Some(is_unset),
+                if_true: unset_b,
+                if_false: compare_b,
+            });
+            // The descriptors match, or they do not.
+            b.switch_to(compare_b);
+            let same = b.emit(Instr::Cmp {
+                dst: VReg(0),
+                op: CmpOp::Eq,
+                a: actual,
+                b: desc,
+            });
+            b.mov(res, same);
+            b.goto(join_b);
+            // A delegate whose type was never set - created where the
+            // target type is not known - has no runtime type to
+            // compare. Say so rather than answer "no" to a test that
+            // may well be "yes".
+            b.switch_to(unset_b);
+            let ex = eval(
+                &Expr::New {
+                    class_name: "System.NotSupportedException".to_owned(),
+                    args: Vec::new(),
+                    init: Vec::new(),
+                    span: Default::default(),
+                },
+                b,
+                ctx,
+            )?;
+            b.terminate(Terminator::Unwind { src: ex });
+            b.switch_to(join_b);
+            return Ok(res);
+        }
+        return Err(LowerError::UnsupportedConstruct(crate::tf!(
+            "rubyc.native.ir.lower_expr.unknown_type_test",
+            spelling.to_owned()
+        )));
+    }
+    let rowv = b.fresh();
+    b.push_raw(Instr::LoadField {
+        dst: rowv,
+        base: value,
+        off: 0,
+    });
+    let mut acc: Option<VReg> = None;
+    for row in rows {
+        let vaddr = b.fresh();
+        b.push_raw(Instr::VTableAddr { dst: vaddr, row });
+        let eq = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Eq,
+            a: rowv,
+            b: vaddr,
+        });
+        acc = Some(match acc {
+            None => eq,
+            Some(prev) => b.emit(Instr::Bin {
+                dst: VReg(0),
+                op: IrBinOp::BitOr,
+                a: prev,
+                b: eq,
+            }),
+        });
+    }
+    Ok(acc.unwrap_or_else(|| b.const_i64(0)))
+}
+
+/// Evaluate one `is` pattern against an ALREADY-EVALUATED subject.
+///
+/// The subject is computed once by the caller and reused here, so a
+/// pattern chain cannot duplicate its side effects. A type pattern goes
+/// through `emit_type_test`; a constant pattern compares values.
+fn emit_is_pattern(
+    b: &mut Body<'_>,
+    ctx: &Ctx<'_>,
+    a: VReg,
+    subject_ty: &str,
+    rhs: &Expr,
+) -> Result<VReg, LowerError> {
+    // `is not null`: the parser marks the shape with `__rubyc_nonnull`
+    // (the subject is the `is` expression's left side), so the test is
+    // "the subject is not null".
+    if let Expr::Call { callee, .. } = rhs
+        && callee == "__rubyc_nonnull"
+    {
+        let zero = b.const_i64(0);
+        return Ok(b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: CmpOp::Ne,
+            a,
+            b: zero,
+        }));
+    }
+    // List pattern: `[p0, p1, ..]`. Arrays store their length at +0 and
+    // elements at +16 with an 8-byte stride.
+    if let Expr::Call { callee, args, .. } = rhs
+        && callee == "__rubyc_list"
+        && !args.is_empty()
+    {
+        let has_rest = matches!(
+            &args[0],
+            Expr::Literal(crate::models::Literal::Bool(true))
+        );
+        let pats = &args[1..];
+        let n = pats.len() as i64;
+        // Element stride comes from the SUBJECT's element type: `int[]`
+        // stores 4-byte elements, so a hardcoded 8 read past the value
+        // (`[10, 20]` failed on a two-element array while `a[1]` was
+        // right). Tuple-shaped subjects keep the 8-byte slot.
+        let elem_ty = subject_ty.trim().trim_end_matches("[]");
+        let width = if elem_ty.is_empty() || subject_ty.contains("tuple") {
+            8
+        } else {
+            crate::native::ir::lower::span::span_elem_width(elem_ty)
+        } as u32;
+        let len = b.fresh();
+        b.push_raw(Instr::LoadField { dst: len, base: a, off: 0 });
+        let want = b.const_i64(n);
+        let mut acc = b.emit(Instr::Cmp {
+            dst: VReg(0),
+            op: if has_rest { CmpOp::Ge } else { CmpOp::Eq },
+            a: len,
+            b: want,
+        });
+        for (i, pat) in pats.iter().enumerate() {
+            let elem = b.fresh();
+            b.push_raw(Instr::LoadField {
+                dst: elem,
+                base: a,
+                off: 16 + width * i as u32,
+            });
+            // Dense elements are packed (`int[]` is 4 bytes each); an
+            // 8-byte load picks up the neighbour's bytes. Narrow and
+            // sign-extend exactly as the index path does — unsigned
+            // elements mask, signed ones mask then sign-extend.
+            let elem = if let Some(mask) = narrow_load_mask(elem_ty) {
+                let m = b.const_i64(mask);
+                b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitAnd,
+                    a: elem,
+                    b: m,
+                })
+            } else if let Some(bits) = signed_narrow_bits(elem_ty) {
+                let mask = b.const_i64((1i64 << bits) - 1);
+                let narrowed = b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitAnd,
+                    a: elem,
+                    b: mask,
+                });
+                let sh = b.const_i64((64 - bits) as i64);
+                let up = b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::Shl,
+                    a: narrowed,
+                    b: sh,
+                });
+                b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::Shr,
+                    a: up,
+                    b: sh,
+                })
+            } else {
+                elem
+            };
+            let t = emit_is_pattern(b, ctx, elem, elem_ty, pat)?;
+            acc = b.emit(Instr::Bin {
+                dst: VReg(0),
+                op: IrBinOp::BitAnd,
+                a: acc,
+                b: t,
+            });
+        }
+        return Ok(acc);
+    }
+    // Tuple pattern: `(p0, p1, ...)`. Tuples lower as dense arrays
+    // (element i at +16 + i*8), so each element is tested in place.
+    if let Expr::Call { callee, args, .. } = rhs
+        && callee == "__rubyc_tuple"
+    {
+        let mut acc: Option<VReg> = None;
+        for (i, pat) in args.iter().enumerate() {
+            let elem = b.fresh();
+            b.push_raw(Instr::LoadField {
+                dst: elem,
+                base: a,
+                off: 16 + 8 * i as u32,
+            });
+            let t = emit_is_pattern(b, ctx, elem, subject_ty, pat)?;
+            acc = Some(match acc {
+                None => t,
+                Some(prev) => b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitAnd,
+                    a: prev,
+                    b: t,
+                }),
+            });
+        }
+        return Ok(acc.unwrap_or_else(|| b.const_i64(1)));
+    }
+    // Property pattern member: `{ Length: > 0 }`. The member is read
+    // from the subject VALUE (not by re-evaluating the subject, which
+    // would duplicate side effects), through a scoped temp carrying the
+    // subject's static type so member resolution works.
+    if let Expr::Call { callee, args, .. } = rhs
+        && callee == "__rubyc_prop"
+        && args.len() == 2
+    {
+        let Expr::Literal(crate::models::Literal::Str(member)) = &args[0] else {
+            return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                "rubyc.native.ir.lower_expr.unsupported_pattern",
+                format!("{rhs:?}")
+            )));
+        };
+        let nz = {
+            let zero = b.const_i64(0);
+            b.emit(Instr::Cmp { dst: VReg(0), op: CmpOp::Ne, a, b: zero })
+        };
+        b.scope_enter();
+        let slot = b
+            .scopes
+            .declare("$prop_pat", subject_ty, crate::models::Access::Default)
+            .map_err(LowerError::UnsupportedConstruct)?;
+        while b.bindings.len() <= slot {
+            let v = b.fresh();
+            b.bindings.push(v);
+        }
+        b.mov(b.bindings[slot], a);
+        let member_expr = Expr::Member {
+            object: Box::new(Expr::Ident {
+                name: "$prop_pat".to_owned(),
+                span: crate::models::Span::new(0, 0),
+            }),
+            name: member.clone(),
+            span: crate::models::Span::new(0, 0),
+        };
+        let mv = eval(&member_expr, b, ctx)?;
+        let inner = emit_is_pattern(b, ctx, mv, subject_ty, &args[1])?;
+        b.scope_exit();
+        return Ok(b.emit(Instr::Bin {
+            dst: VReg(0),
+            op: IrBinOp::BitAnd,
+            a: nz,
+            b: inner,
+        }));
+    }
+    if let Expr::Binary {
+        op: crate::models::BinOp::Or | crate::models::BinOp::And,
+        lhs: p1,
+        rhs: p2,
+        ..
+    } = rhs
+    {
+        let l = emit_is_pattern(b, ctx, a, subject_ty, p1)?;
+        let r = emit_is_pattern(b, ctx, a, subject_ty, p2)?;
+        let op = if matches!(rhs, Expr::Binary { op: crate::models::BinOp::Or, .. }) {
+            IrBinOp::BitOr
+        } else {
+            IrBinOp::BitAnd
+        };
+        return Ok(b.emit(Instr::Bin { dst: VReg(0), op, a: l, b: r }));
+    }
+    if let Expr::Ident { name, .. } = rhs {
+        let simple = name.rsplit('.').next().unwrap_or(name).to_owned();
+        // A test on a value-typed SUBJECT is a static question: the
+        // value can never carry a different runtime type.
+        if primitive_id(&simple).is_some()
+            && !ctx.is_type_var(subject_ty)
+            && is_value_type_spelling(ctx, subject_ty)
+        {
+            let same = base_type_name(subject_ty)
+                == canonical_primitive(&simple);
+            return Ok(b.const_i64(same as i64));
+        }
+        // A DISCARD pattern (`is _`) matches every value.
+        if simple == "_" {
+            return Ok(b.const_i64(1));
+        }
+        // `x is object`: every value is an object, and only a null
+        // reference is not one. A value type is never null.
+        if simple == "object" || simple == "Object" {
+            let nullable = subject_ty.trim_end().ends_with('?');
+            if !nullable
+                && !ctx.is_type_var(subject_ty)
+                && is_value_type_spelling(ctx, subject_ty)
+            {
+                return Ok(b.const_i64(1));
+            }
+            let zero = b.const_i64(0);
+            return Ok(b.emit(Instr::Cmp {
+                dst: VReg(0),
+                op: CmpOp::Ne,
+                a,
+                b: zero,
+            }));
+        }
+        // A TYPE PARAMETER target needs the value's EXACT runtime type.
+        // Only a generic instance carries one (the descriptor that holds
+        // its type arguments), so the test cannot be answered for an
+        // ordinary instance: answering "no" would be a wrong answer.
+        // Say so until every instance carries its runtime type.
+        if ctx.is_type_var(&simple) {
+            return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                "rubyc.native.ir.lower_expr.type_var_test",
+                simple.to_string()
+            )));
+        }
+        return emit_type_test(b, ctx, a, &simple, name);
+    }
+    // A qualified type pattern parses as a member expression
+    // (`is System.Type`). Constants use the same shape (`is Color.Red`),
+    // so only names that resolve to a declared type or a known
+    // framework type take the type-test path.
+    if let Expr::Member { .. } = rhs
+        && let Some(spelled) = dotted_spelling(rhs)
+    {
+        let simple = spelled.rsplit('.').next().unwrap_or(&spelled);
+        let simple = simple.split('<').next().unwrap_or(simple);
+        let known = ctx.table.class(&spelled).is_some()
+            || is_value_type_spelling(ctx, &spelled)
+            || matches!(
+                simple,
+                "Type" | "RuntimeType" | "String" | "Object" | "Array" | "ValueType"
+                    | "Enum" | "Delegate"
+            );
+        if known {
+            return emit_type_test(b, ctx, a, simple, &spelled);
+        }
+    }
+    // Relational pattern: `> 0`, `>= X`, `<= Y`. The parser records the
+    // operator with a zero placeholder on the left; the real left side
+    // is the subject being tested.
+    if let Expr::Binary {
+        op: op @ (crate::models::BinOp::Lt
+        | crate::models::BinOp::Gt
+        | crate::models::BinOp::Le
+        | crate::models::BinOp::Ge),
+        lhs,
+        rhs: value,
+        ..
+    } = rhs
+        && matches!(
+            lhs.as_ref(),
+            Expr::Literal(crate::models::Literal::Int(0))
+        )
+    {
+        let cmp = match op {
+            crate::models::BinOp::Lt => CmpOp::Lt,
+            crate::models::BinOp::Gt => CmpOp::Gt,
+            crate::models::BinOp::Le => CmpOp::Le,
+            _ => CmpOp::Ge,
+        };
+        let v = eval(value, b, ctx)?;
+        return Ok(b.emit(Instr::Cmp { dst: VReg(0), op: cmp, a, b: v }));
+    }
+    let v = eval(rhs, b, ctx)?;
+    Ok(b.emit(Instr::Cmp {
+        dst: VReg(0),
+        op: CmpOp::Eq,
+        a,
+        b: v,
+    }))
+}
+
+/// Names referenced by a lambda body, for the capture check.
+///
+/// Deliberately shallow-but-broad: every expression shape that can hold an
+/// identifier is walked, because a missed one would let a captured local
+/// lower as an unknown name and answer 0 — a wrong value, which is worse
+/// than the report this feeds.
+fn body_idents(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::NamedArg { value, .. } => body_idents(value, out),
+        Expr::Ident { name, .. } => out.push(name.clone()),
+        Expr::Checked { inner, .. } => body_idents(inner, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            body_idents(lhs, out);
+            body_idents(rhs, out);
+        }
+        Expr::Unary { inner, .. } => body_idents(inner, out),
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            body_idents(cond, out);
+            body_idents(then_expr, out);
+            body_idents(else_expr, out);
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                body_idents(a, out);
+            }
+        }
+        Expr::New { args, init, .. } => {
+            for a in args {
+                body_idents(a, out);
+            }
+            for m in init {
+                body_idents(&m.value, out);
+            }
+        }
+        Expr::Member { object, .. } => body_idents(object, out),
+        Expr::MethodCall { object, args, .. } => {
+            body_idents(object, out);
+            for a in args {
+                body_idents(a, out);
+            }
+        }
+        Expr::Index { object, index, .. } => {
+            body_idents(object, out);
+            body_idents(index, out);
+        }
+        Expr::Cast { expr, .. } | Expr::Await { inner: expr, .. } => body_idents(expr, out),
+        Expr::Assign { target, value, .. } | Expr::AssignComplex { lhs: target, value, .. } => {
+            body_idents(target, out);
+            body_idents(value, out);
+        }
+        Expr::PostInc { target, .. } | Expr::PostDec { target, .. } => body_idents(target, out),
+        Expr::NewArray { size, init, .. } => {
+            body_idents(size, out);
+            for e in init {
+                body_idents(e, out);
+            }
+        }
+        Expr::SwitchExpr { subject, arms, .. } => {
+            body_idents(subject, out);
+            for a in arms {
+                body_idents(&a.body, out);
+            }
+        }
+        Expr::InterpolatedString { parts, .. } => {
+            for p in parts {
+                if let crate::models::InterpPart::Hole(h) = p {
+                    body_idents(h, out);
+                }
+            }
+        }
+        Expr::Lambda { body, .. } => match body {
+            crate::models::ast::expression::LambdaBody::Expr(inner) => body_idents(inner, out),
+            crate::models::ast::expression::LambdaBody::Block(b) => {
+                for st in &b.stmts {
+                    body_idents_stmt(st, out);
+                }
+            }
+        },
+        Expr::Literal(_) | Expr::Default { .. } => {}
+    }
+}
+
+fn body_idents_stmt(st: &crate::models::Stmt, out: &mut Vec<String>) {
+    use crate::models::Stmt;
+    match st {
+        Stmt::Let { init, .. } => body_idents(init, out),
+        Stmt::Return { value, .. } => {
+            if let Some(v) = value {
+                body_idents(v, out);
+            }
+        }
+        Stmt::Expression(e) => body_idents(e, out),
+        Stmt::Block { body, .. } => {
+            for s in &body.stmts {
+                body_idents_stmt(s, out);
+            }
+        }
+        Stmt::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            body_idents(cond, out);
+            for s in &then_block.stmts {
+                body_idents_stmt(s, out);
+            }
+            if let Some(b) = else_block {
+                for s in &b.stmts {
+                    body_idents_stmt(s, out);
+                }
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            body_idents(cond, out);
+            for s in &body.stmts {
+                body_idents_stmt(s, out);
+            }
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+            ..
+        } => {
+            if let Some(s) = init {
+                body_idents_stmt(s, out);
+            }
+            if let Some(c) = cond {
+                body_idents(c, out);
+            }
+            if let Some(s) = step {
+                body_idents_stmt(s, out);
+            }
+            for s in &body.stmts {
+                body_idents_stmt(s, out);
+            }
+        }
+        Stmt::DoWhile { body, cond, .. } => {
+            for s in &body.stmts {
+                body_idents_stmt(s, out);
+            }
+            body_idents(cond, out);
+        }
+        Stmt::Switch {
+            subject,
+            arms,
+            default_body,
+            ..
+        } => {
+            body_idents(subject, out);
+            for a in arms {
+                for s in &a.body.stmts {
+                    body_idents_stmt(s, out);
+                }
+            }
+            if let Some(b) = default_body {
+                for s in &b.stmts {
+                    body_idents_stmt(s, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Evaluate an expression to a vreg.
 pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg, LowerError> {
     match expr {
+        // A named argument reaches `eval` only when the call shape did
+        // not rewrite the list into parameter order (the main shapes do;
+        // see `positional_args`). Evaluating the value keeps the old
+        // positional behaviour rather than dropping or skipping it.
+        Expr::NamedArg { value, .. } => eval(value, b, ctx),
+        // `checked(expr)`: the same expression, with overflow checks armed.
+        // The flag lives on the body so nested arithmetic sees it; it is
+        // not a property of the AST node alone.
+        Expr::Checked { inner, .. } => {
+            b.checked_depth += 1;
+            let v = eval(inner, b, ctx);
+            b.checked_depth -= 1;
+            v
+        }
+        Expr::Lambda { params, body, span } => {
+            // A lambda becomes a real function, lifted out of this body
+            // and emitted right after it, plus a delegate object holding
+            // that function's ADDRESS. The index is predictable: this
+            // method takes the next slot, then each lambda met in order
+            // takes the one after.
+            let Some(queue) = ctx.lambda_deferred else {
+                // No enclosing method (a field initializer or a test):
+                // there is nowhere to lift to, which is a real limit.
+                return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                    "rubyc.native.ir.lower_expr.lambda_unavailable"
+                )));
+            };
+            // Captures: a free variable is captured BY REFERENCE, not by
+            // value. Its address goes into the delegate object and the
+            // lifted body reads and writes THROUGH that address, so a
+            // later mutation of the captured variable is visible inside
+            // the closure — what C# requires, and what the addressable-
+            // local machinery (`&x` re-binds a local as by-reference over
+            // a cell) already provides.
+            let mut names: Vec<String> = Vec::new();
+            match body {
+                crate::models::ast::expression::LambdaBody::Expr(e) => {
+                    body_idents(e, &mut names)
+                }
+                crate::models::ast::expression::LambdaBody::Block(b) => {
+                    for st in &b.stmts {
+                        body_idents_stmt(st, &mut names);
+                    }
+                }
+            }
+            let mut captures: Vec<String> = Vec::new();
+            for n in names {
+                if params.contains(&n) || n == "this" || n == "_" {
+                    continue;
+                }
+                if b.scopes.lookup(&n).is_some() && !captures.contains(&n) {
+                    captures.push(n);
+                }
+            }
+            let obj = b.fresh();
+            // Layout: [fn_addr, kind, type, cap0, cap1, ...]. `kind` is 1
+            // for a lifted lambda, whose function takes the delegate
+            // object as its first parameter so it can reach the
+            // captures; 0 for a method group, which is called with its
+            // own arguments only. `type` is the delegate's runtime
+            // type — the descriptor of the instantiation the value
+            // belongs to, so `x is SomeDelegate` can ask.
+            b.push_raw(Instr::Alloc {
+                dst: obj,
+                bytes: 24 + 8 * captures.len() as u64,
+            });
+            // The delegate's runtime type: the descriptor of the type
+            // this value is converted to. The binding site knows it;
+            // without one the word stays null and a type test says so.
+            if let Some(expected) = b.expected_delegate.clone() {
+                if ctx.table.is_delegate(&expected) {
+                    let desc = b.type_token(&expected, ctx)?;
+                    b.push_raw(Instr::StoreField {
+                        base: obj,
+                        off: 16,
+                        src: desc,
+                    });
+                }
+            }
+            for (k, cname) in captures.iter().enumerate() {
+                let slot = b
+                    .scopes
+                    .lookup(cname)
+                    .map(|sym| (sym.slot, sym.is_byref))
+                    .expect("capture resolved above");
+                let (slot, already_byref) = slot;
+                let addr = if already_byref {
+                    b.bindings[slot]
+                } else {
+                    let home = b.bindings[slot];
+                    let cell = b.fresh();
+                    b.push_raw(Instr::Alloc { dst: cell, bytes: 16 });
+                    b.push_raw(Instr::StoreField {
+                        base: cell,
+                        off: 0,
+                        src: home,
+                    });
+                    b.bindings[slot] = cell;
+                    b.scopes.make_byref(cname);
+                    cell
+                };
+                b.push_raw(Instr::StoreField {
+                    base: obj,
+                    off: 24 + 8 * k as u32,
+                    src: addr,
+                });
+            }
+            let n = queue.borrow().len() as u32;
+            queue.borrow_mut().push(crate::native::ir::LambdaDeferred {
+                params: params.clone(),
+                body: body.clone(),
+                span: *span,
+                captures,
+            });
+            // The enclosing function's index is `functions.len() + 1` at
+            // the time it was started, and lambdas follow it. The caller
+            // (`ir/mod.rs`) records the base for us through the queue's
+            // length at method entry (0), so index = base + 1 + n where
+            // base is supplied by the emission loop's ordering.
+            let index = ctx.lambda_base + 1 + n;
+            let fa = b.fresh();
+            b.push_raw(Instr::FnAddr { dst: fa, fidx: index });
+            b.push_raw(Instr::StoreField {
+                base: obj,
+                off: 0,
+                src: fa,
+            });
+            let one = b.const_i64(1);
+            b.push_raw(Instr::StoreField {
+                base: obj,
+                off: 8,
+                src: one,
+            });
+            Ok(obj)
+        }
         Expr::NewArray { elem_type, size, init, .. } => {
             // Allocate on heap via ALLOC helper; store size at [obj+0].
             // Layout matches every other heap object: [0..8)=length,
@@ -4240,6 +5392,15 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // element-read path). Side effects evaluate in order.
             for (i, e) in init.iter().enumerate() {
                 let v = eval(e, b, ctx)?;
+                let src_ty = static_type_of(e, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                let v = if Body::is_object_target(elem_type, ctx)
+                    && primitive_id(&base_type_name(&src_ty)).is_some()
+                {
+                    b.box_value(v, &src_ty, ctx)?
+                } else {
+                    v
+                };
                 let off = b.const_i64(16 + i as i64 * w);
                 let addr = b.emit(Instr::Bin {
                     dst: VReg(0),
@@ -4251,7 +5412,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             }
             Ok(obj)
         }
-        Expr::Index { object, index, span: _, .. } => {
+        Expr::Index { object, index, extra, span: _, .. } => {
             // String char read: strings are UTF-16 (`build_utf16_string`
             // stores `char_len` units at +16), so char `i` is the
             // zero-extended u16 at `[base + 16 + i*2]`. Spelling-agnostic
@@ -4381,16 +5542,43 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // the getter (mirrors the setter path in the assign
             // arm); the raw read below would load object memory as
             // elements.
-            if !is_index_raw_target(&recv_ty) {
+            if !is_index_raw_target(&recv_ty) && !extra.is_empty() {
+                // Multi-parameter indexer (`x[i, j]`): the gate matches
+                // the declared arity, and every index is passed.
+                let mut indices: Vec<Expr> = vec![index.as_ref().clone()];
+                indices.extend(extra.iter().cloned());
+                if let Some((path, decl)) =
+                    find_indexer(ctx, &recv_ty, indices.len())
+                {
+                    let info = ctx
+                        .table
+                        .class(&recv_ty)
+                        .or_else(|| definition_entry(ctx.table, &recv_ty));
+                    if let Some(info) = info {
+                        if let Some(v) = eval_indexer_get(
+                            b, ctx, info, &path, &decl, object, &indices,
+                        )? {
+                            return Ok(v);
+                        }
+                    }
+                }
+            }
+            if !is_index_raw_target(&recv_ty) && extra.is_empty() {
                 if let Some((path, decl)) = find_indexer(ctx, &recv_ty, 1) {
                     let info = ctx
                         .table
                         .class(&recv_ty)
                         .or_else(|| definition_entry(ctx.table, &recv_ty));
                     if let Some(info) = info {
-                        if let Some(v) =
-                            eval_indexer_get(b, ctx, info, &path, &decl, object, index)?
-                        {
+                        if let Some(v) = eval_indexer_get(
+                            b,
+                            ctx,
+                            info,
+                            &path,
+                            &decl,
+                            object,
+                            &[index.as_ref().clone()],
+                        )? {
                             return Ok(v);
                         }
                     }
@@ -4478,6 +5666,23 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
         }
         Expr::Cast { type_name, expr, .. } => {
             let v = eval(expr, b, ctx)?;
+            let src_ty = static_type_of(expr, b, ctx)
+                .unwrap_or_else(|_| "object".to_owned());
+            let src_base = base_type_name(&src_ty);
+            let dst_base = base_type_name(type_name);
+            // Unboxing/boxing on an explicit cast. The boxed value is
+            // already in its target representation; a following numeric
+            // cast (e.g. `(int)(uint)o`) sees the unboxed static type.
+            if primitive_id(&dst_base).is_some()
+                && Body::is_object_target(&src_ty, ctx)
+            {
+                return b.unbox_value(v, type_name, true, ctx);
+            }
+            if Body::is_object_target(type_name, ctx)
+                && primitive_id(&src_base).is_some()
+            {
+                return b.box_value(v, &src_ty, ctx);
+            }
             // Float↔integral casts need real conversion (bit
             // patterns differ): `cvttsd2si` truncates toward zero
             // (C# unchecked semantics), `cvtsi2sd` widens exactly.
@@ -4534,6 +5739,39 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                             .unwrap_or_else(|_| "object".to_owned()),
                     );
                     if is_integral(&src_ty) {
+                        // `checked((T)v)` must REJECT a value that does not
+                        // fit T instead of silently masking it. The range is
+                        // compared in the source width, which is the same
+                        // 64-bit width the value already has.
+                        if b.checked_depth > 0 && bits < 64 {
+                            let (min, max) = if signed {
+                                let half = 1i64 << (bits - 1);
+                                (-half, half - 1)
+                            } else {
+                                (0, ((1u64 << bits) - 1) as i64)
+                            };
+                            let vmin = b.const_i64(min);
+                            let vmax = b.const_i64(max);
+                            let lo = b.emit(Instr::Cmp {
+                                dst: VReg(0),
+                                op: CmpOp::Lt,
+                                a: v,
+                                b: vmin,
+                            });
+                            let hi = b.emit(Instr::Cmp {
+                                dst: VReg(0),
+                                op: CmpOp::Gt,
+                                a: v,
+                                b: vmax,
+                            });
+                            let ovf = b.emit(Instr::Bin {
+                                dst: VReg(0),
+                                op: IrBinOp::BitOr,
+                                a: lo,
+                                b: hi,
+                            });
+                            b.throw_overflow_if(ovf, ctx)?;
+                        }
                         let mask = b.emit(Instr::Const {
                             dst: VReg(0),
                             imm: if bits == 64 {
@@ -4593,7 +5831,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     e.is_struct && !e.fields.is_empty()
                 })
             {
-                return Ok(b.alloc_struct_box(ctx, entry));
+                return Ok(b.alloc_struct_box(ctx, entry, Some(&tn)));
             }
             Ok(b.const_i64(0))
         }
@@ -4610,7 +5848,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 let info_opt = if anchored.is_some() {
                     anchored
                 } else {
-                    ctx.table.class(&type_name)
+                    member_entry(ctx.table, &type_name)
                 };
                 let Some(info) = info_opt else {
                     let _ = eval(object, b, ctx)?;
@@ -4626,7 +5864,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         let v = eval(value, b, ctx)?;
                         return Ok(v);
                     }
-                    return Err(LowerError::UnsupportedConstruct(crate::tf!(
+return Err(LowerError::UnsupportedConstruct(crate::tf!(
                         "rubyc.native.ir.lower_expr.no_member",
                         type_name.clone(),
                         name.clone()
@@ -4640,6 +5878,9 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     // the base address of a static.
                     let _ = eval(object, b, ctx)?;
                     let v = eval(value, b, ctx)?;
+                    let val_ty = static_type_of(value, b, ctx)
+                        .unwrap_or_else(|_| "object".to_owned());
+                    let v = b.coerce_boxing(v, &val_ty, &field.type_name, false, ctx)?;
                     let Some(base) = static_addr(field, b, ctx) else {
                         return Err(LowerError::UnsupportedConstruct(format!(
                             "static field '{}.{}' has no storage slot",
@@ -4651,6 +5892,9 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 }
                 let base = eval(object, b, ctx)?;
                 let v = eval(value, b, ctx)?;
+                let val_ty = static_type_of(value, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                let v = b.coerce_boxing(v, &val_ty, &field.type_name, false, ctx)?;
                 let field_is_ref = info
                     .field(name)
                     .map(|fi| is_heap_ref(ctx.table, &fi.type_name))
@@ -4682,6 +5926,18 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 let base = eval(object, b, ctx)?;
                 let idx = eval(index, b, ctx)?;
                 let v = eval(value, b, ctx)?;
+                let val_ty = static_type_of(value, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                let arr_ty = static_type_of(object, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                let elem_ty = arr_ty.trim_end_matches("[]");
+                let v = if Body::is_object_target(elem_ty, ctx)
+                    && primitive_id(&base_type_name(&val_ty)).is_some()
+                {
+                    b.box_value(v, &val_ty, ctx)?
+                } else {
+                    v
+                };
                 let eight = b.const_i64(8);
                 let sixteen = b.const_i64(16);
                 let idx8 = b.emit(Instr::Bin {
@@ -4778,26 +6034,31 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 && name.starts_with("Item")
                 && name[4..].chars().all(|c| c.is_ascii_digit())
             {
+                // A tuple's static type is spelled `(int, int)` (or
+                // `tuple[]` after inference); both denote the dense slot
+                // array, so `ItemN` is slot N-1 in either spelling.
                 let tr = type_name.trim();
-                if let Some(inner) = tr.strip_suffix("[]") {
-                    if inner.trim() == "tuple" {
-                        if let Ok(n) = name[4..].parse::<i64>() {
-                            if n >= 1 {
-                                let synth = Expr::Index {
-                                    object: object.clone(),
-                                    index: Box::new(Expr::Literal(
-                                        crate::models::Literal::Int(n - 1),
-                                    )),
-                                    is_range: false,
-                                    span: crate::models::Span::new(0, 0),
-                                };
-                                return eval(&synth, b, ctx);
-                            }
-                        }
-                    }
+                let is_tuple = tr == "tuple"
+                    || tr
+                        .strip_suffix("[]")
+                        .map(|inner| inner.trim() == "tuple")
+                        .unwrap_or(false)
+                    || (tr.starts_with('(') && tr.contains(','));
+                if is_tuple
+                    && let Ok(n) = name[4..].parse::<i64>()
+                    && n >= 1
+                {
+                    let synth = Expr::Index {
+                        object: object.clone(),
+                        index: Box::new(Expr::Literal(crate::models::Literal::Int(n - 1))),
+                        extra: Vec::new(),
+                        is_range: false,
+                        span: crate::models::Span::new(0, 0),
+                    };
+                    return eval(&synth, b, ctx);
                 }
             }
-                    if let Some(info) = ctx.table.class(&type_name)
+                    if let Some(info) = member_entry(ctx.table, &type_name)
                         && let Some(field) = info.field(name)
                     {
             ctx.check_access(true, &type_name, name)?;
@@ -4882,6 +6143,27 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 } => inner,
                 _ => target,
             };
+            // `*p = v` — store THROUGH the pointer. This shape was
+            // evaluated and dropped: the value was computed and no
+            // store was emitted, so every write through a pointer
+            // silently did nothing (`int x = 5; int* p = &x; *p = 8;`
+            // left x at 5). The address is the pointer's value and the
+            // store goes at offset 0 of it.
+            if let Expr::Unary {
+                op: UnOp::Deref,
+                inner,
+                ..
+            } = target_eff
+            {
+                let addr = eval(inner, b, ctx)?;
+                let v = eval(value, b, ctx)?;
+                b.push_raw(Instr::StoreField {
+                    base: addr,
+                    off: 0,
+                    src: v,
+                });
+                return Ok(v);
+            }
             // Indexer target on a class receiver (`dict[k] = v`):
             // route through `set_Item` instead of the raw
             // array-element store (`base + 16 + i*8` faults on
@@ -4891,29 +6173,28 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // value evaluates exactly once inside. Arrays, strings,
             // spans, and raw pointers keep the raw path; unknown
             // receivers keep today's leniency.
-            if let Expr::Index { object, index, .. } = target_eff {
+            if let Expr::Index { object, index, extra, .. } = target_eff {
                 let recv_ty = static_type_of(object, b, ctx)?;
-                // TEMP-IDXDBG. Removed before close.
-                if std::env::var("RUBYC_IDXDBG").is_ok() {
-                    eprintln!(
-                        "[rubyc] TEMP-IDXDBG assign recv_ty={} is_raw={} has_set={}",
-                        recv_ty,
-                        is_index_raw_target(&recv_ty),
-                        has_indexer(ctx, &recv_ty, "set_Item")
-                    );
-                }
                 // Indexer set on a class receiver (`dict[k] = v`):
                 // inline the setter body (indexers are not table
                 // methods, so no `set_Item` call exists to emit).
                 if !is_index_raw_target(&recv_ty) {
-                    if let Some((path, decl)) = find_indexer(ctx, &recv_ty, 1) {
+                    let mut indices: Vec<Expr> = vec![index.as_ref().clone()];
+                    indices.extend(extra.iter().cloned());
+                    // `find_indexer` matches the INDEX-parameter count;
+                    // the value is not one of them.
+                    if let Some((path, decl)) =
+                        find_indexer(ctx, &recv_ty, indices.len())
+                    {
                         let info = ctx
                             .table
                             .class(&recv_ty)
                             .or_else(|| definition_entry(ctx.table, &recv_ty));
                         if let Some(info) = info {
                             if let Some(v) =
-                                eval_indexer_set(b, ctx, info, &path, &decl, object, index, value)?
+                                eval_indexer_set(
+                                    b, ctx, info, &path, &decl, object, &indices, value,
+                                )?
                             {
                                 return Ok(v);
                             }
@@ -4928,6 +6209,57 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 return Ok(v);
             }
             if let Expr::Ident { name, .. } = target_eff {
+                // A primitive assigned to an object target is boxed
+                // here too: `o = 5` as an expression takes this path.
+                let target_ty = b
+                    .scopes
+                    .lookup(name)
+                    .map(|s| s.type_name.clone())
+                    .unwrap_or_default();
+                let src_ty = static_type_of(value, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                let v = b.coerce_boxing(v, &src_ty, &target_ty, false, ctx)?;
+                // A STRUCT-typed target receives a COPY, not a reference:
+                // `b = a;` must not alias, or a later `b.V = 9` changes
+                // `a`. Structs are heap objects here, so the copy is a
+                // fresh allocation plus a byte copy (`new` is already
+                // fresh, so it is left alone).
+                let v = {
+                    let tn = b
+                        .scopes
+                        .lookup(name)
+                        .map(|s| s.type_name.clone())
+                        .unwrap_or_default();
+                    let src_is_new = matches!(value.as_ref(), Expr::New { .. });
+                    match ctx.table.class(&tn) {
+                        Some(info) if info.is_struct && !src_is_new => {
+                            // The copy spans the fields' REAL slots (the
+                            // last field ends the struct); a hardcoded
+                            // field start would truncate or overrun as
+                            // soon as the layout changes.
+                            let last = info
+                                .fields
+                                .iter()
+                                .map(|f| f.offset_slots)
+                                .max()
+                                .unwrap_or(1);
+                            let bytes = (last as u64 + 1) * 8;
+                            let copy = b.fresh();
+                            b.push_raw(Instr::Alloc {
+                                dst: copy,
+                                bytes,
+                            });
+                            let len = b.const_i64(bytes as i64);
+                            b.push_raw(Instr::MemCpy {
+                                dst: copy,
+                                src: v,
+                                len,
+                            });
+                            copy
+                        }
+                        _ => v,
+                    }
+                };
                 if let Some(sym) = b.scopes.lookup(name) {
                     let home = b.bindings[sym.slot];
                     // By-reference target: store through the address.
@@ -4957,6 +6289,9 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     && let Some(field) = info.field(name)
                 {
                     ctx.check_access(true, ctx.current_class, name)?;
+                    let src_ty = static_type_of(value, b, ctx)
+                        .unwrap_or_else(|_| "object".to_owned());
+                    let v = b.coerce_boxing(v, &src_ty, &field.type_name, false, ctx)?;
                     if field.is_static {
                         let Some(base) = static_addr(field, b, ctx) else {
                             return Err(LowerError::UnsupportedConstruct(format!(
@@ -4999,10 +6334,13 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // via import), never instance memory.
             if let Expr::Member { object, name, .. } = target_eff {
                 let type_name = static_type_of(object, b, ctx)?;
-                if let Some(info) = ctx.table.class(&type_name)
+                if let Some(info) = member_entry(ctx.table, &type_name)
                     && let Some(field) = info.field(name)
                 {
                     ctx.check_access(true, &type_name, name)?;
+                    let src_ty = static_type_of(value, b, ctx)
+                        .unwrap_or_else(|_| "object".to_owned());
+                    let v = b.coerce_boxing(v, &src_ty, &field.type_name, false, ctx)?;
                     if field.is_static {
                         let _ = eval(object, b, ctx)?;
                         let Some(base) = static_addr(field, b, ctx) else {
@@ -5067,8 +6405,19 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 // static inline otherwise); falls back to
                 // evaluate-and-drop when no setter body resolves.
                 if member_host(ctx.table, &type_name, name).is_some()
-                    && let Some(rinfo) = ctx.table.class(&type_name)
+                    && let Some(rinfo) = member_entry(ctx.table, &type_name)
                 {
+                    // `c.P = v` on a property without a setter: C# reports
+                    // CS0200. The declaration may be inherited, so the
+                    // whole chain is consulted.
+                    if rinfo.property(name).is_some()
+                        && property_settable_in_chain(ctx, &rinfo.name, name)
+                            == Some(false)
+                    {
+                        return Err(LowerError::UnsupportedConstruct(format!(
+                            "property `{name}` has no setter"
+                        )));
+                    }
                     let done = if strict_subclass_has_explicit_setter(ctx, rinfo, name) {
                         eval_virtual_setter(b, ctx, rinfo, name, Some(object.as_ref()), v)?
                     } else {
@@ -5173,6 +6522,16 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     a: base,
                     b: off,
                 });
+                let src_ty = static_type_of(value, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                let v = if header == 16
+                    && Body::is_object_target(&inner, ctx)
+                    && primitive_id(&base_type_name(&src_ty)).is_some()
+                {
+                    b.box_value(v, &src_ty, ctx)?
+                } else {
+                    v
+                };
                 b.push_raw(Instr::StoreField {
                     base: ptr,
                     off: 0,
@@ -5219,7 +6578,117 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             let _ = eval(target, b, ctx)?;
             Ok(v)
         }
-        Expr::SwitchExpr { subject, .. } => eval(subject, b, ctx),
+        Expr::SwitchExpr { subject, arms, .. } => {
+            // Evaluate the subject ONCE, then test the arms in order.
+            // This used to return the subject and ignore every arm, so a
+            // switch expression answered whatever was switched on.
+            let sv = eval(subject, b, ctx)?;
+            let sty = static_type_of(subject, b, ctx)
+                .unwrap_or_else(|_| "object".to_owned());
+            let home = b.fresh();
+            let end_b = b.make_block();
+            let arm_blocks: Vec<crate::native::ir::BlockId> =
+                arms.iter().map(|_| b.make_block()).collect();
+            // Where a false GUARD for arm i must continue: the next arm's
+            // test block, or (after the last arm) the no-match path.
+            // A switch expression has to produce a value, so the no-match
+            // edge cannot fall into the join: C# throws there. An
+            // unguarded discard arm proves the edge dead and is emitted
+            // as an unconditional jump instead.
+            let exhaustive = arms.iter().any(|a| {
+                a.guard.is_none()
+                    && a.labels.iter().any(
+                        |l| matches!(l, Expr::Ident { name, .. } if name == "_"),
+                    )
+            });
+            let no_match_b = (!exhaustive).then(|| b.make_block());
+            let mut miss_blocks: Vec<crate::native::ir::BlockId> =
+                Vec::with_capacity(arms.len());
+            for (i, arm) in arms.iter().enumerate() {
+                let irrefutable = arm.guard.is_none()
+                    && arm.labels.iter().any(
+                        |l| matches!(l, Expr::Ident { name, .. } if name == "_"),
+                    );
+                if irrefutable {
+                    // Always matches; arms after it are unreachable.
+                    b.goto(arm_blocks[i]);
+                    miss_blocks.push(arm_blocks[i]);
+                    for _ in i + 1..arms.len() {
+                        miss_blocks.push(end_b);
+                    }
+                    break;
+                }
+                // Each label is a pattern over the same subject; `or`
+                // chains were already merged by the parser.
+                let mut test: Option<VReg> = None;
+                for label in &arm.labels {
+                    let t = match label {
+                        Expr::Ident { name, .. } if name == "_" => b.const_i64(1),
+                        _ => emit_is_pattern(b, ctx, sv, &sty, label)?,
+                    };
+                    test = Some(match test {
+                        None => t,
+                        Some(prev) => b.emit(Instr::Bin {
+                            dst: VReg(0),
+                            op: IrBinOp::BitOr,
+                            a: prev,
+                            b: t,
+                        }),
+                    });
+                }
+                let test = test.unwrap_or_else(|| b.const_i64(0));
+                let next_b = if i + 1 < arms.len() {
+                    b.make_block()
+                } else {
+                    no_match_b.unwrap_or(end_b)
+                };
+                b.terminate(Terminator::Branch {
+                    cond: Some(test),
+                    if_true: arm_blocks[i],
+                    if_false: next_b,
+                });
+                miss_blocks.push(next_b);
+                if i + 1 < arms.len() {
+                    b.switch_to(next_b);
+                }
+            }
+            for (i, arm) in arms.iter().enumerate() {
+                b.switch_to(arm_blocks[i]);
+                // `when` guard: part of the arm's test.
+                if let Some(g) = &arm.guard {
+                    let gv = eval(g, b, ctx)?;
+                    let body_ok = b.make_block();
+                    b.terminate(Terminator::Branch {
+                        cond: Some(gv),
+                        if_true: body_ok,
+                        if_false: miss_blocks[i],
+                    });
+                    b.switch_to(body_ok);
+                }
+                let v = eval(&arm.body, b, ctx)?;
+                b.mov(home, v);
+                if !b.is_sealed() {
+                    b.goto(end_b);
+                }
+            }
+            // No arm matched: a switch expression must produce a value, so
+            // C# throws `SwitchExpressionException`. Returning the join
+            // home here would hand back whatever the slot held.
+            if let Some(nm) = no_match_b {
+                b.switch_to(nm);
+                let exc = Expr::New {
+                    class_name: "System.Runtime.CompilerServices.SwitchExpressionException"
+                        .to_owned(),
+                    args: Vec::new(),
+                    init: Vec::new(),
+                    span: Default::default(),
+                };
+                let obj = eval(&exc, b, ctx)?;
+                b.terminate(Terminator::Unwind { src: obj });
+            }
+            b.switch_to(end_b);
+            Ok(home)
+        }
         Expr::Literal(Literal::Str(s)) => {
             let (off, len) = b.utf16_literal(s);
             Ok(b.build_utf16_string(off, len))
@@ -5251,7 +6720,22 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                             });
                             text.clear();
                         }
-                        let v = eval(h, b, ctx)?;
+                        // A hole is concatenated as a string object. A
+                        // primitive is converted first (it used to be
+                        // concatenated as a pointer and crash).
+                        let hole_ty =
+                            static_type_of(h, b, ctx).unwrap_or_default();
+                        let mut v = eval(h, b, ctx)?;
+                        if is_primitive_spelling(&hole_ty)
+                            && !is_string_type(&hole_ty)
+                        {
+                            let Some(sv) = b.value_to_string(v, &hole_ty) else {
+                                return Err(LowerError::UnsupportedConstruct(format!(
+                                    "interpolating `{hole_ty}` needs value-to-string conversion, which is not implemented"
+                                )));
+                            };
+                            v = sv;
+                        }
                         acc = Some(match acc {
                             Some(a) => b.concat_strings(a, v),
                             None => v,
@@ -5275,6 +6759,10 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
         Expr::Literal(Literal::Int(v)) => Ok(b.emit(Instr::Const {
             dst: VReg(0),
             imm: *v,
+        })),
+        Expr::Literal(Literal::Char(v)) => Ok(b.emit(Instr::Const {
+            dst: VReg(0),
+            imm: *v as i64,
         })),
         Expr::Literal(Literal::Float(v)) => {
             // Floats are not tracked in `const_vals` (i64-only), so emit a
@@ -5347,17 +6835,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     // Static field: value lives in per-class static storage,
                     // independent of `this`. Read [static_addr + 0].
                     if field.is_static {
-                        // No-ETW configuration (see the `Member` path):
-                        // bare reads (`if (IsSupported)` inside
-                        // EventSource itself) take the same false.
-                        if (name == "IsSupported" || name == "IsMeterSupported")
-                            && (field.declaring_class.contains("EventSource")
-                                || info.key.path.contains("EventSource")
-                                || field.declaring_class.contains("Meter")
-                                || info.key.path.contains("Meter"))
-                        {
-                            return Ok(b.const_i64(0));
-                        }
                         let Some(base) = static_addr(field, b, ctx) else {
                             return Ok(b.const_i64(0));
                         };
@@ -5366,11 +6843,16 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         return Ok(dst);
                     }
                     let this = VReg(0);
-                    // String interiors (`_stringLength`, `_firstChar`)
-                    // fold to the real layout (see `Member`); raw
-                    // table offsets would read data-as-length.
-                    if base_type_name(ctx.current_class) == "String"
-                        && (name == "_stringLength" || name == "_firstChar")
+                    // `string` interiors resolve against RubyC's own
+                    // builtin string layout (see
+                    // `semantic::builtin_string_interior_offset`), not a
+                    // table slot — raw table offsets would read
+                    // data-as-length.
+                    if crate::native::semantic::builtin_string_interior_offset(
+                        ctx.current_class,
+                        name,
+                    )
+                    .is_some()
                     {
                         return Ok(string_interior_read(b, this, name));
                     }
@@ -5398,9 +6880,27 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 // not inlineable.
                 if info.properties.iter().any(|p| p.name == *name) {
                     ctx.check_access(true, ctx.current_class, name)?;
-                    // TEMP-NOGETTER (diagnostic): see above.
-                    if std::env::var("RUBYC_NOGETTER").is_err()
-                        && let Some(val) = eval_property_getter(
+                    // A property the class does not implement (abstract) or
+                    // that a subclass OVERRIDES dispatches virtually: the
+                    // runtime type's implementation serves, like a virtual
+                    // method. The static body cannot serve an abstract
+                    // property at all — it has none — so the read would
+                    // have no value (`'Stream' has no member 'CanRead'`).
+                    // A backing field cannot reach here: the field branch
+                    // above returns for an auto-property.
+                    let upward_explicit = most_derived_prop_decl(ctx, info, name)
+                        .is_some_and(|(decl, _)| decl.get_expr.is_some() || decl.get.is_some());
+                    let abstract_prop = info
+                        .properties
+                        .iter()
+                        .any(|p| p.name == *name && p.is_abstract);
+                    if (upward_explicit || abstract_prop)
+                        && strict_subclass_has_explicit(ctx, info, name)
+                        && let Some(val) = eval_virtual_getter(b, ctx, info, name, None)?
+                    {
+                        return Ok(val);
+                    }
+                    if let Some(val) = eval_property_getter(
                             b,
                             ctx,
                             info,
@@ -5411,16 +6911,46 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     {
                         return Ok(val);
                     }
-                    return Ok(b.const_i64(0));
+return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                        "rubyc.native.ir.lower_expr.no_member",
+                        info.name.clone(),
+                        name.to_string()
+                    )));
                 }
-                // Event fields are accessor-backed with no object layout slot;
-                // return 0 as a placeholder.
+                // An event is accessor-backed with no object layout
+                // slot, so there is no storage to read. That is a real
+                // gap (event semantics land with 2.6c), not a value to
+                // invent — but it must be reported AS the gap: saying
+                // "'E' has no member 'A'" when `E` declares `A` sends the
+                // reader looking for a typo instead of at the missing
+                // feature.
                 if info
                     .own_members
                     .iter()
                     .any(|(mn, is_f, _)| mn == name && *is_f)
                 {
-                    return Ok(b.const_i64(0));
+                    let is_event = ctx
+                        .classes
+                        .iter()
+                        .filter(|c| c.name == info.name)
+                        .any(|c| {
+                            c.members.iter().any(|m| {
+                                matches!(
+                                    m,
+                                    crate::models::ClassMember::Event(e) if e.name == *name
+                                )
+                            })
+                        });
+                    let key = if is_event {
+                        "rubyc.native.ir.lower_expr.event_unavailable"
+                    } else {
+                        "rubyc.native.ir.lower_expr.no_member"
+                    };
+                    return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                        key,
+                        info.name.clone(),
+                        name.to_string()
+                    )));
                 }
             }
             // Enclosing-scope statics (`s_utcTimeZone` read from nested
@@ -5429,13 +6959,21 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // privates (nesting family); genuinely foreign access stays
             // loud.
             if let Some((outer, field)) = outer_static_field(ctx, name) {
+                // Both sides are QUALIFIED: a bare class name is
+                // ambiguous when two namespaces declare same-named
+                // types, and the ambiguity made the nesting-family
+                // rule give up on a legal access.
+                let viewer = match ctx.current_path {
+                    Some(p) if !p.is_empty() => p,
+                    _ => ctx.current_class,
+                };
                 if !crate::native::semantic::visible_from(
                     ctx.table,
                     field.access,
-                    &outer.name,
-                    ctx.current_class,
+                    &outer.key.path,
+                    viewer,
                 ) {
-                    return Err(LowerError::UnsupportedConstruct(crate::tf!(
+return Err(LowerError::UnsupportedConstruct(crate::tf!(
                         "rubyc.native.ir.lower_expr.no_member",
                         outer.name.clone(),
                         name.to_string()
@@ -5469,25 +7007,32 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     &outer.name,
                     ctx.current_class,
                 ) {
-                    return Err(LowerError::UnsupportedConstruct(crate::tf!(
+return Err(LowerError::UnsupportedConstruct(crate::tf!(
                         "rubyc.native.ir.lower_expr.no_member",
                         outer.name.clone(),
                         name.to_string()
                     )));
                 }
-                if std::env::var("RUBYC_NOGETTER").is_err()
-                    && let Some(val) = eval_property_getter(
-                        b,
-                        ctx,
-                        outer,
-                        outer.key.path.as_str(),
-                        name,
-                        None,
-                    )?
+                if let Some(val) = eval_property_getter(
+                    b,
+                    ctx,
+                    outer,
+                    outer.key.path.as_str(),
+                    name,
+                    None,
+                )?
                 {
                     return Ok(val);
                 }
-                return Ok(b.const_i64(0));
+                // The enclosing type declares the property but has no
+                // getter body to inline (abstract or accessor-only), so
+                // there is no value to read. Answering 0 here would look
+                // like a property that legitimately holds default(T).
+                return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                    "rubyc.native.ir.lower_expr.no_property_body",
+                    outer.name.clone(),
+                    name.to_string()
+                )));
             }
             if name == "base" {                // `base` refers to the base-class instance — the same object
                 // as `this` (the base is a part of the same object).
@@ -5511,17 +7056,44 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // spuriously). Types still win via `is_method_group_name`
             // (it rejects names that resolve as classes).
             if is_method_group_name(name, b, ctx) {
-                // TEMP-MGDBG. Removed before close.
-                if std::env::var("RUBYC_MGDBG").is_ok() {
-                    eprintln!("[rubyc] TEMP-MGDBG method-group {name} in {}", ctx.current_class);
+                // A METHOD GROUP is a delegate value: `[fn_addr, kind,
+                // type]` with kind 0 (it takes only its own arguments).
+                // The object used to be allocated EMPTY, so `D d = H;
+                // d(x)` called address 0 and faulted.
+                if let Some(fidx) = method_group_index(name, b, ctx) {
+                    let cell = b.fresh();
+                    b.push_raw(Instr::Alloc { dst: cell, bytes: 24 });
+                    // The delegate's runtime type, as for a lambda.
+                    if let Some(expected) = b.expected_delegate.clone()
+                        && ctx.table.is_delegate(&expected)
+                    {
+                        let desc = b.type_token(&expected, ctx)?;
+                        b.push_raw(Instr::StoreField {
+                            base: cell,
+                            off: 16,
+                            src: desc,
+                        });
+                    }
+                    let addr = b.fresh();
+                    b.push_raw(Instr::FnAddr { dst: addr, fidx });
+                    b.push_raw(Instr::StoreField {
+                        base: cell,
+                        off: 0,
+                        src: addr,
+                    });
+                    let zero = b.const_i64(0);
+                    b.push_raw(Instr::StoreField {
+                        base: cell,
+                        off: 8,
+                        src: zero,
+                    });
+                    return Ok(cell);
                 }
-                let cell = b.fresh();
-                b.push_raw(Instr::Alloc { dst: cell, bytes: 16 });
-                return Ok(cell);
+                return Err(LowerError::UnsupportedConstruct(format!(
+                    "method group '{name}' does not resolve to a function (ambiguous or missing signature)"
+                )));
             }
             if (ctx.table.class(name).is_some()
-                || name == "lambda"
-                || name == "<pattern>"
                 || name == "_"
                 || name
                     .chars()
@@ -5641,16 +7213,108 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             inner,
             ..
         } => {
-            // `&x` — address-of. Must compute the address (not the
-            // value): `&charBuffer[0]` as the element value faulted
-            // `Console.WriteLine` (dst null into `Buffer.MemoryCopy`).
-            // Reuses `ref_target_address` (arrays, strings, fields,
-            // already-address calls); anything else keeps legacy
-            // value semantics (locals have no addressable home).
-            match ref_target_address(b, ctx, inner)? {
-                Some(addr) => Ok(addr),
-                None => eval(inner, b, ctx),
+            // `&x` — address-of. Must compute the address, never the
+            // value: a pointer holding the value turned every later
+            // dereference into a read from a small integer address
+            // (`int x = 41; int* p = &x; *p` faulted) and every
+            // `*p = v` into a write to nowhere.
+            //
+            // Order matters. `ref_target_address` handles the targets
+            // that already have an interior address (array elements,
+            // string data, fields, ref-returning calls). A LOCAL is the
+            // remaining case, and it does have a home: the value is
+            // spilled to a stack cell and that cell's address is the
+            // pointer's value. A local already bound by reference needs
+            // no cell — its binding IS the address.
+            if let Some(addr) = ref_target_address(b, ctx, inner)? {
+                return Ok(addr);
             }
+            if let Expr::Ident { name, .. } = inner.as_ref() {
+                if name == "this" {
+                    // The receiver is already an address.
+                    return Ok(VReg(0));
+                }
+                // `ref _` / `out _`: a discard needs a throwaway
+                // location, not an error — C# requires the compiler to
+                // supply one. Nobody reads it.
+                if name == "_" {
+                    let cell = b.fresh();
+                    b.push_raw(Instr::Alloc { dst: cell, bytes: 16 });
+                    return Ok(cell);
+                }
+                // A static field HAS an address: its storage slot (or,
+                // for a field owned by another image, the owner's slot
+                // via address import). `Interlocked.CompareExchange(ref
+                // _x, …)` needs exactly this.
+                // Static fields may live on ANOTHER PART of a partial
+                // class, so consult the type table as well as the
+                // current declaration: `ref s_in` in a `partial class
+                // Console` part that does not declare the field must
+                // still find its storage slot.
+                let static_field = ctx
+                    .current_info
+                    .and_then(|info| {
+                        info.static_fields
+                            .iter()
+                            .find(|f| f.name == *name && f.is_static)
+                            .cloned()
+                    })
+                    .or_else(|| {
+                        ctx.table
+                            .class(&ctx.current_class)
+                            .and_then(|info| {
+                                info.static_fields
+                                    .iter()
+                                    .find(|f| f.name == *name && f.is_static)
+                                    .cloned()
+                            })
+                    });
+                if let Some(f) = static_field {
+                    if let Some(addr) = static_addr(&f, b, ctx) {
+                        return Ok(addr);
+                    }
+                }
+                // A bare instance field is `this.field` — the
+                // implicit-`this` spelling.
+                if let Some(addr) = implicit_this_field_address(b, ctx, name)? {
+                    return Ok(addr);
+                }
+                let binding = b
+                    .scopes
+                    .lookup(name)
+                    .map(|sym| (sym.slot, sym.is_byref));
+                if let Some((slot, already_byref)) = binding {
+                    let home = b.bindings[slot];
+                    if already_byref {
+                        return Ok(home);
+                    }
+                    // Materialize a home for the local and hand out its
+                    // address, then RE-BIND the local as by-reference so
+                    // a write through the pointer is visible to later
+                    // reads of `x` (C# aliasing). `Alloc` rather than
+                    // `StackAlloc`: the x86-64 backend does not
+                    // implement stack allocation, and this is the same
+                    // cell mechanism the byref-argument path uses.
+                    let cell = b.fresh();
+                    b.push_raw(Instr::Alloc { dst: cell, bytes: 16 });
+                    b.push_raw(Instr::StoreField {
+                        base: cell,
+                        off: 0,
+                        src: home,
+                    });
+                    b.bindings[slot] = cell;
+                    b.scopes.make_byref(name);
+                    return Ok(cell);
+                }
+            }
+            // Not addressable (a temporary, a literal): there is no
+            // cell to hand out, so report the shape rather than pass the
+            // value off as an address.
+            Err(LowerError::UnsupportedConstruct(format!(
+                "{} [addr-of {expr:?} in {}]",
+                crate::tf!("rubyc.native.ir.lower_expr.address_of_temporary"),
+                ctx.current_method.clone().unwrap_or_default()
+            )))
         }
         Expr::Unary {
             op: UnOp::Throw,
@@ -5665,16 +7329,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // (see `push_raw`/`terminate`), so the unwind stands and
             // the poison never reaches real instructions.
             let v = eval(inner, b, ctx)?;
-            // TEMP-TMARK (see lower_throw).
-            if std::env::var("RUBYC_MTRACE").unwrap_or_default() == "all" {
-                let marker = format!(
-                    "T {}.{}\n",
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default()
-                );
-                let (off, len) = b.string_literal(&marker);
-                b.push_raw(Instr::EWriteStr { off, len });
-            }
             b.terminate(Terminator::Unwind { src: v });
             Ok(v)
         }
@@ -5768,6 +7422,575 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             Ok(b.emit(Instr::Neg { dst: VReg(0), a }))
         }
         Expr::Binary { op, lhs, rhs, .. } => {
+            // Delegate combination (`d += g`) has no implementation: a
+            // delegate value is a single object, so `+` used to do
+            // pointer arithmetic on it and the following call jumped
+            // into garbage. Report it until multicast lands.
+            if matches!(
+                op,
+                crate::models::BinOp::Add | crate::models::BinOp::Sub
+            ) {
+                let lt = static_type_of(lhs, b, ctx).unwrap_or_default();
+                let rt = static_type_of(rhs, b, ctx).unwrap_or_default();
+                // `System.Action`/`Func<...>` are runtime types, not
+                // declared delegates in the table, so the left side is
+                // recognised by the METHOD GROUP (or lambda) on the
+                // right — the only way `+`/`-` reaches a delegate here.
+                let lhs_del = ctx.table.is_delegate(&lt);
+                let rhs_del = ctx.table.is_delegate(&rt)
+                    || is_method_group(rhs, b, ctx)
+                    || matches!(rhs.as_ref(), Expr::Lambda { .. });
+                if rhs_del || (lhs_del && ctx.table.is_delegate(&rt)) {
+                    // `d += g` on a LOCAL: build the combined delegate
+                    // (`[0, kind 2, head]` over `[next, delegate]` nodes).
+                    // `null + g` is `g`; an existing list is appended to,
+                    // so handlers run in subscription order.
+                    // Locals and INSTANCE FIELDS can be combined: the
+                    // AssignComplex path writes the result back to the
+                    // same target. A property is excluded (its setter
+                    // path is not wired for this), and so is a static
+                    // field (no instance offset).
+                    let lhs_is_local = matches!(
+                        lhs.as_ref(),
+                        Expr::Ident { name, .. } if b.scopes.lookup(name).is_some()
+                    );
+                    let lhs_is_field = {
+                        let fname = match lhs.as_ref() {
+                            Expr::Ident { name, .. } => Some(name.as_str()),
+                            Expr::Member { name, .. } => Some(name.as_str()),
+                            _ => None,
+                        };
+                        fname.is_some_and(|n| {
+                            ctx.current_info.is_some_and(|i| i.field(n).is_some())
+                        })
+                    };
+                    let lhs_is_prop = {
+                        let fname = match lhs.as_ref() {
+                            Expr::Ident { name, .. } => Some(name.as_str()),
+                            Expr::Member { name, .. } => Some(name.as_str()),
+                            _ => None,
+                        };
+                        // A property needs a SETTER, or the write-back
+                        // is a silent no-op (C# rejects the assignment).
+                        // The accessor list lives on the declaration.
+                        fname.is_some_and(|n| {
+                            ctx.current_info.is_some_and(|i| i.property(n).is_some())
+                                && ctx.classes.iter().any(|c| {
+                                    c.name == ctx.current_class
+                                        && c.members.iter().any(|m| {
+                                            matches!(
+                                                m,
+                                                crate::models::ClassMember::Property(p)
+                                                    if p.name == n && p.is_settable
+                                            )
+                                        })
+                                })
+                        })
+                    };
+                    let lhs_is_local = lhs_is_local || lhs_is_field || lhs_is_prop;
+                    if matches!(op, crate::models::BinOp::Add) && lhs_is_local {
+                        let a = eval(lhs, b, ctx)?;
+                        let bv = eval(rhs, b, ctx)?;
+                        let zero = b.const_i64(0);
+                        let two = b.const_i64(2);
+                        let home = b.fresh();
+                        let null_b = b.make_block();
+                        let some_b = b.make_block();
+                        let join_b = b.make_block();
+                        let is_null = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a,
+                            b: zero,
+                        });
+                        b.terminate(Terminator::Branch {
+                            cond: Some(is_null),
+                            if_true: null_b,
+                            if_false: some_b,
+                        });
+                        b.switch_to(null_b);
+                        b.mov(home, bv);
+                        b.goto(join_b);
+                        b.switch_to(some_b);
+                        // Node for the new handler.
+                        let nd = b.fresh();
+                        b.push_raw(Instr::Alloc {
+                            dst: nd,
+                            bytes: 16,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: nd,
+                            off: 0,
+                            src: zero,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: nd,
+                            off: 8,
+                            src: bv,
+                        });
+                        let k = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: k,
+                            base: a,
+                            off: 8,
+                        });
+                        let is_multi = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: k,
+                            b: two,
+                        });
+                        let multi_b = b.make_block();
+                        let new_b = b.make_block();
+                        b.terminate(Terminator::Branch {
+                            cond: Some(is_multi),
+                            if_true: multi_b,
+                            if_false: new_b,
+                        });
+                        // First combination: a list of the two values.
+                        b.switch_to(new_b);
+                        let n1 = b.fresh();
+                        b.push_raw(Instr::Alloc {
+                            dst: n1,
+                            bytes: 16,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: n1,
+                            off: 0,
+                            src: zero,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: n1,
+                            off: 8,
+                            src: a,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: n1,
+                            off: 0,
+                            src: nd,
+                        });
+                        let obj = b.fresh();
+                        b.push_raw(Instr::Alloc {
+                            dst: obj,
+                            bytes: 32,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: obj,
+                            off: 0,
+                            src: zero,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: obj,
+                            off: 8,
+                            src: two,
+                        });
+                        // The type word, then the subscriber list.
+                        let ctype = b.const_i64(0);
+                        b.push_raw(Instr::StoreField {
+                            base: obj,
+                            off: 16,
+                            src: ctype,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: obj,
+                            off: 24,
+                            src: n1,
+                        });
+                        b.mov(home, obj);
+                        b.goto(join_b);
+                        // Already combined: append at the tail.
+                        b.switch_to(multi_b);
+                        let head = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: head,
+                            base: a,
+                            off: 24,
+                        });
+                        let loop_b = b.make_block();
+                        let advance_b = b.make_block();
+                        let attach_b = b.make_block();
+                        b.goto(loop_b);
+                        b.switch_to(loop_b);
+                        let nxt = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: nxt,
+                            base: head,
+                            off: 0,
+                        });
+                        let is_end = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: nxt,
+                            b: zero,
+                        });
+                        b.terminate(Terminator::Branch {
+                            cond: Some(is_end),
+                            if_true: attach_b,
+                            if_false: advance_b,
+                        });
+                        b.switch_to(advance_b);
+                        b.mov(head, nxt);
+                        b.goto(loop_b);
+                        b.switch_to(attach_b);
+                        b.push_raw(Instr::StoreField {
+                            base: head,
+                            off: 0,
+                            src: nd,
+                        });
+                        b.mov(home, a);
+                        b.goto(join_b);
+                        b.switch_to(join_b);
+                        return Ok(home);
+                    }
+                    // `d -= g` for a METHOD GROUP: unlink the first node
+                    // whose delegate has the same function address. A
+                    // captured closure is NOT matched by address (its
+                    // identity is the captured object), so a lambda
+                    // operand keeps the report below.
+                    if matches!(op, crate::models::BinOp::Sub)
+                        && is_method_group(rhs, b, ctx)
+                    {
+                        let a = eval(lhs, b, ctx)?;
+                        let bv = eval(rhs, b, ctx)?;
+                        let zero = b.const_i64(0);
+                        let two = b.const_i64(2);
+                        let home = b.fresh();
+                        let end_b = b.make_block();
+                        let finish_b = b.make_block();
+                        let null_b = b.make_block();
+                        let some_b = b.make_block();
+                        let is_null = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a,
+                            b: zero,
+                        });
+                        b.terminate(Terminator::Branch {
+                            cond: Some(is_null),
+                            if_true: null_b,
+                            if_false: some_b,
+                        });
+                        b.switch_to(null_b);
+                        b.mov(home, zero); // null - g is null
+                        b.goto(end_b);
+                        b.switch_to(some_b);
+                        let kind = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: kind,
+                            base: a,
+                            off: 8,
+                        });
+                        let is_multi = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: kind,
+                            b: two,
+                        });
+                        let list_b = b.make_block();
+                        let single_b = b.make_block();
+                        b.terminate(Terminator::Branch {
+                            cond: Some(is_multi),
+                            if_true: list_b,
+                            if_false: single_b,
+                        });
+                        // One delegate: same function -> null, else stay.
+                        b.switch_to(single_b);
+                        let bfn0 = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: bfn0,
+                            base: bv,
+                            off: 0,
+                        });
+                        let afn0 = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: afn0,
+                            base: a,
+                            off: 0,
+                        });
+                        let same0 = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: afn0,
+                            b: bfn0,
+                        });
+                        let eq_b = b.make_block();
+                        let ne_b = b.make_block();
+                        b.terminate(Terminator::Branch {
+                            cond: Some(same0),
+                            if_true: eq_b,
+                            if_false: ne_b,
+                        });
+                        b.switch_to(eq_b);
+                        b.mov(home, zero);
+                        b.goto(end_b);
+                        b.switch_to(ne_b);
+                        b.mov(home, a);
+                        b.goto(end_b);
+                        // Combined: walk the list and unlink one node.
+                        b.switch_to(list_b);
+                        let bfn = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: bfn,
+                            base: bv,
+                            off: 0,
+                        });
+                        let head = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: head,
+                            base: a,
+                            off: 24,
+                        });
+                        let prev = b.fresh();
+                        b.mov(prev, zero);
+                        let cur = b.fresh();
+                        b.mov(cur, head);
+                        let loop_b = b.make_block();
+                        let body_b = b.make_block();
+                        let check_b = b.make_block();
+                        let choose_b = b.make_block();
+                        let hit_head_b = b.make_block();
+                        let hit_prev_b = b.make_block();
+                        let advance_b = b.make_block();
+                        b.goto(loop_b);
+                        b.switch_to(loop_b);
+                        let done = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: cur,
+                            b: zero,
+                        });
+                        b.terminate(Terminator::Branch {
+                            cond: Some(done),
+                            if_true: finish_b,
+                            if_false: body_b,
+                        });
+                        b.switch_to(body_b);
+                        let d = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: d,
+                            base: cur,
+                            off: 8,
+                        });
+                        let k = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: k,
+                            base: d,
+                            off: 8,
+                        });
+                        let k0 = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: k,
+                            b: zero,
+                        });
+                        b.terminate(Terminator::Branch {
+                            cond: Some(k0),
+                            if_true: check_b,
+                            if_false: advance_b,
+                        });
+                        b.switch_to(check_b);
+                        let t = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: t,
+                            base: d,
+                            off: 0,
+                        });
+                        let hit = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: t,
+                            b: bfn,
+                        });
+                        b.terminate(Terminator::Branch {
+                            cond: Some(hit),
+                            if_true: choose_b,
+                            if_false: advance_b,
+                        });
+                        b.switch_to(choose_b);
+                        let at_head = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: prev,
+                            b: zero,
+                        });
+                        b.terminate(Terminator::Branch {
+                            cond: Some(at_head),
+                            if_true: hit_head_b,
+                            if_false: hit_prev_b,
+                        });
+                        b.switch_to(hit_head_b);
+                        let nx1 = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: nx1,
+                            base: cur,
+                            off: 0,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: a,
+                            off: 24,
+                            src: nx1,
+                        });
+                        b.goto(finish_b);
+                        b.switch_to(hit_prev_b);
+                        let nx2 = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: nx2,
+                            base: cur,
+                            off: 0,
+                        });
+                        b.push_raw(Instr::StoreField {
+                            base: prev,
+                            off: 0,
+                            src: nx2,
+                        });
+                        b.goto(finish_b);
+                        b.switch_to(advance_b);
+                        b.mov(prev, cur);
+                        let nx3 = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: nx3,
+                            base: cur,
+                            off: 0,
+                        });
+                        b.mov(cur, nx3);
+                        b.goto(loop_b);
+                        b.switch_to(finish_b);
+                        // C# answers NULL when removal empties the list,
+                        // not an empty combined delegate (invoking that
+                        // was a silent no-op).
+                        let final_head = b.fresh();
+                        b.push_raw(Instr::LoadField {
+                            dst: final_head,
+                            base: a,
+                            off: 24,
+                        });
+                        let emptied = b.emit(Instr::Cmp {
+                            dst: VReg(0),
+                            op: crate::native::ir::CmpOp::Eq,
+                            a: final_head,
+                            b: zero,
+                        });
+                        let empty_b = b.make_block();
+                        let keep_b = b.make_block();
+                        b.terminate(Terminator::Branch {
+                            cond: Some(emptied),
+                            if_true: empty_b,
+                            if_false: keep_b,
+                        });
+                        b.switch_to(empty_b);
+                        b.mov(home, zero);
+                        b.goto(end_b);
+                        b.switch_to(keep_b);
+                        b.mov(home, a);
+                        b.goto(end_b);
+                        b.switch_to(end_b);
+                        return Ok(home);
+                    }
+                    return Err(LowerError::UnsupportedConstruct(format!(
+                        "combining delegates (`d {} g`) needs a local, an instance/static field, or a SETTABLE property",
+                        if matches!(op, crate::models::BinOp::Add) { "+=" } else { "-=" }
+                    )));
+                }
+            }
+            // String concatenation is implemented for string + string
+            // only. With a PRIMITIVE operand (`"a" + 5`, `"a" + true`)
+            // C# converts the value with ToString; this compiler has no
+            // value-to-string conversion yet, and the raw value used to
+            // be treated as a string pointer — a crash or an empty
+            // result. Report it instead of computing garbage.
+            if matches!(op, crate::models::BinOp::Add) {
+                let lt = static_type_of(lhs, b, ctx).unwrap_or_default();
+                let rt = static_type_of(rhs, b, ctx).unwrap_or_default();
+                let primitive_non_string = |t: &str| {
+                    is_primitive_spelling(t) && !is_string_type(t)
+                };
+                if is_string_type(&lt) && primitive_non_string(&rt) {
+                    let a = eval(lhs, b, ctx)?;
+                    let bv = eval(rhs, b, ctx)?;
+                    let Some(s) = b.value_to_string(bv, &rt) else {
+                        return Err(LowerError::UnsupportedConstruct(format!(
+                            "string concatenation with `{rt}` needs value-to-string conversion, which is not implemented"
+                        )));
+                    };
+                    return Ok(b.concat_strings(a, s));
+                }
+                if is_string_type(&rt) && primitive_non_string(&lt) {
+                    let a = eval(lhs, b, ctx)?;
+                    let bv = eval(rhs, b, ctx)?;
+                    let Some(s) = b.value_to_string(a, &lt) else {
+                        return Err(LowerError::UnsupportedConstruct(format!(
+                            "string concatenation with `{lt}` needs value-to-string conversion, which is not implemented"
+                        )));
+                    };
+                    return Ok(b.concat_strings(s, bv));
+                }
+            }
+            // RECORD equality is VALUE equality: `record R(int V);` makes
+            // `new R(1) == new R(1)` true, comparing field by field. A
+            // record is a class here, so the general path below would
+            // compare references and answer false — which is what it did
+            // while the parser discarded the `record` keyword.
+            if matches!(
+                op,
+                crate::models::BinOp::Eq | crate::models::BinOp::Ne
+            ) && let (Ok(lt), Ok(rt)) =
+                (static_type_of(lhs, b, ctx), static_type_of(rhs, b, ctx))
+                && lt == rt
+                && let Some(info) = ctx.table.class(&lt)
+                && info.is_record
+            {
+                let n = info.fields.len();
+                let a = eval(lhs, b, ctx)?;
+                let r = eval(rhs, b, ctx)?;
+                let mut acc: Option<VReg> = None;
+                for k in 0..n {
+                    // The field's OWN slot: a hardcoded field start
+                    // reads the wrong words as soon as the layout
+                    // gains a header slot.
+                    let off = (info.fields[k].offset_slots * 8) as u32;
+                    let av = b.fresh();
+                    b.push_raw(Instr::LoadField {
+                        dst: av,
+                        base: a,
+                        off,
+                    });
+                    let bv = b.fresh();
+                    b.push_raw(Instr::LoadField {
+                        dst: bv,
+                        base: r,
+                        off,
+                    });
+                    let eq = b.emit(Instr::Cmp {
+                        dst: VReg(0),
+                        op: crate::native::ir::CmpOp::Eq,
+                        a: av,
+                        b: bv,
+                    });
+                    acc = Some(match acc {
+                        None => eq,
+                        Some(prev) => b.emit(Instr::Bin {
+                            dst: VReg(0),
+                            op: IrBinOp::BitAnd,
+                            a: prev,
+                            b: eq,
+                        }),
+                    });
+                }
+                // A record with NO fields compares equal whenever both
+                // sides are non-null; a single-field record is just the
+                // one comparison. `!=` inverts the whole result.
+                let base = acc.unwrap_or_else(|| b.const_i64(1));
+                if matches!(op, crate::models::BinOp::Ne) {
+                    let one = b.const_i64(1);
+                    return Ok(b.emit(Instr::Bin {
+                        dst: VReg(0),
+                        op: IrBinOp::BitXor,
+                        a: base,
+                        b: one,
+                    }));
+                }
+                return Ok(base);
+            }
             // Logical operators short-circuit like C#: `&&` skips its
             // right side when the left is false, `||` when true. The
             // old eager form evaluated throwing/null-dereferencing
@@ -5957,6 +8180,38 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 return Ok(home);
             }
             let a = eval(lhs, b, ctx)?;
+            // `is` takes a PATTERN, not a value: evaluating the right
+            // side as an expression would emit a call for a pattern
+            // marker and resolve a type name as a variable.
+            if matches!(op, crate::models::BinOp::Is) {
+                // `x is null` on a non-nullable value type (or a generic
+                // parameter) is constant false; that check needs the
+                // subject's TYPE, so it stays here. Everything else is a
+                // pattern, and one helper answers them all: type tests,
+                // constants, relational, tuple, list, property and the
+                // `and`/`or` chains over any of those.
+                if matches!(rhs.as_ref(), Expr::Literal(crate::models::Literal::Null)) {
+                    if let Ok(ty) = static_type_of(lhs, b, ctx) {
+                        let is_generic_param = ctx.method_vars.iter().any(|g| g == &ty)
+                            || ctx.current_info.is_some_and(|info| {
+                                info.generic_params.iter().any(|g| g == &ty)
+                            });
+                        if is_value_comparable(ctx.table, &ty) || is_generic_param {
+                            return Ok(b.const_i64(0));
+                        }
+                    }
+                    let zero = b.const_i64(0);
+                    return Ok(b.emit(Instr::Cmp {
+                        dst: VReg(0),
+                        op: CmpOp::Eq,
+                        a,
+                        b: zero,
+                    }));
+                }
+                let sty = static_type_of(lhs, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                return emit_is_pattern(b, ctx, a, &sty, rhs);
+            }
             let bv = eval(rhs, b, ctx)?;
             // Pointer arithmetic scales here too (the pair path —
             // see `pointer_arith`).
@@ -5988,8 +8243,14 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         };
                         let total = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Add, a: len_a, b: len_b });
                         let s16 = b.const_i64(16);
-                        // Object = 16-byte header (len + refcount) + data.
-                        let total_sz = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Add, a: total, b: s16 });
+                        // The header length is a CHARACTER count, but the
+                        // data is UTF-16: allocation, pointer advance and
+                        // both MemCpy lengths are BYTE counts. Copying
+                        // `len` bytes produced half a string ("12"+"345"
+                        // gave "1" then garbage) — measured.
+                        let two = b.const_i64(2);
+                        let total_bytes = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Mul, a: total, b: two });
+                        let total_sz = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Add, a: total_bytes, b: s16 });
                         let newobj = b.fresh();
                         b.push_raw(Instr::AllocDyn { dst: newobj, bytes: total_sz });
                         b.push_raw(Instr::StoreField { base: newobj, off: 0, src: total });
@@ -5997,10 +8258,12 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         b.push_raw(Instr::StoreField { base: newobj, off: 8, src: one });
                         let data_new = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Add, a: newobj, b: s16 });
                         let data_a = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Add, a: a, b: s16 });
-                        b.raw_vreg(Instr::MemCpy { dst: data_new, src: data_a, len: len_a });
-                        let ptr2 = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Add, a: data_new, b: len_a });
+                        let len_a_bytes = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Mul, a: len_a, b: two });
+                        b.raw_vreg(Instr::MemCpy { dst: data_new, src: data_a, len: len_a_bytes });
+                        let ptr2 = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Add, a: data_new, b: len_a_bytes });
                         let data_b = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Add, a: bv, b: s16 });
-                        b.raw_vreg(Instr::MemCpy { dst: ptr2, src: data_b, len: len_b });
+                        let len_b_bytes = b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::Mul, a: len_b, b: two });
+                        b.raw_vreg(Instr::MemCpy { dst: ptr2, src: data_b, len: len_b_bytes });
                         return Ok(newobj);
                     }
                     crate::models::BinOp::Eq | crate::models::BinOp::Ne => {
@@ -6037,8 +8300,29 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             if !op.is_comparison()
                 && let (Some(&va), Some(&vb)) = (b.const_vals.get(&a.0), b.const_vals.get(&bv.0))
             {
-                let folded = fold_arith(op, va, vb);
-                if let Some(v) = folded {
+                let int32 = is_int32_spelling(&static_type_of(lhs, b, ctx).unwrap_or_default())
+                    && is_int32_spelling(&static_type_of(rhs, b, ctx).unwrap_or_default());
+                let uint32 = is_uint32_spelling(&static_type_of(lhs, b, ctx).unwrap_or_default())
+                    && is_uint32_spelling(&static_type_of(rhs, b, ctx).unwrap_or_default());
+                let shift = matches!(
+                    op,
+                    crate::models::BinOp::Shl
+                        | crate::models::BinOp::Shr
+                        | crate::models::BinOp::ShrShr
+                );
+                // A folded `int` SHIFT would use the unmasked count
+                // (`1 << 32` is 1 in C#), so shifts take the runtime
+                // path; other folded `int` results wrap at 32 bits.
+                if !((int32 || uint32) && shift)
+                    && let Some(v) = fold_arith(op, va, vb)
+                {
+                    let v = if int32 {
+                        (v as i32) as i64
+                    } else if uint32 {
+                        v & 0xFFFF_FFFF
+                    } else {
+                        v
+                    };
                     return Ok(b.emit(Instr::Const {
                         dst: VReg(0),
                         imm: v,
@@ -6088,37 +8372,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     _ => unreachable!("comparison filter above"),
                 };
                 let lhs_ty = static_type_of(lhs, b, ctx).unwrap_or_default();
-                // TEMP-OPDBG: audit operator dispatch.
-                // Removed before close.
-                if std::env::var("RUBYC_OPDBG").is_ok() {
-                    let entry = ctx.table.class(&lhs_ty);
-                    let methods: Vec<String> = entry
-                        .map(|e| {
-                            e.methods
-                                .iter()
-                                .filter(|m| m.name == op_name)
-                                .map(|m| {
-                                    format!(
-                                        "{}#{}:static={}",
-                                        m.name,
-                                        m.param_types.len(),
-                                        m.is_static
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    eprintln!(
-                        "[rubyc] TEMP-OPDBG op={op_name} lhs_ty={lhs_ty} entry_some={} methods={:?} in {}.{}",
-                        ctx.table.class(&lhs_ty).is_some(),
-                        methods,
-                        ctx.current_class,
-                        ctx.current_method.clone().unwrap_or_default()
-                    );
-                }
-                // Function-index keys use AST declaration names
-                // (often simple: `TS::Less#2`), while inferred types
-                // are qualified (`app.TS`): try both spellings.
                 let mut op_fidx: Option<u32> = None;
                 {
                     let simple = lhs_ty.rsplit('.').next().unwrap_or(&lhs_ty);
@@ -6220,30 +8473,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // Type check (`is`): `x is null` folds to a null
             // comparison (pervasive in guards like `IsNullOrEmpty`);
             // general type tests stay parse-only false for now.
-            if matches!(op, crate::models::BinOp::Is) {
-                if matches!(rhs.as_ref(), Expr::Literal(crate::models::Literal::Null)) {
-                    // `x is null` on a non-nullable value type (or a
-                    // generic parameter, same gamble as `== null`
-                    // above) is constant false.
-                    if let Ok(ty) = static_type_of(lhs, b, ctx) {
-                        let is_generic_param = ctx.method_vars.iter().any(|g| g == &ty)
-                            || ctx.current_info.is_some_and(|info| {
-                                info.generic_params.iter().any(|g| g == &ty)
-                            });
-                        if is_value_comparable(ctx.table, &ty) || is_generic_param {
-                            return Ok(b.const_i64(0));
-                        }
-                    }
-                    let zero = b.const_i64(0);
-                    return Ok(b.emit(Instr::Cmp {
-                        dst: VReg(0),
-                        op: CmpOp::Eq,
-                        a,
-                        b: zero,
-                    }));
-                }
-                return Ok(b.emit(Instr::Const { dst: VReg(0), imm: 0 }));
-            }
+
             // Logical AND/OR — lower as Cmp-based boolean operations.
             if matches!(op, crate::models::BinOp::And | crate::models::BinOp::Or) {
                 let is_and = matches!(op, crate::models::BinOp::And);
@@ -6293,7 +8523,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     return Ok(dst);
                 }
             }
-            let binop = match op {
+            let mut binop = match op {
                 crate::models::BinOp::Add => IrBinOp::Add,
                 crate::models::BinOp::Sub => IrBinOp::Sub,
                 crate::models::BinOp::Mul => IrBinOp::Mul,
@@ -6307,12 +8537,89 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 crate::models::BinOp::ShrShr => IrBinOp::ShrShr,
                 _ => unreachable!("logical/comparison handled above"),
             };
-            Ok(b.emit(Instr::Bin {
+            // C# `int` is 32 bits. When BOTH operands are `int`, the
+            // result must wrap at 32 bits and shifts must mask their
+            // count (`1 << 32` is `1`, because C# masks by 0x1F). Mixed
+            // `int`/`long` arithmetic is 64-bit and is left alone.
+            let lt = static_type_of(lhs, b, ctx).unwrap_or_default();
+            let rt = static_type_of(rhs, b, ctx).unwrap_or_default();
+            let int32_pair = is_int32_spelling(&lt) && is_int32_spelling(&rt);
+            // `uint` arithmetic is 32-bit UNSIGNED: the result is the low
+            // 32 bits, zero-extended (masking two's-complement low bits is
+            // correct even when the i64 product wrapped).
+            let uint32_pair = is_uint32_spelling(&lt) && is_uint32_spelling(&rt);
+            // `/` and `%` on unsigned results use `div`, not `idiv`.
+            if matches!(op, crate::models::BinOp::Div | crate::models::BinOp::Rem)
+                && is_unsigned_result(&numeric_result(&lt, &rt))
+            {
+                binop = if matches!(op, crate::models::BinOp::Div) {
+                    IrBinOp::UDiv
+                } else {
+                    IrBinOp::URem
+                };
+            }
+            let shift = matches!(
+                op,
+                crate::models::BinOp::Shl
+                    | crate::models::BinOp::Shr
+                    | crate::models::BinOp::ShrShr
+            );
+            // A shift's RESULT type is the LEFT operand's type; C# does
+            // not combine it with the count's type (`u << 32` is a uint
+            // shift by 0). Counts mask by width-1 (0x1F / 0x3F).
+            let shift_int32 = shift && is_int32_spelling(&lt);
+            let shift_uint32 = shift && is_uint32_spelling(&lt);
+            let shift_wide = shift
+                && matches!(
+                    lt.trim(),
+                    "long" | "Int64" | "System.Int64" | "ulong" | "UInt64" | "System.UInt64"
+                );
+            let shift_b = if shift_int32 || shift_uint32 {
+                let m = b.const_i64(31);
+                b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitAnd,
+                    a: bv,
+                    b: m,
+                })
+            } else if shift_wide {
+                let m = b.const_i64(63);
+                b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitAnd,
+                    a: bv,
+                    b: m,
+                })
+            } else {
+                bv
+            };
+            let r = b.emit(Instr::Bin {
                 dst: VReg(0),
                 op: binop,
                 a,
-                b: bv,
-            }))
+                b: shift_b,
+            });
+            // Inside `checked(...)`, integer +, - and * must raise instead
+            // of wrapping. Comparisons, floats and pointers never reach
+            // here (they take their own paths above).
+            if b.checked_depth > 0 {
+                let kind = if int32_pair || shift_int32 {
+                    crate::native::ir::lower::body::CheckedKind::Int32
+                } else if uint32_pair || shift_uint32 {
+                    crate::native::ir::lower::body::CheckedKind::UInt32
+                } else {
+                    crate::native::ir::lower::body::CheckedKind::Int64
+                };
+                b.checked_arith_guard(binop, a, shift_b, r, ctx, kind)?;
+            }
+            let r = if int32_pair || shift_int32 {
+                narrow_int32(b, r)
+            } else if uint32_pair || shift_uint32 {
+                mask_uint32(b, r)
+            } else {
+                r
+            };
+            Ok(r)
         }
         Expr::New {
             class_name, args, init, ..
@@ -6376,11 +8683,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     .and_then(|q| ctx.table.class(&q))
                     .or_else(|| ctx.table.class(&class_name))
             }) else {
-                // TEMP-NEWDIAG: silent-zero `new` (unresolved class).
-                // Removed before close.
-                if std::env::var("RUBYC_NEWDIAG").is_ok() {
-                    eprintln!("[rubyc] TEMP-NEWDIAG unresolved new {qualified}");
-                }
                 let _ = eval_args(args, b, ctx)?;
                 return Ok(b.const_i64(0));
             };
@@ -6399,7 +8701,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         if is_method_group(a, b, ctx) {
                             return "method-group".to_owned();
                         }
-                        static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned())
+                        overload_arg_type(a, b, ctx)
                     })
                     .collect();
                 let accepts = |e: &crate::native::semantic::ClassInfo| {
@@ -6422,24 +8724,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 }
             };
             let obj = b.fresh();
-            // TEMP-NOOPDIAG3: skip UTF8Encoding construction (bisect
-            // trap). Removed before close.
-            if std::env::var("RUBYC_NOOP_FB").is_ok()
-                && (class_name == "UTF8Encoding" || class_name.ends_with(".UTF8Encoding"))
-            {
-                let _ = eval_args(args, b, ctx)?;
-                return Ok(b.const_i64(0));
-            }
-            // TEMP-NOOPDIAG5: minimal UTF8Encoding (alloc+zero, no ctor
-            // body) to split construction trap from use. Removed
-            // before close.
-            if std::env::var("RUBYC_MINUTF8").is_ok()
-                && (class_name == "UTF8Encoding" || class_name.ends_with(".UTF8Encoding"))
-                && !info.fields.is_empty()
-            {
-                let _ = eval_args(args, b, ctx)?;
-                return Ok(b.alloc_struct_box(ctx, info));
-            }
             // Span construction packs instead of running ctor bodies
             // (see `span.rs`): reference arithmetic in real bodies
             // (`Unsafe.Add`) is outside our ref model, so `new
@@ -6450,7 +8734,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 let arg_types: Vec<String> = args
                     .iter()
                     .map(|a| {
-                        static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned())
+                        overload_arg_type(a, b, ctx)
                     })
                     .collect();
                 let span_ty = info.key.path.clone();
@@ -6471,54 +8755,13 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     return span_slice(b, ctx, full, &span_ty, &inner, start, Some(length));
                 }
             }
-            b.alloc(obj, (info.fields.len() + 2) as u64 * 8);
-            // TEMP-FLDDBG: field layout audit.
-            if std::env::var("RUBYC_FLDDBG").is_ok()
-                && (class_name.contains("Encoding")
-                    || class_name.contains("Fallback")
-                    || class_name.contains("Exception")
-                    // TEMP-SENTDIAG7: Stream field layouts (bisecting
-                    // the CanWrite-false fault). Removed before close.
-                    || class_name.contains("ConsoleStream")
-                    || class_name.contains("MemoryStream")
-                    // TEMP-TASKDIAG: Task field layouts (bisecting the
-                    // m_stateFlags-zero fault). Removed before close.
-                    || class_name == "Task"
-                    || class_name.contains("Task<")
-                    // TEMP-SWDIAG2: Writer field layouts (bisecting the
-                    // CoreNewLine-null fault). Removed before close.
-                    || class_name.contains("StreamWriter")
-                    || class_name.contains("TextWriter")
-                    // TEMP-SPANDIAG3: Span layouts (CopyTo fault).
-                    // Removed before close.
-                    || class_name.contains("Span"))
-            {
-                let fs: Vec<String> = info
-                    .fields
-                    .iter()
-                    .map(|f| format!("{}@{}", f.name, f.offset_slots))
-                    .collect();
-                eprintln!("[rubyc] TEMP-FLDDBG {} fields={}", class_name, fs.join(","));
-            }
-            // `using`-alias spelling (`new WorkQueue()` for
-            // `using WorkQueue = Queue<object>`): the alias itself
-            // declares nothing — the AST declaration (field
-            // initializers, primary params, bases) lives under the
-            // target entry's simple name. Resolved inside
-            // `construction_decl` (shared with virtual dispatch, so
-            // rows agree).
-            // Cross-image construction (dynamic-linking consume): no AST
-            // declaration exists for this entry, and it ships from another
-            // image — allocate against the owner's vtable row and run the
-            // owner's ctor instead of the hollow local row below.
+            // The header is vtable + refcount + runtime type (the
+            // instantiation), then the instance fields.
+            b.alloc(
+                obj,
+                (info.fields.len() + INSTANCE_HEADER_SLOTS) as u64 * 8,
+            );
             let decl_opt = construction_decl(ctx, &class_name);
-            // TEMP-VIRDBG8: new-resolution audit. Removed before close.
-            if std::env::var("RUBYC_VIRDBG7").is_ok() && class_name.contains("MemoryStream") {
-                eprintln!(
-                    "[rubyc] TEMP-VIRDBG8 new {class_name} -> {:?}",
-                    decl_opt.map(|d| (d.name.clone(), construction_row(ctx, d)))
-                );
-            }
             if decl_opt.is_none() && !info.owner.is_empty() {
                 return lower_external_new(info, args, &class_name, b, ctx);
             }
@@ -6526,16 +8769,9 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // emission order (mirrors `Program` row construction).
             // Table order does NOT work: it carries extra entries and
             // a different order, so every `new` misdispatched virtuals.
-            // TEMP-VIDBG.
             let vi = match decl_opt {
                 Some(decl) => {
                     let n = construction_row(ctx, decl);
-                    if std::env::var("RUBYC_VIDBG").is_ok()
-                        && (class_name == "UTF8Encoding"
-                            || class_name.ends_with(".UTF8Encoding"))
-                    {
-                        eprintln!("[rubyc] TEMP-VIDBG new {class_name} vi={n}");
-                    }
                     n
                 }
                 None => 0,
@@ -6543,6 +8779,37 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             let vt = b.fresh();
             b.vtable_addr(vt, vi as u32);
             b.push_raw(Instr::StoreField { base: obj, off: 0, src: vt });
+            // The instance's RUNTIME TYPE: the descriptor of the
+            // instantiation, which carries a generic class's type
+            // arguments. `typeof(T)` inside a method of the class
+            // reads the argument out of it.
+            // A construction whose type argument is still a type
+            // VARIABLE (`new Memory<T>()` inside a generic method)
+            // has no concrete runtime type yet, so the slot stays
+            // null and `typeof(T)` reports that rather than reading
+            // an answer that is not there.
+            let runtime_type = if info.generic_params.is_empty()
+                || type_meta(&class_name, ctx).has_type_var
+            {
+                None
+            } else {
+                Some(b.type_token(&class_name, ctx)?)
+            };
+            match runtime_type {
+                Some(desc) => b.push_raw(Instr::StoreField {
+                    base: obj,
+                    off: (RUNTIME_TYPE_SLOT * 8) as u32,
+                    src: desc,
+                }),
+                None => {
+                    let none = b.const_i64(0);
+                    b.push_raw(Instr::StoreField {
+                        base: obj,
+                        off: (RUNTIME_TYPE_SLOT * 8) as u32,
+                        src: none,
+                    });
+                }
+            }
             // Zero every field slot up front (C# `new` semantics):
             // freelist-reused memory holds stale data, and a later
             // reference-field store releases the old value — garbage
@@ -6557,8 +8824,8 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     off: 8,
                     src: one,
                 });
-                let mut off = 16u32;
-                let end = (info.fields.len() as u32 + 2) * 8;
+                let mut off = (FIRST_FIELD_SLOT * 8) as u32;
+                let end = (info.fields.len() as u32 + INSTANCE_HEADER_SLOTS as u32) * 8;
                 while off < end {
                     b.push_raw(Instr::StoreField {
                         base: obj,
@@ -6570,23 +8837,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             }
 
             if let Some(decl) = decl_opt {
-                // TEMP-FINITDIAG: audit instance field-init emission.
-                // Removed before close.
-                if std::env::var("RUBYC_FINITDIAG").is_ok()
-                    && (class_name == "HillClimbing" || class_name.ends_with(".HillClimbing"))
-                {
-                    let fs: Vec<String> = decl
-                        .members
-                        .iter()
-                        .filter_map(|m| match m {
-                            crate::models::ClassMember::Field(fd) if !fd.is_static && !fd.is_const => {
-                                Some(fd.name.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    eprintln!("[rubyc] TEMP-FINITDIAG new HillClimbing decl={} inits={}", decl.name, fs.join(","));
-                }
                 // Explicit args evaluate once, up front (side effects in
                 // order, values reused for primary binding + ctor call).
                 let mut explicit: Vec<VReg> = Vec::new();
@@ -6617,7 +8867,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                             if is_method_group(a, b, ctx) {
                                 return "method-group".to_owned();
                             }
-                            static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned())
+                            overload_arg_type(a, b, ctx)
                         })
                         .unwrap_or_else(|| "object".to_owned());
                     let Ok(slot) =
@@ -6660,9 +8910,18 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 for edecl in init_chain {
                     let init_ctx = Ctx {
                         table: ctx.table,
+                        class_paths: ctx.class_paths,
                         current_class: &edecl.name,
                         current_info: None,
-                        current_path: ctx.current_path,
+                        // The PATH must name the class being
+                        // initialized: the caller's path made the
+                        // access rule compare unrelated types (a
+                        // private const of the class's own field
+                        // initializer was denied).
+                        current_path: ctx
+                            .class_paths
+                            .get(&(edecl as *const crate::models::ClassDecl))
+                            .map(|s| s.as_str()),
                         classes: ctx.classes,
                         import_index: ctx.import_index,
                         dep_imports: ctx.dep_imports,
@@ -6670,9 +8929,12 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         static_index: ctx.static_index,
                         defines: ctx.defines,
                         method_vars: &[],
+                type_subst: None,
                         local_fns: &[],
                         current_method: None,
                         current_ret: None,
+                        lambda_deferred: None,
+                    lambda_base: 0,
                     };
                     for f in &edecl.members {
                     if let ClassMember::Field(fd) = f
@@ -6686,6 +8948,9 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         // faulting every later virtual call on the
                         // object.
                         let v = eval(&fd.init, b, &init_ctx)?;
+                        let src_ty = static_type_of(&fd.init, b, &init_ctx)
+                            .unwrap_or_else(|_| "object".to_owned());
+                        let v = b.coerce_boxing(v, &src_ty, &fd.type_name, false, &init_ctx)?;
                         let off =
                             (info.field(&fd.name).map(|fi| fi.offset_slots).unwrap_or(1) * 8) as u32;
                         b.push_raw(Instr::StoreField { base: obj, off, src: v });
@@ -6705,7 +8970,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         if is_method_group(a, b, ctx) {
                             return "method-group".to_owned();
                         }
-                        static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned())
+                        overload_arg_type(a, b, ctx)
                     })
                     .collect();
                 // Typed ctor selection across same-named entries
@@ -6822,25 +9087,20 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 }
                 if let Some(mi) = selected_ctor {
                     ctx.check_method_access(mi)?;
-                    // TEMP-NEWDBG: ctor selection audit. Removed before close.
-                    // TEMP-TASKDIAG2: Task ctor selection (bisecting the
-                    // m_stateFlags-zero fault). Removed before close.
-                    // TEMP-SWDIAG: StreamWriter selection (bisecting the
-                    // null _charBuffer fault). Removed before close.
-                    if std::env::var("RUBYC_NEWDBG").is_ok()
-                        && (class_name.contains("MemoryStream") || class_name.contains("Stream") || class_name.contains("Task") || class_name.contains("StreamWriter"))
-                    {
-                        eprintln!(
-                            "[rubyc] TEMP-NEWDBG new {} args={:?} -> {}.{}({:?})",
-                            class_name,
-                            arg_types,
-                            mi.declaring_class,
-                            mi.name,
-                            mi.param_types,
-                        );
+                    // Named ctor arguments (`new Foo(b: 1, a: 2)`): the
+                    // values were evaluated in written order, so permute
+                    // them into parameter order here (side effects keep
+                    // their written order either way).
+                    if let Some(order) = named_arg_order(args, mi)? {
+                        let mut reordered: Vec<VReg> = Vec::with_capacity(order.len());
+                        for (i, written) in order.into_iter().enumerate() {
+                            match written {
+                                Some(w) => reordered.push(explicit[w]),
+                                None => reordered.push(default_arg_value(i, mi, b)),
+                            }
+                        }
+                        explicit = reordered;
                     }
-                    // Reuse the up-front evaluated args (no double side
-                    // effects).
                     let mut argv = vec![obj];
                     argv.extend(explicit);
                     // Fill omitted optional ctor params from the folded
@@ -6891,31 +9151,103 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         )
                     })
                     .unwrap_or(0);
-                    // TEMP-NPOS: diagnose generic ctor routing.
-                    // Removed before close.
-                    if std::env::var("RUBYC_NPOS").is_ok() {
-                        eprintln!(
-                            "[rubyc] TEMP-NPOS new {} mi={}.{}({:?}) n={n} idx={idx}",
-                            class_name, mi.declaring_class, mi.name, mi.param_types,
-                        );
-                    }
                     let call_dst = b.fresh();
                     b.push_raw(Instr::CallFn {
                         dst: call_dst,
                         fidx: idx as u32,
                         args: argv,
                     });
-                } else if let Some(base) = decl.bases.first() {
-                    // C# implicit chaining: a class with no explicit ctor
-                    // calls the first base's zero-arg ctor, if one exists.
-                    if let Some(idx) =
-                        function_index_for(ctx, base, base, 0)
-                    {
+                } else {
+                    // No explicit constructor: chain EVERY base's
+                    // parameterless constructor, not just the first.
+                    // Each base's constructor writes at ITS OWN class's
+                    // offsets, so a base sitting behind another base's
+                    // fields needs an adjusted receiver — the same rule
+                    // `@start` uses for the entry instance. Chaining only
+                    // `bases.first()` left every second base's state
+                    // uninitialised (`class Both : Left, Right` got
+                    // Left's field and not Right's).
+                    let mut chain: Vec<&crate::models::ClassDecl> = Vec::new();
+                    let mut seen: Vec<String> = Vec::new();
+                    fn collect<'a>(
+                        d: &'a crate::models::ClassDecl,
+                        classes: &[&'a crate::models::ClassDecl],
+                        seen: &mut Vec<String>,
+                        out: &mut Vec<&'a crate::models::ClassDecl>,
+                    ) {
+                        if seen.iter().any(|n| n == &d.name) {
+                            return;
+                        }
+                        seen.push(d.name.clone());
+                        for b in &d.bases {
+                            let simple = b.split('<').next().unwrap_or(b).trim();
+                            if let Some(base) =
+                                classes.iter().find(|c| c.name == simple)
+                            {
+                                collect(base, classes, seen, out);
+                            }
+                        }
+                        out.push(d);
+                    }
+                    collect(decl, ctx.classes, &mut seen, &mut chain);
+                    // Subobject offset per class, from the DERIVED
+                    // class's real layout: the first field slot that
+                    // belongs to that base (or its ancestors), minus the
+                    // first field slot. Counting declarations was wrong
+                    // whenever the layout differed from the count — and a
+                    // wrong offset made a base constructor write INTO a
+                    // neighbouring object (measured: one object's field
+                    // turned into the next object's value).
+                    let derived_fields = ctx
+                        .table
+                        .class(&decl.name)
+                        .map(|i| i.fields.clone())
+                        .unwrap_or_default();
+                    let mut offs: Vec<(&str, u32)> = Vec::new();
+                    for c in chain.iter() {
+                        let first = derived_fields
+                            .iter()
+                            .filter(|f| {
+                                f.declaring_class == c.name
+                                    || ctx.table.derives_from(&f.declaring_class, &c.name)
+                            })
+                            .map(|f| f.offset_slots)
+                            .min();
+                        let off = match first {
+                            // The base's own layout starts its fields at
+                            // the first field slot, so the difference
+                            // between the two layouts is the adjustment.
+                            Some(slot) => {
+                                slot.saturating_sub(FIRST_FIELD_SLOT) as u32 * 8
+                            }
+                            None => 0,
+                        };
+                        offs.push((c.name.as_str(), off));
+                    }
+                    for (cname, off) in offs {
+                        if cname == decl.name {
+                            continue;
+                        }
+                        let Some(idx) = function_index_for(ctx, cname, cname, 0)
+                        else {
+                            continue;
+                        };
+                        let recv = if off == 0 {
+                            obj
+                        } else {
+                            let o = b.const_i64(off as i64);
+                            b.emit(Instr::Bin {
+                                dst: VReg(0),
+                                op: IrBinOp::Add,
+                                a: obj,
+                                b: o,
+                            })
+                        };
                         let call_dst = b.fresh();
                         b.push_raw(Instr::CallFn {
                             dst: call_dst,
                             fidx: idx as u32,
-                            args: vec![obj],
+                            args: vec![recv],
                         });
                     }
                 }
@@ -6930,110 +9262,74 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
         }
         Expr::Member { object, name, .. } => {
             let type_name = static_type_of(object, b, ctx)?;
-            // `Type.Name` / `FullName` / `Namespace` over type
-            // placeholders: our `typeof` boxes carry no metadata, so
-            // member reads would fault or answer garbage
-            // (`EventSource` construction reads all three and throws
-            // on nulls). Answer precisely when the receiver spells
-            // the type literally (`typeof(Foo).Name` → `"Foo"`),
-            // else a constant empty string (documented degradation:
-            // uniform, non-crashing; real names need runtime metadata).
-            // Gated to the Type family (only it has placeholders);
-            // member infos and assemblies use normal paths.
-            if matches!(name.as_str(), "Name" | "FullName" | "Namespace") {
-                let sn = base_type_name(&type_name);
-                if sn == "Type" || sn.ends_with("Type") {
-                    let _ = eval(object, b, ctx)?;
-                    let spelled = match object.as_ref() {
-                        Expr::Call { callee, args, .. } if callee == "typeof" => {
-                            args.first().and_then(|a| match a {
-                                Expr::Ident { name: n, .. } => Some(n.clone()),
-                                _ => None,
-                            })
-                        }
-                        _ => None,
+            // A System.Type value is one of our native descriptors.
+            // Its properties are fields; a CoreLib RuntimeType has a
+            // different layout and is never the object we hand out.
+            if is_descriptor_receiver(&type_name)
+                && let Some((off, bit)) = type_member(name)
+            {
+                let base = eval(object, b, ctx)?;
+                if off == u32::MAX {
+                    // RuntimeTypeHandle is the descriptor pointer.
+                    return Ok(base);
+                }
+                let dst = b.fresh();
+                b.push_raw(Instr::LoadField { dst, base, off });
+                let Some(mask) = bit else {
+                    return Ok(dst);
+                };
+                let m = b.const_i64(mask as i64);
+                let bits = b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitAnd,
+                    a: dst,
+                    b: m,
+                });
+                let zero = b.const_i64(0);
+                return Ok(b.emit(Instr::Cmp {
+                    dst: VReg(0),
+                    op: CmpOp::Ne,
+                    a: bits,
+                    b: zero,
+                }));
+            }
+            // Tuple element read (`t.Item1`): tuples lower as dense slot
+            // arrays, so `ItemN` is slot N-1. The declared spelling is
+            // `(int, int)` (or `tuple[]` after inference).
+            {
+                let tr = type_name.trim();
+                let is_tuple = tr == "tuple"
+                    || tr
+                        .strip_suffix("[]")
+                        .map(|inner| inner.trim() == "tuple")
+                        .unwrap_or(false)
+                    || (tr.starts_with('(') && tr.contains(','));
+                if is_tuple
+                    && name.len() > 4
+                    && name.starts_with("Item")
+                    && name[4..].chars().all(|c| c.is_ascii_digit())
+                    && let Ok(n) = name[4..].parse::<i64>()
+                    && n >= 1
+                {
+                    let synth = Expr::Index {
+                        object: object.clone(),
+                        index: Box::new(Expr::Literal(crate::models::Literal::Int(n - 1))),
+                        extra: Vec::new(),
+                        is_range: false,
+                        span: crate::models::Span::new(0, 0),
                     };
-                    let val = match spelled {
-                        Some(s) if name.as_str() == "Name" => s
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or(&s)
-                            .split('<')
-                            .next()
-                            .unwrap_or(&s)
-                            .to_owned(),
-                        Some(s) if name.as_str() == "FullName" => s,
-                        Some(s) => s
-                            .rfind('.')
-                            .map(|i| s[..i].to_owned())
-                            .unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    let lit = Expr::Literal(Literal::Str(val));
-                    return eval(&lit, b, ctx);
+                    return eval(&synth, b, ctx);
                 }
             }
-            // `typeof(X).IsValueType` over a literal spelling: our
-            // `typeof` boxes carry no metadata, so the getter chain
-            // (`IsValueTypeImpl` → `IsSubclassOf`) answers false for
-            // everything — spuriously tripping guards like
-            // `!typeof(T).IsValueType` in `Span(T[])` (which then
-            // throws on broken `typeof` identity and faults
-            // unwinding). Answer from the spelling: open type
-            // variables count as value types (optimistic fail-open —
-            // every reaching instantiation is blittable in practice,
-            // mirroring the `IsReferenceOrContainsReferences`
-            // precedent), as do known primitives/structs/enums;
-            // everything else keeps the legacy false.
-            if name.as_str() == "IsValueType" {
-                if let Expr::Call { callee, args, .. } = object.as_ref() {
-                    if callee == "typeof" {
-                        if let Some(spelling) = args.first().and_then(|a| match a {
-                            Expr::Ident { name: n, .. } => Some(n.clone()),
-                            _ => None,
-                        }) {
-                            let _ = eval(object, b, ctx)?;
-                            let v = is_value_type_spelling(ctx, &spelling);
-                            return Ok(b.const_i64(v as i64));
-                        }
-                    }
-                }
-            }
+            // Member reads on a `System.Type` receiver are answered by
+            // the descriptor path above (the canonical names and
+            // predicates). A member the descriptor does not carry needs
+            // a real reflection surface and is reported, not guessed.
             // `string.Length` — a first-class string stores its byte length
             // at slot 0 (offset 0).
-            // TEMP-INVDIAG4: trace Invariant member reads (top).
-            // Removed before close.
-            if std::env::var("RUBYC_INVDIAG").is_ok() && name == "Invariant" {
-                eprintln!(
-                    "[rubyc] TEMP-INVDIAG4 recvtype={type_name} in {}.{}",
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default()
-                );
-            }
             if type_name == "string" && name == "Length" {                let base = eval(object, b, ctx)?;
                 let dst = b.fresh();
                 b.push_raw(Instr::LoadField { dst, base, off: 0 });
-                // TEMP-LENIDENTITYDIAG: trap if Length equals its own
-                // receiver (identity bug: length slot holds the object).
-                // Removed before close.
-                if std::env::var("RUBYC_LENIDENTITYDIAG").is_ok() {
-                    let is_self = b.emit(Instr::Cmp {
-                        dst: VReg(0),
-                        op: crate::native::ir::CmpOp::Eq,
-                        a: dst,
-                        b: base,
-                    });
-                    let ok_b = b.make_block();
-                    let trap_b = b.make_block();
-                    b.terminate(Terminator::Branch {
-                        cond: Some(is_self),
-                        if_true: trap_b,
-                        if_false: ok_b,
-                    });
-                    b.switch_to(trap_b);
-                    b.push_raw(Instr::Raw(vec![0xCC]));
-                    b.switch_to(ok_b);
-                }
                 return Ok(dst);
             }
             // `MethodTable*` dereference reads (`pMT->IsSzArray`,
@@ -7095,17 +9391,13 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             if base_type_name(&type_name) == "RawData" && name == "Data" {
                 return Ok(eval(object, b, ctx)?);
             }
-            // String interior fields: our string layout keeps the
-            // length at +0 and character data at +16, but the table
-            // lays `_stringLength`/`_firstChar` out as ordinary fields
-            // (slots 2/3 → offsets 16/24), so normal member lowering
-            // reads data-as-length and second-word-as-first-char.
-            // Fold to the real layout instead (see
+            // `string` interior fields: RubyC's builtin layout keeps the length
+            // at +0 and character data at +16, while the table would lay
+            // them out as ordinary slots (16/24). Lower them from the
+            // single layout owner in `semantic` (see
             // `string_interior_read`; shared with the implicit-`this`
-            // read path for bare `_firstChar`).
-            if base_type_name(&type_name) == "String"
-                && (name == "_stringLength" || name == "_firstChar")
-            {
+            // read path for a bare payload read).
+            if crate::native::semantic::builtin_string_interior_offset(&type_name, name).is_some() {
                 let base = eval(object, b, ctx)?;
                 return Ok(string_interior_read(b, base, name));
             }
@@ -7125,22 +9417,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     || (!ctx.table.class(&type_name).is_some()
                         && definition_entry(ctx.table, &type_name).is_none()))
             {
-                // TEMP-LENTRACE.
-                if std::env::var("RUBYC_LENTRACE").is_ok() {
-                    eprintln!("[rubyc] TEMP-LENTRACE array-path type={type_name}");
-                }
-                // Non-class type with `.Length` — treat as array.
                 let base = eval(object, b, ctx)?;
-                // TEMP-NULLBASE (array Length). Removed before close.
-                if std::env::var("RUBYC_NULLBASE").is_ok()
-                    && b.const_vals.get(&base.0) == Some(&0)
-                {
-                    eprintln!(
-                        "[rubyc] TEMP-NULLBASE-ARRAY member=Length type={type_name} in {}.{}",
-                        ctx.current_class,
-                        ctx.current_method.clone().unwrap_or_default()
-                    );
-                }
                 let dst = b.fresh();
                 b.push_raw(Instr::LoadField {
                     dst,
@@ -7179,38 +9456,13 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         .map(|(e, _)| e)
                 })
             else {
-                // Unknown type (e.g. generic type parameter `T`) — return 0
-                // as a placeholder so compilation succeeds.
-                // TEMP-TYPEDBG. Removed before close.
-                if std::env::var("RUBYC_FIELDDBG").is_ok()
-                    && (name == "CACHE_LINE_SIZE" || name == "Invariant")
-                {
-                    // Try all plausible spellings to see which (if any) hit.
-                    let cands = [
-                        type_name.clone(),
-                        type_name.rsplit('.').next().unwrap_or(&type_name).to_owned(),
-                    ];
-                    let hits: Vec<String> = cands
-                        .iter()
-                        .filter_map(|c| {
-                            ctx.table
-                                .class(c)
-                                .map(|e| format!("{c}=>{}", e.key.path))
-                        })
-                        .collect();
-                    eprintln!(
-                        "[rubyc] TEMP-TYPEDBG unresolved recvtype={type_name} member={name} hits={hits:?} allpad={:?} in {}.{}",
-                        ctx.table
-                            .classes
-                            .iter()
-                            .filter(|c| c.name.contains("PaddingHelpers")
-                                || c.key.path.contains("PaddingHelpers"))
-                            .map(|c| format!("{}|{}", c.name, c.key.path))
-                            .collect::<Vec<_>>(),
-                        ctx.current_class,
-                        ctx.current_method.clone().unwrap_or_default()
-                    );
-                }
+                // An unresolved receiver (an open generic parameter `T`, an
+                // uninferred temporary, a `_` discard) has no entry to
+                // check membership against, so a member read is not
+                // diagnosable here — evaluate for side effects and
+                // yield the default. A receiver that DID resolve to a
+                // class entry and simply lacks the member falls through
+                // to the honest `no_member` error below.
                 let _ = eval(object, b, ctx)?;
                 return Ok(b.const_i64(0));
             };
@@ -7227,48 +9479,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 member_host(ctx.table, &type_name, name).unwrap_or(first)
             };
             let field = info.field(name);
-            // Invariant globalization (static freestanding exes
-            // ship no ICU — host stubs cannot provide it):
-            // `GlobalizationMode.Invariant` /
-            // `Settings.Invariant` read true, taking the
-            // framework's officially supported no-ICU paths
-            // (the same configuration as .NET's
-            // `Invariant=true` publish flag / `DOTNET_SYSTEM_`
-            // `GLOBALIZATION_INVARIANT=1`, which CoreLib itself
-            // recommends when ICU is absent). Without this every
-            // culture lookup crashes in ICU P/Invokes. Real ICU
-            // support is future work. Gated here (before field /
-            // property / access dispatch): the read is a compiler
-            // intrinsic, and private nesting (`Settings`) must not
-            // block it, nor may missing backing storage.
-            if name == "Invariant" && info.key.path.contains("GlobalizationMode") {
-                let _ = eval(object, b, ctx)?;
-                return Ok(b.const_i64(1));
-            }
-            // TEMP-INVDIAG5: trace field lookup result.
-            // Removed before close.
-            if std::env::var("RUBYC_INVDIAG").is_ok() && name == "Invariant" {
-                eprintln!(
-                    "[rubyc] TEMP-INVDIAG5 entry={} field_some={} field_static={} has_prop={}",
-                    info.key.path,
-                    field.is_some(),
-                    field.is_some_and(|f| f.is_static),
-                    info.property(name).is_some()
-                );
-            }
-            // TEMP-FIELDDBG3: trace all CACHE_LINE_SIZE reads.
-            // Removed before close.
-            if std::env::var("RUBYC_FIELDDBG").is_ok() && name == "CACHE_LINE_SIZE" {
-                eprintln!(
-                    "[rubyc] TEMP-FIELDDBG3 member={name} type={type_name} entry={} field_some={} is_const={} const_val={:?} in {}.{}",
-                    info.key.path,
-                    field.is_some(),
-                    field.is_some_and(|f| f.is_const),
-                    field.and_then(|f| f.const_value.clone()),
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default()
-                );
-            }
             if field.is_none()
                 && !info.own_members.iter().any(|(n, is_f, _)| n == name && *is_f)
                 && info.property(name).is_none()
@@ -7276,18 +9486,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 // Member not found as a field, own member, or known
                 // property — return 0 as a placeholder (e.g.
                 // expression-bodied property).
-                // TEMP-FIELDDBG: trace misses for specific names.
-                // Removed before close.
-                if std::env::var("RUBYC_FIELDDBG").is_ok()
-                    && (name == "CACHE_LINE_SIZE" || name == "Invariant")
-                {
-                    eprintln!(
-                        "[rubyc] TEMP-FIELDDBG miss member={name} type={type_name} entry={} in {}.{}",
-                        info.key.path,
-                        ctx.current_class,
-                        ctx.current_method.clone().unwrap_or_default()
-                    );
-                }
                 let _ = eval(object, b, ctx)?;
                 return Ok(b.const_i64(0));
             }
@@ -7297,16 +9495,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             if let Some(f) = field
                 && f.is_const
             {
-                // TEMP-FIELDDBG2. Removed before close.
-                if std::env::var("RUBYC_FIELDDBG").is_ok() && name == "CACHE_LINE_SIZE" {
-                    eprintln!(
-                        "[rubyc] TEMP-FIELDDBG2 const {name} entry={} value={:?} in {}.{}",
-                        info.key.path,
-                        f.const_value,
-                        ctx.current_class,
-                        ctx.current_method.clone().unwrap_or_default()
-                    );
-                }
                 return match f.const_value {
                     Some(ConstValue::Int(i)) => Ok(b.const_i64(i)),
                     Some(ConstValue::Float(fv)) => {
@@ -7333,53 +9521,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 // Evaluate the receiver for side effects only; it is not the
                 // base address of a static.
                 let _ = eval(object, b, ctx)?;
-                // Invariant globalization (static freestanding exes
-                // ship no ICU — host stubs cannot provide it):
-                // `GlobalizationMode.Invariant` /
-                // `Settings.Invariant` read true, taking the
-                // framework's officially supported no-ICU paths
-                // (the same configuration as .NET's
-                // `Invariant=true` publish flag / `DOTNET_SYSTEM_`
-                // `GLOBALIZATION_INVARIANT=1`, which CoreLib itself
-                // recommends when ICU is absent). Without this every
-                // culture lookup crashes in ICU P/Invokes. Real ICU
-                // support is future work.
-                // TEMP-INVDIAG2: audit Invariant static reads.
-                // Removed before close.
-                if std::env::var("RUBYC_INVDIAG").is_ok() && name == "Invariant" {
-                    eprintln!(
-                        "[rubyc] TEMP-INVDIAG2 name={name} fdecl={} infopath={} in {}.{}",
-                        f.declaring_class,
-                        info.key.path,
-                        ctx.current_class,
-                        ctx.current_method.clone().unwrap_or_default()
-                    );
-                }
-                if name == "Invariant"
-                    && (f.declaring_class.contains("GlobalizationMode")
-                        || info.key.path.contains("GlobalizationMode"))
-                {
-                    return Ok(b.const_i64(1));
-                }
-                // No ETW/EventPipe backend (static freestanding exes
-                // ship no event pipeline — host stubs cannot provide
-                // it): `EventSource.IsSupported` /
-                // `IsMeterSupported` read false, taking the
-                // framework's inert paths (construction skips its
-                // body, SendCommand/WriteEvent return early). Without
-                // this, EventSource construction runs manifest/guid/
-                // provider/listener machinery that faults on
-                // placeholder reflection (killed every EventSource
-                // static init). Real EventPipe support is future work.
-                // Mirrors the no-ICU precedent above.
-                if (name == "IsSupported" || name == "IsMeterSupported")
-                    && (f.declaring_class.contains("EventSource")
-                        || info.key.path.contains("EventSource")
-                        || f.declaring_class.contains("Meter")
-                        || info.key.path.contains("Meter"))
-                {
-                    return Ok(b.const_i64(0));
-                }
                 // Static properties (including ISA gates like
                 // `Sse2.IsSupported`) never reach the field branch
                 // above (no backing storage); they inline through the
@@ -7390,44 +9531,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 };
                 let dst = b.fresh();
                 b.push_raw(Instr::LoadField { dst, base, off: 0 });
-                // `EqualityComparer<T>.Default` lazy-init: generic
-                // statics are not eagerly initialized before first
-                // dynamic use (ordering cannot see method-body
-                // dependencies), so early reads observe zeroed storage
-                // (null) and fault on first use (killed EventSource
-                // construction via a null comparer). On null, construct
-                // the universal comparer and store it — idempotent and
-                // single-thread safe (stateless, interchangeable).
-                if name == "Default"
-                    && base_type_name(&f.declaring_class) == "EqualityComparer"
-                {
-                    let z = b.const_i64(0);
-                    let is_null = b.emit(Instr::Cmp {
-                        dst: VReg(0),
-                        op: CmpOp::Eq,
-                        a: dst,
-                        b: z,
-                    });
-                    let init_b = b.make_block();
-                    let done_b = b.make_block();
-                    b.terminate(Terminator::Branch {
-                        cond: Some(is_null),
-                        if_true: init_b,
-                        if_false: done_b,
-                    });
-                    b.switch_to(init_b);
-                    let fresh = new_universal_comparer(b, ctx)?;
-                    b.push_raw(Instr::StoreField {
-                        base,
-                        off: 0,
-                        src: fresh,
-                    });
-                    b.mov(dst, fresh);
-                    if !b.is_sealed() {
-                        b.goto(done_b);
-                    }
-                    b.switch_to(done_b);
-                }
                 // Uninitialized struct statics read null, but member
                 // access needs an object (`DateTime.MinValue.Ticks`
                 // must see zero data, not address zero): materialize
@@ -7467,34 +9570,13 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         if_false: done_b,
                     });
                     b.switch_to(box_b);
-                    let boxed = b.alloc_struct_box(ctx, entry);
+                    let boxed = b.alloc_struct_box(ctx, entry, Some(&f.type_name));
                     b.mov(home, boxed);
                     b.goto(done_b);
                     b.switch_to(done_b);
                     return Ok(home);
                 }
                 return Ok(dst);
-            }
-            // TEMP-ODBG: field offset audit.
-            if std::env::var("RUBYC_ODBG").is_ok()
-                && (name == "encoderFallback"
-                    || name == "decoderFallback"
-                    || name == "_isThrowException"
-                    || name == "_codePage")
-            {
-                eprintln!(
-                    "[rubyc] TEMP-ODBG field {name} type={type_name} off={}",
-                    field.map(|f| f.offset_slots as i64 * 8).unwrap_or(-1)
-                );
-            }
-            // TEMP-GETDBG2: member resolution audit.
-            if std::env::var("RUBYC_GETDBG").is_ok() && name == "P" {
-                eprintln!(
-                    "[rubyc] TEMP-GETDBG2 member={name} type={type_name} entry={} has_field={} has_prop={}",
-                    info.key.path,
-                    info.field(name).is_some(),
-                    info.property(name).is_some()
-                );
             }
             let base = eval(object, b, ctx)?;
             // Struct-typed receiver (e.g. embedded `_separated` with
@@ -7531,9 +9613,10 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 .properties
                 .iter()
                 .any(|p| p.name == *name && p.is_abstract);
+            let strict_sub = strict_subclass_has_explicit(ctx, info, name);
             let strict_override = has_prop
                 && (upward_explicit || field.is_some() || abstract_prop)
-                && strict_subclass_has_explicit(ctx, info, name);
+                && strict_sub;
             // Static properties never dispatch virtually: there is no
             // receiver instance (the class-as-value evaluates to the
             // null placeholder), so subclass overrides can never
@@ -7547,50 +9630,8 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 info.property(name).is_some_and(|p| p.is_static);
             let prop_explicit =
                 field.is_some() && (upward_explicit || strict_override);
-            // TEMP-VIRDBG8: read-path decision audit. Removed before close.
-            if std::env::var("RUBYC_VIRDBG8").is_ok()
-                && (name == "CanWrite" || name == "Capacity" || name == "Flag")
-            {
-                eprintln!(
-                    "[rubyc] TEMP-VIRDBG8 member={name} type={type_name} entry={} field={} up={} strict={} gate={} in={}.{}",
-                    info.key.path,
-                    field.is_some(),
-                    upward_explicit,
-                    strict_override,
-                    prop_explicit,
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default(),
-                );
-            }
             match field {
                 Some(f) if !prop_explicit => {
-                    // TEMP-VIRDBG8 result. Removed before close.
-                    if std::env::var("RUBYC_VIRDBG8").is_ok()
-                        && (name == "CanWrite" || name == "Capacity" || name == "Flag")
-                    {
-                        eprintln!("[rubyc] TEMP-VIRDBG8 {name} -> FIELD");
-                    }
-                    // TEMP-SPANDBG: field resolution.
-                    if std::env::var("RUBYC_SPANDBG").is_ok() {
-                        eprintln!(
-                            "[rubyc] TEMP-SPANDBG-F member={} type={} entry={} off={} static={}",
-                            name, type_name, info.key.path, f.offset_slots, f.is_static
-                        );
-                    }
-                    // TEMP-NULLBASE: flag field reads off a
-                    // compile-time-null base (guaranteed runtime
-                    // fault). Removed before close.
-                    if std::env::var("RUBYC_NULLBASE").is_ok()
-                        && b.const_vals.get(&base.0) == Some(&0)
-                    {
-                        eprintln!(
-                            "[rubyc] TEMP-NULLBASE member={name} type={type_name} entry={} off={} in {}.{}",
-                            info.key.path,
-                            f.offset_slots,
-                            ctx.current_class,
-                            ctx.current_method.clone().unwrap_or_default()
-                        );
-                    }
                     b.push_raw(Instr::LoadField {
                         dst,
                         base,
@@ -7615,16 +9656,9 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     // vreg. Block getters with real statements stay
                     // placeholders (future work); auto-properties have
                     // no body at all.
-                    // TEMP-NOGETTER (diagnostic): disable inlining to
-                    // bisect the UTF8NoBOM trap. Removed before close.
-                    let do_inline = std::env::var("RUBYC_NOGETTER").is_err();
-                    // TEMP-VIRTDISABLE: force static-inline when a static
-                    // explicit body exists (skip virtual dispatch).
-                    // Diagnostic only (breaks overriding subclass
-                    // instances!) to confirm virtual-miss vs body.
-                    // Removed before close.
-                    let no_virtual = std::env::var("RUBYC_NOVIRTUAL").is_ok();
-                    if do_inline {
+                    // Property accessors inline whenever a body exists; auto-
+                    // properties have no body at all.
+                    {
                         // A strict-subclass override wins over any base
                         // body (virtual dispatch; the chain includes the
                         // base arm for base-typed instances). Without
@@ -7632,23 +9666,11 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         // either, placeholder zeros below. Skipping the
                         // inapplicable attempt keeps CoreLib-sized
                         // worlds fast (each attempt walks the world).
-                        if strict_override && !no_virtual && !is_static_prop {
+                        if strict_override && !is_static_prop {
                             if let Some(val) = eval_virtual_getter(
                                 b, ctx, info, name, Some(object),
                             )? {
-                                // TEMP-VIRDBG8 result. Removed before close.
-                                if std::env::var("RUBYC_VIRDBG8").is_ok()
-                                    && (name == "CanWrite" || name == "Capacity" || name == "Flag")
-                                {
-                                    eprintln!("[rubyc] TEMP-VIRDBG8 {name} -> VIRTUAL in={}", ctx.current_method.clone().unwrap_or_default());
-                                }
                                 return Ok(val);
-                            }
-                            // TEMP-VIRDBG8 result. Removed before close.
-                            if std::env::var("RUBYC_VIRDBG8").is_ok()
-                                && (name == "CanWrite" || name == "Capacity" || name == "Flag")
-                            {
-                                eprintln!("[rubyc] TEMP-VIRDBG8 {name} -> virtual-miss in={}", ctx.current_method.clone().unwrap_or_default());
                             }
                         } else if let Some(val) = eval_property_getter(
                             b,
@@ -7658,29 +9680,21 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                             name,
                             Some(object),
                         )? {
-                            // TEMP-VIRDBG8 result. Removed before close.
-                            if std::env::var("RUBYC_VIRDBG8").is_ok()
-                                && (name == "CanWrite" || name == "Capacity" || name == "Flag")
-                            {
-                                eprintln!("[rubyc] TEMP-VIRDBG8 {name} -> STATIC in={}", ctx.current_method.clone().unwrap_or_default());
-                            }
                             return Ok(val);
                         }
                     }
-                    // Expression-bodied property or other accessor-backed
-                    // member — return 0 as a placeholder. (Must return
-                    // the const itself: the pre-allocated `dst` was
-                    // never defined on this path, and returning it
-                    // leaks an undefined vreg into downstream uses —
-                    // e.g. a comparison reading garbage and throwing
-                    // or crashing.)
-                    // TEMP-VIRDBG8 result. Removed before close.
-                    if std::env::var("RUBYC_VIRDBG8").is_ok()
-                        && (name == "CanWrite" || name == "Capacity" || name == "Flag")
-                    {
-                        eprintln!("[rubyc] TEMP-VIRDBG8 {name} -> PLACEHOLDER in={}", ctx.current_method.clone().unwrap_or_default());
-                    }
-                    return Ok(b.const_i64(0));
+                    // A property with no inlineable getter (abstract, or an
+                    // accessor whose body has not been modelled) has no
+                    // value to read. Returning 0 here made the read
+                    // indistinguishable from a property holding
+                    // default(T) — the case where the pre-allocated
+                    // `dst` was never defined also used to leak an
+                    // undefined vreg downstream.
+                    return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                        "rubyc.native.ir.lower_expr.no_property_body",
+                        type_name.clone(),
+                        name.to_string()
+                    )));
                 }
             }
             Ok(dst)
@@ -7688,6 +9702,86 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
         Expr::MethodCall {
             object, name, args, ..
         } => {
+            // `5.ToString()` / `true.ToString()`: primitive values are
+            // unboxed, so there is no ToString to dispatch to and the
+            // call used to jump through a raw integer as a vtable row.
+            if name == "ToString"
+                && args.is_empty()
+                && let Ok(t) = static_type_of(object, b, ctx)
+                && is_primitive_spelling(&t)
+                && !is_string_type(&t)
+            {
+                let v = eval(object, b, ctx)?;
+                let Some(s) = b.value_to_string(v, &t) else {
+                    return Err(LowerError::UnsupportedConstruct(format!(
+                        "`{t}.ToString()` needs value-to-string conversion, which is not implemented"
+                    )));
+                };
+                return Ok(s);
+            }
+            // `E?.Invoke(args)` on an EVENT: walk the subscriber list and
+            // call every delegate. The null-conditional around it already
+            // tests `E != null`; the arguments are evaluated ONCE and
+            // passed to each handler (C# semantics).
+            if name == "Invoke"
+                && let Expr::Ident { name: ev, .. } = object.as_ref()
+                && let Some(field) = super::body::event_field(ctx, ev)
+            {
+                let off = (field.offset_slots * 8) as u32;
+                let this = b.this_vreg();
+                let argv = eval_args(args, b, ctx)?;
+                let cur = b.fresh();
+                b.push_raw(Instr::LoadField { dst: cur, base: this, off });
+                let loop_b = b.make_block();
+                let body_b = b.make_block();
+                let cont_b = b.make_block();
+                let done_b = b.make_block();
+                b.goto(loop_b);
+                b.switch_to(loop_b);
+                let zero = b.const_i64(0);
+                let none = b.fresh();
+                b.push_raw(Instr::Cmp { dst: none, op: CmpOp::Eq, a: cur, b: zero });
+                b.terminate(Terminator::Branch {
+                    cond: Some(none),
+                    if_true: done_b,
+                    if_false: body_b,
+                });
+                b.switch_to(body_b);
+                let d = b.fresh();
+                b.push_raw(Instr::LoadField { dst: d, base: cur, off: 8 });
+                let target = b.fresh();
+                b.push_raw(Instr::LoadField { dst: target, base: d, off: 0 });
+                let kind = b.fresh();
+                b.push_raw(Instr::LoadField { dst: kind, base: d, off: 8 });
+                let closure_b = b.make_block();
+                let plain_b = b.make_block();
+                b.terminate(Terminator::Branch {
+                    cond: Some(kind),
+                    if_true: closure_b,
+                    if_false: plain_b,
+                });
+                b.switch_to(closure_b);
+                {
+                    let mut call_args = vec![d];
+                    call_args.extend(argv.iter().copied());
+                    let dst = b.fresh();
+                    b.push_raw(Instr::CallFnAddr { dst, target, args: call_args });
+                    b.goto(cont_b);
+                }
+                b.switch_to(plain_b);
+                {
+                    let dst = b.fresh();
+                    b.push_raw(Instr::CallFnAddr { dst, target, args: argv.clone() });
+                    b.goto(cont_b);
+                }
+                b.switch_to(cont_b);
+                let nx = b.fresh();
+                b.push_raw(Instr::LoadField { dst: nx, base: cur, off: 0 });
+                b.mov(cur, nx);
+                b.goto(loop_b);
+                b.switch_to(done_b);
+                return Ok(b.const_i64(0));
+            }
             // Strip generic-args suffix (e.g. `Convert<T3, TResult>` ->
             // `Convert`) — the parser embeds `<...>` in the name.
             // The arity still constrains overload ranking below
@@ -7703,18 +9797,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 Some(_) => explicit_type_args(name),
                 None => Vec::new(),
             };
-            // TEMP-ALLOCDBG3: trace AllocateTypeAssociatedMemory calls.
-            // Removed before close.
-            if name.contains("AllocateTypeAssociatedMemory") {
-                eprintln!("[rubyc] TEMP-ALLOCDBG3 reached MethodCall arm");
-            }
-            // TEMP-ALLOCDBG4: gate values. Removed before close.
-            if name == "AllocateTypeAssociatedMemory" {
-                // is_static_receiver/type_name/selected computed below;
-                // re-derive cheaply here for the audit.
-                let tn = static_type_of(object, b, ctx).unwrap_or_else(|_| "<err>".to_owned());
-                eprintln!("[rubyc] TEMP-ALLOCDBG4 type_name={tn}");
-            }
             let name = match name.find('<') {
                 Some(pos) => &name[..pos],
                 None => name.as_str(),
@@ -7735,33 +9817,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             } else {
                 type_name
             };
-            // TEMP-NOOPDIAG: neutralize fallback setup to bisect the
-            // UTF8NoBOM trap. Removed before close.
-            if std::env::var("RUBYC_NOOP_FB").is_ok()
-                && (name == "SetDefaultFallbacks" || name == "ThrowIfNegative")
-            {
-                let _ = eval(object, b, ctx)?;
-                let _ = eval_args(args, b, ctx)?;
-                return Ok(b.const_i64(0));
-            }
-            // TEMP-HOOKDBG: audit interception firing.
-            if std::env::var("RUBYC_HOOKDBG").is_ok()
-                && matches!(
-                    name,
-                    "Create"
-                        | "Slice"
-                        | "TryGetSingleRange"
-                        | "CanUseUniqueLowNibbleSearch"
-                        | "CanUsePackedIndexOf"
-                        | "ShouldUseProbabilisticMap"
-                        | "AsSpan"
-                )
-            {
-                eprintln!("[rubyc] TEMP-HOOKDBG call {name} recv={type_name} nargs={}", args.len());
-            }
-            // `Slice` body needs reference arithmetic our ref model
-            // cannot do, so `Slice(start[, length])` constructs
-            // `{ref + start*w, len}` directly.
             if name == "Slice"
                 && let Some((_, inner)) = span_view(&type_name)
                 && (args.len() == 1 || args.len() == 2)
@@ -7846,41 +9901,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     return eval(&empty, b, ctx);
                 }
             }
-            // `RuntimeHelpers.AllocateTypeAssociatedMemory`:
-            // native malloc tied to a type lifetime (used for
-            // COM vftbls). The managed wrapper rejects
-            // placeholders (`type is not RuntimeType` → throw;
-            // the throw machinery then faults) and the QCall
-            // yields zero (null write on first store). Answer
-            // with heap memory directly: type-associated
-            // memory lives forever (never unloaded in a static
-            // exe), matching our never-freed heap exactly.
-            // Placed early (before overload resolution, which
-            // misses this method): the shape alone identifies it.
-            // Alignment: bump allocator is word-aligned (vftbl
-            // needs 8); the alignment arg (3-arg form) is
-            // accepted and ignored (documented).
-            if name == "AllocateTypeAssociatedMemory"
-                && base_type_name(&type_name) == "RuntimeHelpers"
-                && (args.len() == 2 || args.len() == 3)
-            {
-                // TEMP-ALLOCDBG2. Removed before close.
-                eprintln!("[rubyc] TEMP-ALLOCDBG2 AllocateTypeAssociatedMemory intercepted (early)");
-                // Side effects first (usually pure
-                // `typeof`/constants), value from the size arg
-                // (`args[1]` in both forms) exactly once.
-                let _ = eval(&args[0], b, ctx)?;
-                if args.len() == 3 {
-                    let _ = eval(&args[2], b, ctx)?;
-                }
-                let size_v = eval(&args[1], b, ctx)?;
-                let dst = b.fresh();
-                b.push_raw(Instr::AllocDyn {
-                    dst,
-                    bytes: size_v,
-                });
-                return Ok(dst);
-            }
             // `obj.GetType()` on non-array receivers: `Object.GetType`
             // is extern (InternalCall, no managed body), so it has no
             // vtable implementation — virtual dispatch reads a MAX hole
@@ -7896,14 +9916,23 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             if name == "GetType" && args.is_empty() {
                 let rt = static_type_of(object, b, ctx)
                     .unwrap_or_else(|_| "object".to_owned());
-                let tr = rt.trim();
-                if !tr.ends_with("[]") && base_type_name(tr) != "Array" {
+                let tr = rt.trim().to_owned();
+                // An array's runtime type IS its static type (`int[]`).
+                if let Some(elem) = array_elem_ty(&tr) {
                     let _ = eval(object, b, ctx)?;
-                    let targ = Expr::Ident {
-                        name: tr.to_owned(),
-                        span: crate::models::Span::new(0, 0),
-                    };
-                    return call("typeof", std::slice::from_ref(&targ), b, ctx);
+                    return b.type_token(&format!("{elem}[]"), ctx);
+                }
+                if base_type_name(&tr) == "Array" {
+                    // The element type of an `Array`-typed receiver is
+                    // not in the static type; the answer is the array
+                    // type itself (a real descriptor, not a row
+                    // address pretending to be a Type).
+                    let _ = eval(object, b, ctx)?;
+                    return b.type_token("System.Array", ctx);
+                }
+                if !tr.ends_with("[]") {
+                    let recv = eval(object, b, ctx)?;
+                    return runtime_type_of(b, recv, &tr, ctx);
                 }
             }
             // `arr.GetType()` on arrays (and `Array`-typed receivers):
@@ -7936,20 +9965,11 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // is always safe — callers fall through to correct
             // general paths (`AnyN`, `Ascii`, `Bitmap` searchers).
             // Names are unique to the search machinery.
-            // Search-vector construction (`SearchValues.Create`):
-            // route to an empty result. The real factory needs
-            // generic math, comparers, and SIMD paths our backend
-            // cannot do yet; an empty searcher is a safe placeholder
-            // (matches nowhere) until span search is implemented.
-            // Callers that depend on real matches must be revisited
-            // then. Names are unique to the search machinery.
-            if name == "Create"
-                && base_type_name(&type_name).contains("SearchValues")
-            {
-                let _ = eval(object, b, ctx)?;
-                let _ = eval_args(args, b, ctx)?;
-                return Ok(b.const_i64(0));
-            }
+            // `SearchValues.Create` has no fold: the real factory
+            // decides. Handing back an empty searcher (a value that
+            // matches nothing) changed program RESULTS, which no
+            // capability fold may do; where the body needs machinery
+            // this compiler does not have yet, the build says so.
             if matches!(
                 name,
                 "TryGetSingleRange"
@@ -8034,7 +10054,7 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     if is_method_group(a, b, ctx) {
                         return "method-group".to_owned();
                     }
-                    static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned())
+                    overload_arg_type(a, b, ctx)
                 })
                 .collect();
 
@@ -8048,19 +10068,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // `Nat`), while inferred receiver types are qualified
             // (`app.Nat`): try both spellings (same mismatch that broke
             // operator dispatch; a miss silently zeroes P/Invoke results).
-            // TEMP-IMPORTDBG. Removed before close.
-            if std::env::var("RUBYC_IMPORTDBG").is_ok() {
-                let keys: Vec<String> = ctx
-                    .import_index
-                    .keys()
-                    .map(|(c, m)| format!("{c}.{m}"))
-                    .collect();
-                eprintln!(
-                    "[rubyc] TEMP-IMPORTDBG recv={type_name} name={name} indexkeys={keys:?} in {}.{}",
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default()
-                );
-            }
             let import_key = ctx
                 .import_index
                 .get(&(type_name.clone(), name.to_string()))
@@ -8225,39 +10232,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             );
             if let Some(mi) = selected {
                 selected_declaring = mi.declaring_class.clone();
-                // TEMP-SELDIAG: audit overload selection for
-                // StartsWith misresolution. Removed before close.
-                // TEMP-SWDIAG2: audit Write overload (SafeHandle vs
-                // IntPtr). Removed before close.
-                // TEMP-GBDIAG2: audit GetBytes qualified selection
-                // (encoder path misroutes to an array overload).
-                // Removed before close.
-                if std::env::var("RUBYC_SELDIAG").is_ok() && (name == "StartsWith" || name == "Write" || name == "GetBytes") {
-                    eprintln!(
-                        "[rubyc] TEMP-SELDIAG recv={type_name} args={arg_types:?} entries={:?} selected={}.{}({:?}) static_recv={is_static_receiver} in {}.{}",
-                        entries.iter().map(|e| e.key.path.clone()).collect::<Vec<_>>(),
-                        mi.declaring_class,
-                        mi.name,
-                        mi.param_types,
-                        ctx.current_class,
-                        ctx.current_method.clone().unwrap_or_default()
-                    );
-                }
-                // TEMP-SELDIAG2: audit GetBytesWithFallback overload
-                // choice (stub vs with-encoder). Removed before close.
-                if std::env::var("RUBYC_SELDIAG").is_ok() && name == "GetBytesWithFallback" {
-                    eprintln!(
-                        "[rubyc] TEMP-SELDIAG2 recv={type_name} args={arg_types:?} selected={}.{}({:?}) in {}.{}",
-                        mi.declaring_class,
-                        mi.name,
-                        mi.param_types,
-                        ctx.current_class,
-                        ctx.current_method.clone().unwrap_or_default()
-                    );
-                }
-                // Conditional winner in a mixed set: the resolved
-                // overload itself is omitted when its symbol is
-                // undefined (C# checks the winner, not the set).
                 if mi
                     .conditional_symbol
                     .as_ref()
@@ -8266,6 +10240,15 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     return Ok(b.const_i64(0));
                 }
             }
+            // Named arguments: rewrite once, here, into parameter order.
+            // Every path below (virtual dispatch, direct calls, byref
+            // boxing, span coercion, SafeHandle marshaling) then sees the
+            // positional list it already expects.
+            let named_args = match selected {
+                Some(mi) => positional_args(args, mi)?,
+                None => None,
+            };
+            let args: &[Expr] = named_args.as_deref().unwrap_or(args);
             // Nullable-annotated receivers (`string?`) resolve members
             // through the base type (see `nullable_base`); without
             // this the gate below misses and the call falls to
@@ -8396,20 +10379,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                             } else {
                                 String::new()
                             };
-                            // TEMP-ASDIAG: audit AsSpan span construction.
-                            // Removed before close.
-                            if std::env::var("RUBYC_ASDIAG").is_ok() {
-                                let dbg_path = span_class_path(ctx, &target);
-                                let dbg_view = dbg_path
-                                    .as_ref()
-                                    .and_then(|p| span_view(p).map(|_| true));
-                                eprintln!(
-                                    "[rubyc] TEMP-ASDIAG recvtype={type_name} nargs={} target={target} path={dbg_path:?} view={dbg_view:?} in {}.{}",
-                                    args.len(),
-                                    ctx.current_class,
-                                    ctx.current_method.clone().unwrap_or_default()
-                                );
-                            }
                             if !target.is_empty()
                                 && let Some(path) = span_class_path(ctx, &target)
                                 // Inner width comes from the TARGET
@@ -8501,8 +10470,8 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                             dump.push_str(&format!(" argexprs={args:?}"));
                             eprintln!("{dump}");
                         }
-                        return Err(LowerError::UnsupportedConstruct(crate::tf!(
-                            "rubyc.native.ir.lower_expr.no_member",
+return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                        "rubyc.native.ir.lower_expr.no_member",
                             type_name.clone(),
                             name.to_string()
                         )));
@@ -8543,15 +10512,24 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         fill_default_args(&mut argv, mi, b);
                         coerce_span_args(b, ctx, &mut argv, &arg_types, &mi.param_types)?;
                         marshal_safehandle_args(b, ctx, &mut argv, &arg_types, &mi.param_types, !mi.has_body)?;
-                        // Slot from the selected declaring entry
-                        // (reconciled base-first, so it agrees with
-                        // the receiver's row for this signature).
+                        // Slot from the RECEIVER's entry, not the
+                        // declaring one: the declaring entry's slot does
+                        // NOT agree with the receiver's row for this
+                        // signature once a type has several bases — each
+                        // base numbers its own methods from 0, so
+                        // `MyClass2.Multiply` is slot 1 in MyClass2 and
+                        // slot 3 in a `MyClass3 : MyClass1, MyClass2` row.
+                        // Dispatching on the declaring slot ran whichever
+                        // method held that slot in the first base
+                        // (Multiply ran Divide).
                         let slot = ctx
                             .table
-                            .classes
-                            .iter()
-                            .find(|c| {
-                                c.name == mi.declaring_class || c.key.path == mi.declaring_class
+                            .class(&type_name)
+                            .or_else(|| {
+                                ctx.table.classes.iter().find(|c| {
+                                    c.name == mi.declaring_class
+                                        || c.key.path == mi.declaring_class
+                                })
                             })
                             .and_then(|e| {
                                 e.methods.iter().find(|m| {
@@ -8559,9 +10537,21 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                                 })
                             })
                             .map(|m| m.vtable_slot)
-                            .unwrap_or_else(|| {
-                                canonical_slot(ctx.table, None, &type_name, name)
-                            });
+                            // The ARGUMENT spellings identify the interface
+                // overload: an interface receiver has no entry of its
+                // own, so selection leaves `selected` empty and the
+                // slot must be keyed on what the call passes (an empty
+                // list matched no overload and fell back to a guessed
+                // class slot, sending both `M(int)` and `M(string)` to
+                // the first one).
+                .or(canonical_slot(ctx.table, None, &type_name, name, &[]))
+                            .ok_or_else(|| {
+                                LowerError::UnsupportedConstruct(crate::tf!(
+                                    "rubyc.native.ir.lower_call.no_virtual_slot",
+                                    type_name.clone(),
+                                    name.to_string()
+                                ))
+                            })?;
                         let dst = b.fresh();
                         b.push_raw(Instr::CallVirt {
                             dst,
@@ -8663,13 +10653,19 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                                 b: rhs,
                             }));
                         }
+                        // An unresolved receiver (open generic parameter, uninferred
+                        // temporary, discard) has no entry to resolve a
+                        // member against: evaluate for side effects and
+                        // yield the default. A call on a receiver that
+                        // DID resolve and lacks the method reports
+                        // `no_member` below.
                         let _ = eval(object, b, ctx)?;
                         let _ = eval_args(args, b, ctx)?;
                         return Ok(b.const_i64(0));
                     };
                     if !interface_has_method(ctx.table, &type_name, name) {
-                        return Err(LowerError::UnsupportedConstruct(crate::tf!(
-                            "rubyc.native.ir.lower_expr.no_member",
+return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                        "rubyc.native.ir.lower_expr.no_member",
                             type_name.clone(),
                             name.to_string()
                         )));
@@ -8806,206 +10802,12 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                             });
                             return Ok(dst);
                         }
-                        return Err(LowerError::UnsupportedConstruct(crate::tf!(
-                            "rubyc.native.ir.lower_expr.no_member",
+return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                        "rubyc.native.ir.lower_expr.no_member",
                             type_name.clone(),
                             name.to_string()
                         )));
                     };
-                    // `HashCode.GenerateGlobalSeed()`: fills a stack
-                    // local via `&result` (address-of) + native random
-                    // bytes. Address-of erases to a value in our ref
-                    // model, so the native write would land on a
-                    // garbage address (arbitrary memory corruption).
-                    // Return a fixed seed instead: static images are
-                    // deterministic, which also keeps `--optimize`
-                    // parity exact. Only the DOS-diffusion seed is
-                    // affected, never hash correctness.
-                    if base_type_name(&selected_declaring) == "HashCode"
-                        && name == "GenerateGlobalSeed"
-                        && argv.is_empty()
-                    {
-                        return Ok(b.const_i64(0x9E37_79B9));
-                    }
-                    // `Marvin.GenerateSeed()`: same shape (fills a
-                    // stack local via `&seed` + native random bytes
-                    // for the string-hash DOS-diffusion seed).
-                    // Address-of erases to a value, so the native
-                    // write would land on address zero (the segfault
-                    // that killed console startup). Fixed 64-bit
-                    // golden-ratio seed, same determinism rationale
-                    // as above; hash correctness unaffected.
-                    if base_type_name(&selected_declaring) == "Marvin"
-                        && name == "GenerateSeed"
-                        && argv.is_empty()
-                    {
-                        return Ok(b.const_i64(0x9E3779B97F4A7C15u64 as i64));
-                    }
-                    // `ComparerHelpers.CreateDefaultEqualityComparer`:
-                    // picks a comparer via runtime type queries
-                    // (`type == typeof(string)`, `MakeGenericType`,
-                    // `Activator.CreateInstance`) that all degrade on
-                    // placeholders (identity false, generic construction
-                    // null) — ending in a null `Default` that faults on
-                    // first use. Answer the universal comparer directly
-                    // (see `new_universal_comparer`). The specialized
-                    // (string/enum/nullable) comparers are future work
-                    // alongside real runtime types.
-                    if base_type_name(&selected_declaring) == "ComparerHelpers"
-                        && name == "CreateDefaultEqualityComparer"
-                        && argv.len() == 1
-                    {
-                        let _ = eval_args(args, b, ctx)?;
-                        return new_universal_comparer(b, ctx);
-                    }
-                    // `ComparerHelpers.CreateDefaultComparer`: same
-                    // disease (generic construction null via
-                    // `MakeGenericType`+`Activator`) for `Comparer<T>`
-                    // (ordering). Answer `GenericComparer<object>`
-                    // directly: `Compare` delegates to the values'
-                    // `IComparable.CompareTo` (null-safe branches),
-                    // correct for comparable values; non-comparable
-                    // values fault on use (same as a null `Default`
-                    // would, but later and rarer). Unrandomized and
-                    // deterministic like above.
-                    if base_type_name(&selected_declaring) == "ComparerHelpers"
-                        && name == "CreateDefaultComparer"
-                        && argv.len() == 1
-                    {
-                        let _ = eval_args(args, b, ctx)?;
-                        let new_cmp = Expr::New {
-                            class_name: "GenericComparer".to_owned(),
-                            args: vec![],
-                            init: Vec::new(),
-                            span: crate::models::Span::new(0, 0),
-                        };
-                        return eval(&new_cmp, b, ctx);
-                    }
-                    // `RuntimeHelpers.GetMethodTable(obj)`: a JIT
-                    // intrinsic whose managed body is a self-call
-                    // placeholder (lowered literally, it recurses
-                    // forever). Our object layout keeps the vtable
-                    // pointer at +0, which IS the method table, so
-                    // lower to a field load. Downstream `MethodTable*`
-                    // dereferences are a separate gap (CoreCLR struct
-                    // layout); callers that only pass the pointer
-                    // through (e.g. `GetType()` plumbing) proceed.
-                    if base_type_name(&selected_declaring) == "RuntimeHelpers"
-                        && name == "GetMethodTable"
-                        && argv.len() == 1
-                    {
-                        // TEMP-MTDBG. Removed before close.
-                        if std::env::var("RUBYC_MTDBG").is_ok() {
-                            eprintln!(
-                                "[rubyc] TEMP-MTDBG arg0={:?} in {}.{}",
-                                arg_types.first(),
-                                ctx.current_class,
-                                ctx.current_method.clone().unwrap_or_default()
-                            );
-                        }
-                        // Arrays carry no vtable word (length lives at
-                        // +0): loading it as a method table poisons
-                        // downstream `MethodTable*` dereferences (the
-                        // rank fold loads `[length]` and faults on
-                        // length-3 arrays). Hand arrays the shared
-                        // `System.Array` row token instead (mirrors the
-                        // `GetType` fold); same-kind `AreSameType`
-                        // comparisons stay consistent.
-                        let t0 = arg_types.first().cloned().unwrap_or_default();
-                        let tr = t0.trim();
-                        if tr.ends_with("[]") || base_type_name(tr) == "Array" {
-                            let dst = b.fresh();
-                            b.push_raw(Instr::VTableAddr {
-                                dst,
-                                row: vtable_row_for(ctx, "Array", "System.Array"),
-                            });
-                            return Ok(dst);
-                        }
-                        let dst = b.fresh();
-                        b.push_raw(Instr::LoadField { dst, base: argv[0], off: 0 });
-                        return Ok(dst);
-                    }
-                    // `RuntimeHelpers.IsReferenceOrContainsReferences<T>()`:
-                    // a JIT intrinsic whose managed body is a self-call
-                    // placeholder (lowered literally, it recurses
-                    // forever → stack overflow inside static init, e.g.
-                    // `HtmlEntities` init). Fold to a compile-time
-                    // constant from the type argument (conservative
-                    // true when the type is unknown — callers then take
-                    // the careful path). An OPEN type variable (`T`
-                    // inside `Read<T>`'s shared body — generic methods
-                    // do not monomorphize, so the check cannot decide
-                    // per-instantiation) folds FALSE: every reaching
-                    // instantiation is blittable in practice
-                    // (`ulong`, `Guid`, ...), and folding true made
-                    // every generic `Read`/`AsBytes` spuriously throw
-                    // (`BinaryPrimitives` during `HtmlEntities` init).
-                    if base_type_name(&selected_declaring) == "RuntimeHelpers"
-                        && name == "IsReferenceOrContainsReferences"
-                        && argv.is_empty()
-                    {
-                        let t = explicit_targs.first().map(String::as_str).unwrap_or("object");
-                        let r = !ctx.is_type_var(t) && type_contains_refs(ctx.table, t);
-                        return Ok(b.const_i64(r as i64));
-                    }
-                    // Hardware-intrinsic feature gates (`*.IsSupported`,
-                    // `*.IsHardwareAccelerated`, no args): always false.
-                    // This backend has no SIMD/intrinsic support and no
-                    // CPUID plumbing — the real getters are either
-                    // self-recursive (`get => IsSupported`, which would
-                    // recurse forever) or CPUID reads, and unlowered
-                    // intrinsic bodies yield zeros. A wrong-true takes
-                    // vectorized paths with garbage results (`Log2`
-                    // returned 0 for every input via a dead
-                    // `BitScanReverse`, breaking all bucket sizing and
-                    // faulting pooled paths). False selects the plain
-                    // managed scalar fallbacks, which are correct.
-                    // Configuration-grade, like no-ICU/no-ETW: if real
-                    // intrinsics ever land, delete this fold. A
-                    // legitimate true-gate would surface as a behavior
-                    // bug and can be allowlisted then (none known).
-                    if (name == "IsSupported" || name == "IsHardwareAccelerated")
-                        && args.is_empty()
-                    {
-                        return Ok(b.const_i64(0));
-                    }
-                    // `RuntimeHelpers.IsBitwiseEquatable<T>()`: a JIT
-                    // intrinsic whose managed body is `throw new
-                    // InvalidOperationException()` (the EE replaces it;
-                    // lowered literally it detonates at runtime — the
-                    // segfault that killed console startup inside
-                    // `IndexOfAny`, faulting through the throw
-                    // machinery). Fold to a compile-time constant:
-                    // true for closed primitive integral/char/bool
-                    // (bitwise equality is exact there); false for
-                    // open variables (callers take the slow comparer
-                    // path, which is correct) and for float/double
-                    // (conservative — NaN semantics stay on the slow
-                    // path too). Unknown spellings are false, never
-                    // true (a wrong true would miscompare).
-                    if base_type_name(&selected_declaring) == "RuntimeHelpers"
-                        && name == "IsBitwiseEquatable"
-                        && argv.is_empty()
-                    {
-                        let r = explicit_targs.first().is_some_and(|t| {
-                            matches!(
-                                canonical_primitive(
-                                    t.trim()
-                                        .rsplit('.')
-                                        .next()
-                                        .unwrap_or(t.trim())
-                                        .trim_end_matches(['?', '*', '&'])
-                                )
-                                .as_str(),
-                                "Boolean" | "Byte" | "SByte" | "Char" | "Int16" | "UInt16"
-                                    | "Int32" | "UInt32" | "Int64" | "UInt64" | "IntPtr"
-                                    | "UIntPtr" | "bool" | "byte" | "sbyte" | "char"
-                                    | "short" | "ushort" | "int" | "uint" | "long"
-                                    | "ulong" | "nint" | "nuint"
-                            )
-                        });
-                        return Ok(b.const_i64(r as i64));
-                    }
                     // `BitOperations.Log2(v)` (1 arg, any int width):
                     // floor log2 (`0`→`0`), via halving (division, never
                     // shifts — our `Shr` is arithmetic and would stick
@@ -9158,30 +10960,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         b.switch_to(join_b);
                         return Ok(out);
                     }
-                    // `Thread.FastPollGC()`: JIT intrinsic (GC poll
-                    // hook) whose managed body is a self-call
-                    // placeholder — lowered literally, it recurses
-                    // forever (stack overflow inside static init).
-                    // No GC exists here to poll; erase to no-op.
-                    if base_type_name(&selected_declaring) == "Thread"
-                        && name == "FastPollGC"
-                        && argv.is_empty()
-                    {
-                        return Ok(b.const_i64(0));
-                    }
-                    // `Interlocked.MemoryBarrier()`: JIT intrinsic
-                    // whose managed body is a self-call placeholder
-                    // (`=> MemoryBarrier()`, intrinsified by the JIT
-                    // and never executed) — lowered literally, it
-                    // recurses forever (210K frames → stack guard
-                    // inside `DateTimeFormat` init). No threads exist
-                    // here to fence; erase to no-op.
-                    if base_type_name(&selected_declaring) == "Interlocked"
-                        && name == "MemoryBarrier"
-                        && argv.is_empty()
-                    {
-                        return Ok(b.const_i64(0));
-                    }
                     // `Unsafe.AddByteOffset(ref value, byteOffset)`:
                     // raw address arithmetic. `ref` erases at parse,
                     // so the first argument already holds the address
@@ -9297,16 +11075,15 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     }
                     // `Buffer.Memmove<T>(ref dst, ref src, len)` (len in
                     // ELEMENTS): fold to a byte copy of `len*width`.
-                    // Argument ORDER is unreliable — C# named arguments
-                    // arrive in source order (`elementCount:,
-                    // destination:, source:`), not parameter order —
-                    // so the length is identified by TYPE (the unique
+                    // Named arguments are rewritten into parameter
+                    // order before this point (`positional_args`), but
+                    // the length is still identified by TYPE (the unique
                     // `uint`/`nuint`/`int`-typed argument; dst/src type
-                    // as their (ref-erased) element). The rest keep
-                    // relative order as dst, src. All-same-type calls
-                    // fall back to positional. (Proper named-argument
-                    // reordering is future work; this covers the
-                    // framework shapes.) Same overlap limitation as
+                    // as their (ref-erased) element), which keeps the
+                    // fold correct for overload spellings the call site
+                    // cannot match. The rest keep relative order as
+                    // dst, src. All-same-type calls fall back to
+                    // positional. Same overlap limitation as
                     // `SpanHelpers.Memmove` above.
                     if base_type_name(&selected_declaring) == "Buffer"
                         && name == "Memmove"
@@ -9429,54 +11206,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         });
                         return Ok(argv[0]);
                     }
-                    // `String.FastAllocateString(length)` (and the
-                    // 2-arg `(MethodTable*, length)` extern it wraps):
-                    // JIT/internal-call placeholders with no managed
-                    // body — lowered literally they yield zero, so
-                    // every `Substring`/`Concat` via this path produced
-                    // null. Allocate a real string: length header at
-                    // +0, refcount at +8, `length` UTF-16 chars of
-                    // uninitialized data at +16 (callers `Memmove`
-                    // exactly the content in). The `MethodTable*`
-                    // argument (vtable layout we do not model) is
-                    // ignored.
-                    if base_type_name(&selected_declaring) == "String"
-                        && name == "FastAllocateString"
-                        && (argv.len() == 1 || argv.len() == 2)
-                    {
-                        let len = argv[argv.len() - 1];
-                        let two = b.const_i64(2);
-                        let payload = b.emit(Instr::Bin {
-                            dst: VReg(0),
-                            op: IrBinOp::Mul,
-                            a: len,
-                            b: two,
-                        });
-                        let sixteen = b.const_i64(16);
-                        let total = b.emit(Instr::Bin {
-                            dst: VReg(0),
-                            op: IrBinOp::Add,
-                            a: payload,
-                            b: sixteen,
-                        });
-                        let obj = b.fresh();
-                        b.push_raw(Instr::AllocDyn { dst: obj, bytes: total });
-                        b.push_raw(Instr::StoreField { base: obj, off: 0, src: len });
-                        let one = b.const_i64(1);
-                        b.push_raw(Instr::StoreField { base: obj, off: 8, src: one });
-                        return Ok(obj);
-                    }
-                    // `Interop.Sys.StrError(errno)`: builds the message
-                    // via `stackalloc` + native `strerror_r` write +
-                    // manual UTF-8 scan. The native write lands inside
-                    // a heap object (erased pointer model) and the
-                    // scan walks raw memory — both fault-prone, and
-                    // errno text is never load-bearing (diagnostics
-                    // only). Return a constant instead.
-                    if name == "StrError" && argv.len() == 1 {
-                        let (off, len) = b.utf16_literal("error");
-                        return Ok(b.build_utf16_string(off, len));
-                    }
                     // `Unsafe.IsNullRef(ref x)`: a ref to any variable
                     // (static/local/field slot) is never a null
                     // *pointer* in C# semantics, even when the slot
@@ -9511,20 +11240,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                         && (args.len() == 2 || args.len() == 3)
                     {
                         return lower_compare_exchange(name, args, b, ctx);
-                    }
-                    // `GenericCache.CreateCacheTable` (virtual static
-                    // dispatch machinery): builds tables via raw memory
-                    // reinterpretation (`Unsafe.As<RawArrayData>`) our
-                    // erased-ref model cannot do (array layout differs).
-                    // Static-virtual dispatch is unimplemented anyway,
-                    // so the cache can never meaningfully fill; return
-                    // null and let later uses (none in smoke paths)
-                    // fault honestly if they arrive.
-                    if base_type_name(&selected_declaring) == "GenericCache"
-                        && name == "CreateCacheTable"
-                    {
-                        let _ = eval_args(args, b, ctx)?;
-                        return Ok(b.const_i64(0));
                     }
                     // `NativeMemory.Alloc/AllocZeroed/Realloc/AlignedAlloc/
                     // AlignedRealloc` (and `Free`/`AlignedFree` below):
@@ -9577,35 +11292,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     {
                         let _ = eval_args(args, b, ctx)?;
                         return Ok(b.const_i64(0));
-                    }
-                    // Generic `ThrowIf*` validators
-                    // (`ThrowIfNegative<T>`, `ThrowIfZero<T>`,
-                    // `ThrowIfGreaterThan<T>`, …): their bodies use
-                    // static-virtual interface dispatch
-                    // (`T.IsNegative(value)`,
-                    // `value.CompareTo(other)`) our backend cannot do,
-                    // faulting at runtime. Lower directly: compare
-                    // (integer or float by operand type) and throw
-                    // `ArgumentOutOfRangeException` on violation via
-                    // the normal `new` path (so catch sites keep
-                    // working). Semantics match the framework exactly
-                    // for the compared values.
-                    if base_type_name(&selected_declaring) == "ArgumentOutOfRangeException"
-                        && matches!(
-                            name,
-                            "ThrowIfZero"
-                                | "ThrowIfNegative"
-                                | "ThrowIfNegativeOrZero"
-                                | "ThrowIfEqual"
-                                | "ThrowIfNotEqual"
-                                | "ThrowIfGreaterThan"
-                                | "ThrowIfGreaterThanOrEqual"
-                                | "ThrowIfLessThan"
-                                | "ThrowIfLessThanOrEqual"
-                        )
-                        && (args.len() == 1 || args.len() == 2 || args.len() == 3)
-                    {
-                        return lower_throw_if(name, args, b, ctx);
                     }
                     // `Unsafe.As<TFrom, TTo>(ref x)` / `Unsafe.AsRef(...)`:
                     // JIT intrinsics whose managed bodies throw
@@ -9678,29 +11364,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     {
                         return r;
                     }
-                    // No-header configuration (mirrors the `Interlocked`
-                    // rationale above): our objects carry no CoreCLR
-                    // header word (`[obj-4]` is foreign memory), so the
-                    // thin-lock protocol cannot run — `AcquireThinLock`
-                    // faulted there on the first vetted lock
-                    // (`Partition.TryPush` in the file-I/O read path).
-                    // Static exes are single-threaded, so acquisition
-                    // never fails and release has nothing to undo:
-                    // acquire/release fold to void and
-                    // `TryAcquireThinLock`/`IsAcquired` to true (a
-                    // `Monitor.IsEntered` answer of "held" matches
-                    // single-threaded reality for any object this image
-                    // ever locks). Args are already evaluated above
-                    // (side effects preserved); the bodies never run.
-                    // Family-gated like the no-ETW folds; `Monitor.*`
-                    // bodies delegate here, so bare same-class
-                    // `Monitor` calls need no twin — they just call the
-                    // folded primitive (see `calls.rs`).
-                    if base_type_name(&selected_declaring).contains("ObjectHeader")
-                        && let Some(r) = monitor_atomic(name, args, b, ctx)
-                    {
-                        return r;
-                    }
                     // `MemoryMarshal.Cast<From, To>(span)` reinterprets
                     // the buffer (see `span.rs`): real bodies need
                     // reference arithmetic outside our ref model.
@@ -9718,12 +11381,11 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     let wbs = byref_pattern(ctx.table, &selected_declaring, name, argv.len())
                         .map(|pat| box_byref_args(b, ctx, args, &mut argv, &pat).unwrap_or_default())
                         .unwrap_or_default();
-                    // P/Invoke SafeHandle marshaling for `Interop.*`
-                    // natives (see `marshal_safehandle_args`): this
-                    // generic static path lacks the selected overload,
-                    // so resolve it for param types + externness.
-                    if selected_declaring.contains("Interop")
-                        || selected_declaring == "Sys"
+                    // P/Invoke marshaling is a language feature, but the
+                    // marshaling decision must come from the signature
+                    // (is the callee an extern, do parameter types
+                    // differ), never from the declaring class being
+                    // spelled `Interop`/`Sys`.
                     {
                         if let Some(entry) = ctx.table.class(&selected_declaring) {
                             if let Some(mi) = entry.methods.iter().find(|m| {
@@ -9775,41 +11437,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 )));
             }
             let recv = eval(object, b, ctx)?;
-            // No-ETW configuration (see the `IsSupported` fold): static
-            // exes ship no event pipeline, so `EventSource.IsEnabled()`
-            // (all arities) reads false — real .NET without listeners
-            // also yields false and skips the block. Fires on the
-            // receiver family alone: `ArrayPoolEventSource.Log` builds
-            // a broken singleton (vtable slot holds -1) and the
-            // pooled-Rent tail calls `log.IsEnabled()` on it, faulting
-            // the file-I/O read path. Args are already evaluated above
-            // (side effects preserved); the call never dispatches.
-            if name == "IsEnabled"
-                && (base_type_name(&type_name).contains("EventSource")
-                    || type_name.contains("EventSource"))
-            {
-                let _ = recv;
-                return Ok(b.const_i64(0));
-            }
-            // TEMP-EQDIAG: audit Equals call shapes (bisecting the
-            // StartsWith fault). Removed before close.
-            if std::env::var("RUBYC_EQDIAG").is_ok() && name == "Equals" {
-                eprintln!(
-                    "[rubyc] TEMP-EQDIAG recvtype={type_name} argtypes={arg_types:?} in {}.{}",
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default()
-                );
-            }
-            // `x.Equals(y)` on primitive/enum receivers: compare slots
-            // directly instead of dispatching on the raw int as an
-            // object (faults: `span[0]?.Equals(value)` with
-            // span[0]=`'0'` reads `[48+24]`). Fires on the receiver
-            // alone: the argument is often an open type variable
-            // (`T value` in `StartsWith<T>`) whose static type says
-            // nothing, while the receiver's primitive spelling is
-            // exact. Same-typed operands compare exactly; a boxed
-            // `object` argument compares by address (usually false —
-            // same as today's placeholder, never a fault).
             if name == "Equals"
                 && argv.len() == 1
                 && is_value_comparable(ctx.table, &type_name)
@@ -9820,19 +11447,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                     a: recv,
                     b: argv[0],
                 }));
-            }
-            // TEMP-NOOPDIAG4: skip virtual SetDefaultFallbacks (bisect
-            // trap). Removed before close.
-            if std::env::var("RUBYC_NOOP_FB").is_ok() && name == "SetDefaultFallbacks" {
-                let _ = eval_args(args, b, ctx)?;
-                return Ok(b.const_i64(0));
-            }
-            // TEMP-SLOTDBG.
-            if std::env::var("RUBYC_SLOTDBG").is_ok() && name == "SetDefaultFallbacks" {
-                eprintln!(
-                    "[rubyc] TEMP-SLOTDBG {name} recv={type_name} slot={}",
-                    canonical_slot(ctx.table, None, &type_name, name)
-                );
             }
             // Slot from the SELECTED overload's declaring entry when
             // available (same-name overloads occupy distinct slots
@@ -9850,23 +11464,36 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // then elects a sibling overload's slot — e.g. an
             // internal pointer `GetBytes` routed to an array
             // overload that throws reading Length off the pointer.
-            let slot = selected
-                .and_then(|mi| {
-                    ctx.table
-                        .classes
-                        .iter()
-                        .find(|c| {
-                            c.name == mi.declaring_class || c.key.path == mi.declaring_class
+            // Receiver's entry first, for the same reason as the
+            // call above: with multiple bases the declaring class's
+            // slot numbering is unrelated to the receiver's row.
+            let slot = ctx
+                .table
+                .class(&type_name)
+                .and_then(|e| {
+                    e.methods.iter().find(|m| {
+                        selected.is_some_and(|mi| {
+                            m.name == mi.name && m.param_types == mi.param_types
                         })
-                        .and_then(|e| {
-                            e.methods.iter().find(|m| {
-                                m.name == mi.name && m.param_types == mi.param_types
-                            })
-                        })
-                        .map(|m| m.vtable_slot)
-                        .or(Some(mi.vtable_slot))
+                    })
                 })
-                .unwrap_or_else(|| canonical_slot(ctx.table, None, &type_name, name));
+                .map(|m| m.vtable_slot)
+                .or_else(|| selected.map(|mi| mi.vtable_slot))
+                // The ARGUMENT spellings identify the interface
+                // overload: an interface receiver has no entry of its
+                // own, so selection leaves `selected` empty and the
+                // slot must be keyed on what the call passes (an empty
+                // list matched no overload and fell back to a guessed
+                // class slot, sending both `M(int)` and `M(string)` to
+                // the first one).
+                .or(canonical_slot(ctx.table, None, &type_name, name, &arg_types))
+                .ok_or_else(|| {
+                    LowerError::UnsupportedConstruct(crate::tf!(
+                        "rubyc.native.ir.lower_call.no_virtual_slot",
+                        type_name.clone(),
+                        name.to_string()
+                    ))
+                })?;
             // Sealed-layout receivers (strings, arrays, and the
             // `Array` base itself — e.g. `Copy(Array, ...)`
             // parameters) carry no vtable word (length at +0) —
@@ -9935,17 +11562,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
                 args: argv,
             });
             emit_writebacks(b, &wbs);
-            // TEMP-VIRTDIAG: audit virtual calls (receiver type + method).
-            // Removed before close.
-            if std::env::var("RUBYC_VIRTDIAG").is_ok() {
-                eprintln!(
-                    "[rubyc] TEMP-VIRTDIAG {name} recvtype={type_name} recv={:?} nargs={} in {}.{}",
-                    recv.0,
-                    args.len(),
-                    ctx.current_class,
-                    ctx.current_method.clone().unwrap_or_default()
-                );
-            }
             Ok(dst)
         }
         Expr::Call { callee, args, .. } => call(callee, args, b, ctx),
@@ -9961,8 +11577,174 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // local values into the task frame before returning to the
             // scheduler.
             let state = b.fresh();
+            // Placeholder state number until the state-machine transform
+            // assigns real ones. The operand is an IR value, so it must
+            // have a definition even while the backend treats `Suspend`
+            // as a nop.
+            b.push_raw(Instr::Const { dst: state, imm: 0 });
             b.push_raw(Instr::Suspend { state });
             Ok(value)
         }
     }
+}
+
+
+pub(super) use eval_block_inline as eval_block_inline_pub;
+
+
+/// `int`/`Int32` spelling (the two forms `static_type_of` produces).
+fn is_int32_spelling(t: &str) -> bool {
+    matches!(t.trim(), "int" | "Int32" | "System.Int32")
+}
+
+/// Truncate to 32 bits and sign-extend back to the slot width, which is
+/// how every 32-bit result is represented (`Shr` must be arithmetic).
+fn narrow_int32(b: &mut Body<'_>, v: VReg) -> VReg {
+    let s = b.const_i64(32);
+    let l = b.emit(Instr::Bin {
+        dst: VReg(0),
+        op: IrBinOp::Shl,
+        a: v,
+        b: s,
+    });
+    b.emit(Instr::Bin {
+        dst: VReg(0),
+        op: IrBinOp::Shr,
+        a: l,
+        b: s,
+    })
+}
+
+
+/// `uint`/`UInt32` spelling.
+fn is_uint32_spelling(t: &str) -> bool {
+    matches!(t.trim(), "uint" | "UInt32" | "System.UInt32")
+}
+
+/// Keep the low 32 bits, zero-extended (C# `uint` result).
+fn mask_uint32(b: &mut Body<'_>, v: VReg) -> VReg {
+    let m = b.const_i64(0xFFFF_FFFF);
+    b.emit(Instr::Bin {
+        dst: VReg(0),
+        op: IrBinOp::BitAnd,
+        a: v,
+        b: m,
+    })
+}
+
+/// The runtime type of `recv`, whose static type is `static_ty`.
+///
+/// The object's first word is its vtable row, so the runtime class is
+/// the one whose row it carries: compare the rows of the static class
+/// and its subclasses and answer that class's descriptor. A boxed
+/// value carries its descriptor directly. A class from another image
+/// (dynamic linking) has no row here, so the static type answers it.
+fn runtime_type_of(
+    b: &mut Body<'_>,
+    recv: VReg,
+    static_ty: &str,
+    ctx: &Ctx<'_>,
+) -> Result<VReg, LowerError> {
+    let static_desc = b.type_token(static_ty, ctx)?;
+    // Candidates: the static class first, then its subclasses.
+    let mut candidates: Vec<(String, u32)> = Vec::new();
+    if let Some(info) = ctx.table.class(static_ty) {
+        candidates.push((
+            info.name.clone(),
+            super::span::vtable_row_for(ctx, &info.name, &info.key.path),
+        ));
+        for decl in ctx.classes {
+            let Some(dinfo) = ctx.table.class(&decl.name) else {
+                continue;
+            };
+            if dinfo.name != info.name
+                && ctx.table.derives_from(&dinfo.name, &info.name)
+            {
+                candidates.push((
+                    dinfo.name.clone(),
+                    construction_row(ctx, decl),
+                ));
+            }
+        }
+    }
+    // A boxed value answers from its own descriptor.
+    let boxed = b.fresh();
+    b.push_raw(Instr::LoadField { dst: boxed, base: recv, off: 24 });
+    let refc = b.fresh();
+    b.push_raw(Instr::LoadField { dst: refc, base: recv, off: 8 });
+    let flag = b.const_i64(BOX_FLAG);
+    let flagged = b.emit(Instr::Bin {
+        dst: VReg(0),
+        op: IrBinOp::BitAnd,
+        a: refc,
+        b: flag,
+    });
+    let zero = b.const_i64(0);
+    let is_box = b.emit(Instr::Cmp {
+        dst: VReg(0),
+        op: CmpOp::Ne,
+        a: flagged,
+        b: zero,
+    });
+    let res = b.fresh();
+    let box_b = b.make_block();
+    let class_b = b.make_block();
+    let join_b = b.make_block();
+    b.terminate(Terminator::Branch {
+        cond: Some(is_box),
+        if_true: box_b,
+        if_false: class_b,
+    });
+    b.switch_to(box_b);
+    b.mov(res, boxed);
+    b.goto(join_b);
+    b.switch_to(class_b);
+    if candidates.is_empty() {
+        b.mov(res, static_desc);
+        b.goto(join_b);
+    } else {
+        // Compare the object's row with each candidate's row.
+        let mut descs: Vec<VReg> = Vec::with_capacity(candidates.len());
+        for (name, _) in &candidates {
+            descs.push(b.type_token(name, ctx)?);
+        }
+        let row = b.fresh();
+        b.push_raw(Instr::LoadField { dst: row, base: recv, off: 0 });
+        // One "test candidate" block per candidate plus a final
+        // fallback block (no row matched).
+        let mut next_blocks = Vec::with_capacity(candidates.len() + 1);
+        let mut found_blocks = Vec::with_capacity(candidates.len());
+        for _ in 0..=candidates.len() {
+            next_blocks.push(b.make_block());
+        }
+        for _ in &candidates {
+            found_blocks.push(b.make_block());
+        }
+        b.goto(next_blocks[0]);
+        for (i, (_, cand_row)) in candidates.iter().enumerate() {
+            b.switch_to(next_blocks[i]);
+            let cand = b.fresh();
+            b.push_raw(Instr::VTableAddr { dst: cand, row: *cand_row });
+            let eq = b.emit(Instr::Cmp {
+                dst: VReg(0),
+                op: CmpOp::Eq,
+                a: row,
+                b: cand,
+            });
+            b.terminate(Terminator::Branch {
+                cond: Some(eq),
+                if_true: found_blocks[i],
+                if_false: next_blocks[i + 1],
+            });
+            b.switch_to(found_blocks[i]);
+            b.mov(res, descs[i]);
+            b.goto(join_b);
+        }
+        // No row matched (a class from another image): the static type.
+        b.switch_to(next_blocks[candidates.len()]);
+        b.mov(res, static_desc);
+        b.goto(join_b);
+    }
+    b.switch_to(join_b);
+    Ok(res)
 }

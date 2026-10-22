@@ -9,6 +9,8 @@ use crate::native::semantic::{
 
 fn sample_class() -> ClassInfo {
     ClassInfo {
+        is_record: false,
+        type_arg_index: Vec::new(),
         name: "Widget".into(),
         key: TypeKey::new("t.Widget", 1),
         bases: vec!["Object".into()],
@@ -46,6 +48,7 @@ fn sample_class() -> ClassInfo {
             declaring_class: "Widget".into(),
         }],
         methods: vec![MethodInfo {
+            param_names: vec![],
             name: "Get".into(),
             ret_type: "int".into(),
             param_types: vec!["string".into()],
@@ -82,6 +85,8 @@ fn sample_class() -> ClassInfo {
 #[test]
 fn rci_roundtrip_preserves_entries() {
     let other = ClassInfo {
+        is_record: false,
+        type_arg_index: Vec::new(),
         name: "Other".into(),
         key: TypeKey::new("t.Other", 0),
         bases: vec![],
@@ -142,6 +147,7 @@ fn rci_roundtrip_preserves_entries() {
 
 fn sample_iface() -> crate::models::InterfaceDecl {
     crate::models::InterfaceDecl {
+        indexers: vec![],
         name: "IDrop".into(),
         generic_params: vec![],
         methods: vec![crate::models::MethodSig {
@@ -150,6 +156,7 @@ fn sample_iface() -> crate::models::InterfaceDecl {
             name: "Area".into(),
             generic_params: vec![],
             params: vec![crate::models::Param {
+                attrs: vec![],
                 type_name: "IDrop".into(),
                 name: "self".into(),
                 span: Default::default(),
@@ -176,6 +183,7 @@ fn sample_delegate() -> crate::models::DelegateDecl {
         name: "Handler".into(),
         generic_params: vec!["T".into()],
         params: vec![crate::models::Param {
+            attrs: vec![],
             type_name: "T[]".into(),
             name: "args".into(),
             span: Default::default(),

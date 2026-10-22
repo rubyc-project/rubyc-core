@@ -43,6 +43,10 @@ pub enum BinOp {
     Div,
     /// Remainder of `idiv` (rdx). Traps on zero divisor like Div.
     Rem,
+    /// Unsigned quotient (`div`), for uint/ulong/nuint operands.
+    UDiv,
+    /// Unsigned remainder (`div` rdx), for uint/ulong/nuint operands.
+    URem,
     /// dst = a & b
     BitAnd,
     /// dst = a | b
@@ -194,11 +198,12 @@ pub enum Instr {
     /// dst = bump-allocate `bytes` on the heap.
     Alloc { dst: VReg, bytes: u64 },
     /// dst = process argv as a `string[]` array (same layout as
-    /// `NewArray`: length at offset 0, elements from offset 8).
-    /// Each element is a heap string in literal layout (length at 0,
-    /// refcount 1 at 8, bytes from 16). The backend reads the kernel
-    /// argv via a startup-saved stack slot; contexts without one
-    /// (JIT) yield an empty array rather than faulting.
+    /// `NewArray`: length at offset 0, refcount at 8, elements from
+    /// offset 16). Each element is a heap string in literal layout
+    /// (length at 0, refcount 1 at 8, UTF-16 data from 16). The backend
+    /// reads the kernel argv via a startup slot; a host without one
+    /// (the JIT) supplies its own argv block, and a zero slot yields an
+    /// empty array rather than a fault.
     BuildArgv { dst: VReg },
     /// dst = bump-allocate `bytes` (a runtime value) on the heap. Used for
     /// runtime-sized objects such as concatenated strings.
@@ -211,6 +216,20 @@ pub enum Instr {
     /// dst = address of static slot `idx` in `Program::statics`. The
     /// backend resolves the absolute address of the slot in the data
     /// segment.
+    /// Call through an ADDRESS held in a register (plus the receiver).
+    ///
+    /// `CallFn` names a callee at compile time, which is all a direct call
+    /// needs; a delegate is a value, so the callee's address is only known
+    /// at run time. This is the call that makes a delegate object callable.
+    CallFnAddr { dst: VReg, target: VReg, args: Vec<VReg> },
+    /// Address of a FUNCTION, by its index in `Program::functions`.
+    ///
+    /// A delegate object has to hold the address of the code to call, and
+    /// nothing could materialise one before this: every call site named a
+    /// function directly (`CallFn`). The linker already resolves
+    /// `Sym::Fn(i)` to a code address (see `MachineCode::resolve`), so this
+    /// instruction is the missing producer of that relocation.
+    FnAddr { dst: VReg, fidx: u32 },
     LoadStaticAddr { dst: VReg, idx: u32 },
     /// dst = [base + off] where `off` is a byte offset.
     LoadField { dst: VReg, base: VReg, off: u32 },

@@ -273,7 +273,8 @@ fn extension_call_accepts_method_group_for_delegate_param() {
     // `X509Certificate2.GetPublicKey<ECDsa>(HasECDsaKeyUsage)`. The
     // delegate is DECLARED (as CoreLib declares `Predicate<T>`) —
     // convertibility resolves against declarations, never a name list.
-    let p = lower(
+    let p = crate::native::ir::lower(
+        &crate::parser::parse(
         r#"namespace t;
 class Cert { }
 public delegate bool Predicate<T>(T obj);
@@ -283,7 +284,12 @@ static class E {
     public static bool Go<T>(Cert c) { return c.GetKey<T>(Has); }
     int main() { return 0; }
 }"#,
+        )
+        .unwrap(),
     );
+    // The method-group value has a representation now (2.3d), so the call
+    // both selects the delegate overload and passes a real object.
+    let p = p.expect("a method-group argument lowers");
     assert!(
         has(&p, |i| matches!(i, Instr::CallStatic { .. })),
         "method-group call must select the delegate extension"

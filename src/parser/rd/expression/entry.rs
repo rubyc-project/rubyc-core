@@ -1,6 +1,8 @@
 //! Expressions: precedence climbing, unary, postfix chains, primaries.
 
-use crate::models::{Access, BinOp, Expr, InterpPart, Keyword, Literal, Span, Stmt, SwitchExprArm, TokenKind, UnOp};
+use crate::models::{
+    BinOp, Expr, InterpPart, Keyword, Literal, Span, SwitchExprArm, TokenKind, UnOp,
+};
 
 use super::super::{Parser, binop_precedence, expr_span, expr_span_last};
 use super::types::{parse_interp_hole, read_unicode_escape};
@@ -270,10 +272,17 @@ impl Parser {
         self.expect(&TokenKind::LeftBrace, "to open switch expression body")?;
         let mut arms = Vec::new();
         while self.peek().kind != TokenKind::RightBrace && self.peek().kind != TokenKind::Eof {
-            // Parse one or more `or`-separated pattern labels.
+            // Parse one or more `or`-separated pattern labels as REAL
+            // patterns (the same parser `is` uses), so they lower through
+            // the same tests instead of being inert text.
             let mut labels = Vec::new();
             loop {
-                let label = self.parse_switch_expr_pattern_label();
+                let label = self
+                    .parse_is_pattern_chain(Some(&subject))
+                    .unwrap_or(Expr::Ident {
+                        name: "_".to_owned(),
+                        span: self.peek().span,
+                    });
                 labels.push(label);
                 // `or` chains another pattern; `,` chains another arm's
                 // labels (handled by the outer arm loop).
@@ -290,14 +299,23 @@ impl Parser {
             // (parenthesized lambdas inside still work; only a top-level
             // bare name directly before `=>` is ambiguous, and there C#
             // takes the arm arrow).
+            let mut guard: Option<Expr> = None;
             if matches!(self.peek().kind, TokenKind::Keyword(Keyword::When_)) {
                 self.bump();
                 if self.peek_is_name(0)
                     && self.peek_at(1).kind == TokenKind::FatArrow
                 {
-                    self.bump(); // guard name; the `=>` stays the arm's
+                    // A bare name directly before `=>`: the arrow belongs
+                    // to the arm, so the guard is the name itself.
+                    let span = self.peek().span;
+                    let name = match self.peek().kind.clone() {
+                        TokenKind::Identifier(n) => n,
+                        _ => String::new(),
+                    };
+                    self.bump();
+                    guard = Some(Expr::Ident { name, span });
                 } else {
-                    let _ = self.expression();
+                    guard = self.expression();
                 }
             }
             // `=> body`
@@ -307,6 +325,7 @@ impl Parser {
             self.eat(&TokenKind::Comma);
             arms.push(SwitchExprArm {
                 labels,
+                guard,
                 body: Box::new(body),
             });
         }
@@ -318,427 +337,6 @@ impl Parser {
         })
     }
 
-    /// Parse one pattern label inside a switch expression. Returns a string
-    /// representation since the AST does not model the full pattern grammar.
-    fn parse_switch_expr_pattern_label(&mut self) -> String {
-        let start = self.peek().span;
-        // `nameof(X)` — constant pattern. (`sizeof`/`typeof` lex as
-        // identifiers and already route through the type branch.)
-        if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Nameof_)) {
-            self.bump(); // 'nameof'
-            if self.peek().kind == TokenKind::LeftParen {
-                self.skip_balanced_bracket();
-            }
-            return "nameof(..)".to_owned();
-        }
-        // `default` / `default(T)` — default literal, optionally typed
-        // (mirrors `primary`; e.g. `default(char) => ...`).
-        if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Default)) {
-            self.bump(); // 'default'
-            if self.peek().kind == TokenKind::LeftParen {
-                self.bump(); // '('
-                let mut type_name = String::new();
-                // Reuse the full type grammar when it looks like one;
-                // otherwise skip to `)` — either way the value is the
-                // type's default and the label stays inert.
-                let mark = self.pos;
-                let err_mark = self.errors.len();
-                if let Some(t) = self.type_name() {
-                    type_name = t;
-                } else {
-                    self.pos = mark;
-                    self.errors.truncate(err_mark);
-                    while !matches!(
-                        self.peek().kind,
-                        TokenKind::RightParen | TokenKind::Eof
-                    ) {
-                        self.bump();
-                    }
-                }
-                let _ = self.expect(&TokenKind::RightParen, "to close default type");
-                if type_name.is_empty() {
-                    return "default".to_owned();
-                }
-                return format!("default({type_name})");
-            }
-            return "default".to_owned();
-        }
-        // Negated pattern: `not <pattern>` (e.g. `not null`). Recurse
-        // for the inner pattern so `not not x` and `not (A, B)` work;
-        // mirrors the statement-level `case_label`.
-        if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Not_)) {
-            self.bump(); // 'not'
-            let inner = self.parse_switch_expr_pattern_label();
-            return format!("not {inner}");
-        }
-        // Discard pattern.
-        if let TokenKind::Identifier(name) = &self.peek().kind
-            && name == "_"
-        {
-            self.bump();
-            return "_".to_owned();
-        }
-        // Relational pattern: `<rel> expr`.
-        let rel_op = match self.peek().kind {
-            TokenKind::GreaterEq => Some(">="),
-            TokenKind::LessEq => Some("<="),
-            TokenKind::Greater => Some(">"),
-            TokenKind::Less => Some("<"),
-            _ => None,
-        };
-        if let Some(op) = rel_op {
-            self.bump();
-            // Consume the rest of the pattern as a string.
-            let mut label = format!("{op} ");
-            let mut depth = 0i32;
-            while self.peek().kind != TokenKind::Comma
-                && self.peek().kind != TokenKind::FatArrow
-                && self.peek().kind != TokenKind::RightBrace
-                && self.peek().kind != TokenKind::Eof
-            {
-                if matches!(self.peek().kind, TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace) {
-                    depth += 1;
-                } else if matches!(self.peek().kind, TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace) {
-                    depth -= 1;
-                }
-                if depth <= 0
-                    && matches!(self.peek().kind, TokenKind::Keyword(Keyword::And_) | TokenKind::Keyword(Keyword::Or_))
-                {
-                    break;
-                }
-                let s = format!("{:?}", self.peek().kind);
-                let s = s.trim_matches('\'').to_string();
-                label.push_str(&s);
-                label.push(' ');
-                self.bump();
-            }
-            // Eat the rest of the `and X` / `or X` chain.
-            while matches!(self.peek().kind, TokenKind::Keyword(Keyword::And_) | TokenKind::Keyword(Keyword::Or_)) {
-                let op = if matches!(self.peek().kind, TokenKind::Keyword(Keyword::And_)) { "and" } else { "or" };
-                self.bump();
-                label.push_str(&format!("{op} "));
-                while self.peek().kind != TokenKind::Comma
-                    && self.peek().kind != TokenKind::FatArrow
-                    && self.peek().kind != TokenKind::RightBrace
-                    && self.peek().kind != TokenKind::Eof
-                {
-                    let s = format!("{:?}", self.peek().kind);
-                    let s = s.trim_matches('\'').to_string();
-                    label.push_str(&s);
-                    label.push(' ');
-                    self.bump();
-                }
-            }
-            let _ = start;
-            return label.trim().to_owned();
-        }
-        // Cast in arm position: `(int)X.Y` — parens holding a single
-        // type (no top-level comma) followed by an operand are a cast,
-        // not a positional pattern. Same disambiguation as `case`
-        // labels and `is`-patterns; without it the cast is skipped as
-        // a pattern and the member access breaks the arm.
-        if self.peek().kind == TokenKind::LeftParen && !self.paren_holds_comma() {
-            let mark = self.pos;
-            let err_mark = self.errors.len();
-            self.bump(); // '('
-            // Only a plain identifier-ish type qualifies; anything else
-            // rewinds to the pattern handling below.
-            let mut tn: Option<String> = None;
-            if matches!(self.peek().kind, TokenKind::Identifier(_)) {
-                let first = self.bump();
-                let TokenKind::Identifier(t) = first.kind else {
-                    unreachable!()
-                };
-                let mut full = t;
-                let mut ok = true;
-                while self.peek().kind == TokenKind::Dot {
-                    self.bump();
-                    match self.peek().kind.clone() {
-                        TokenKind::Identifier(seg) => {
-                            self.bump();
-                            full.push('.');
-                            full.push_str(&seg);
-                        }
-                        _ => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok && self.peek().kind == TokenKind::RightParen {
-                    self.bump(); // ')'
-                    tn = Some(full);
-                }
-            }
-            if let Some(type_name) = tn {
-                // A cast label: consume the operand up to the arm
-                // terminator (labels are inert strings; the operand may
-                // be a member path, literal, or call).
-                let mut label = format!("cast {type_name}");
-                let mut depth = 0i32;
-                loop {
-                    let terminal = match &self.peek().kind {
-                        TokenKind::FatArrow
-                        | TokenKind::Comma
-                        | TokenKind::Eof => true,
-                        TokenKind::RightBrace => depth == 0,
-                        TokenKind::Keyword(Keyword::And_)
-                        | TokenKind::Keyword(Keyword::Or_)
-                        | TokenKind::Keyword(Keyword::When_) => depth == 0,
-                        TokenKind::LeftParen
-                        | TokenKind::LeftBracket
-                        | TokenKind::LeftBrace => {
-                            depth += 1;
-                            false
-                        }
-                        TokenKind::RightParen | TokenKind::RightBracket => {
-                            depth = depth.saturating_sub(1);
-                            false
-                        }
-                        _ => false,
-                    };
-                    if terminal {
-                        break;
-                    }
-                    let s = format!("{:?}", self.peek().kind);
-                    label.push_str(s.trim_matches('\''));
-                    label.push(' ');
-                    self.bump();
-                }
-                return label.trim().to_owned();
-            } else {
-                self.pos = mark;
-                self.errors.truncate(err_mark);
-            }
-        }
-        // Property / positional / list / discard-as-bracket patterns.
-        if self.peek().kind == TokenKind::LeftBrace
-            || self.peek().kind == TokenKind::LeftBracket
-            || self.peek().kind == TokenKind::LeftParen
-        {
-            let open = self.pos;
-            self.skip_balanced_bracket();
-            // Inner designations (`{ P: T x }`) bind in the enclosing
-            // scope, like the trailing one below.
-            self.queue_inner_designations(open);
-            // Optional variable binding (`{ ... } x`): a value in the
-            // enclosing scope, like type-pattern bindings below. The
-            // name may be a contextual keyword (`{ ... } record`).
-            if let Some((binding, span)) = self.take_pattern_binding() {
-                self.pre_pending.push(Stmt::Let {
-                    is_byref: false,
-                    type_name: String::from("var"),
-                    name: binding,
-                    init: Expr::Literal(Literal::Int(0)),
-                    access: Access::Default,
-                    span: start.to(span),
-                });
-            }
-            return "<pattern>".to_owned();
-        }
-        // Type pattern, type-property pattern, or constant.
-        if matches!(self.peek().kind, TokenKind::Identifier(_)) {
-            // Consume the type segment (identifier + dots + generics + array).
-            let mut label = String::new();
-            let s = format!("{:?}", self.peek().kind);
-            let s = s.trim_matches('\'').to_string();
-            label.push_str(&s);
-            label.push(' ');
-            self.bump();
-            // Generic arguments: `KeyValuePair<K, V>`, `Dictionary<K,V>`.
-            // Gated (balanced + type-ish follower) so `a < b` still
-            // parses as a comparison for the binary fold below.
-            // (`end` is a lookahead offset: bump that many times.)
-            if let Some(end) = self.generic_args_end_at(0) {
-                if self.generic_follow_ok(end) {
-                    for _ in 0..end {
-                        self.bump();
-                    }
-                    label.push_str("<...>");
-                    label.push(' ');
-                }
-            }
-            // Dotted segments (each with its own optional generics).
-            while self.peek().kind == TokenKind::Dot {
-                self.bump();
-                let s = format!("{:?}", self.peek().kind);
-                let s = s.trim_matches('\'').to_string();
-                label.push('.');
-                label.push_str(&s);
-                label.push(' ');
-                self.bump();
-                if let Some(end) = self.generic_args_end_at(0) {
-                    if self.generic_follow_ok(end) {
-                        for _ in 0..end {
-                            self.bump();
-                        }
-                        label.push_str("<...>");
-                        label.push(' ');
-                    }
-                }
-            }
-            // Optional positional pattern: `Type(...)`.
-            if self.peek().kind == TokenKind::LeftParen {
-                let open = self.pos;
-                self.skip_balanced_bracket();
-                self.queue_inner_designations(open);
-            }
-            // Property pattern: `Type { ... }` (after the optional `Type(...)`).
-            if self.peek().kind == TokenKind::LeftBrace {
-                let open = self.pos;
-                self.skip_balanced_bracket();
-                self.queue_inner_designations(open);
-            }
-            // Array rank suffixes: `string[] values`.
-            while self.peek().kind == TokenKind::LeftBracket {
-                self.skip_balanced_bracket();
-            }
-            // Nullable suffix: `T? x`.
-            if self.peek().kind == TokenKind::Question {
-                self.bump();
-            }
-            // Optional variable binding (`Type x`): a value in the
-            // enclosing scope — expose it like `is`-pattern bindings.
-            // (`_` discards need no declaration; anything else does.)
-            // The name may be a contextual keyword (`case T record:`).
-            if let Some((binding, span)) = self.take_pattern_binding() {
-                label.push_str(&binding);
-                label.push(' ');
-                if binding != "_" {
-                    self.pre_pending.push(Stmt::Let {
-                        is_byref: false,
-                        type_name: String::from("var"),
-                        name: binding,
-                        init: Expr::Literal(Literal::Int(0)),
-                        access: Access::Default,
-                        span: start.to(span),
-                    });
-                }
-            }
-            // Constant-expression continuation (`A >> B`, `X + Y`):
-            // fold `op operand` pairs into the label. Arm terminators
-            // (`=>`, `,`, `}`, `or`, `and`, `when`) always stop the
-            // fold, so nothing a later stage needs is ever consumed.
-            self.fold_pattern_binary_tail(&mut label);
-            return label.trim().to_owned();
-        }
-        // Constant pattern (literal, etc.). A leading `-`/`+` on a
-        // numeric literal is part of the constant (`-1 => ...`), not a
-        // binary operator — consume both as one pattern.
-        let mut sign = String::new();
-        if matches!(
-            self.peek().kind,
-            TokenKind::Minus | TokenKind::Plus
-        ) && matches!(self.peek_at(1).kind, TokenKind::IntLiteral(_)) {
-            let s = format!("{:?}", self.peek().kind);
-            sign.push_str(s.trim_matches('\''));
-            sign.push(' ');
-            self.bump(); // sign
-        }
-        let s = format!("{:?}", self.peek().kind);
-        let s = s.trim_matches('\'').to_string();
-        self.bump();
-        let s = if sign.is_empty() {
-            s
-        } else {
-            format!("{sign}{s}")
-        };
-        // Consume any literal suffix (`L`, `U`, `UL`, `f`, `m`, `d`).
-        if matches!(&self.peek().kind, TokenKind::Identifier(suf)
-            if matches!(suf.as_str(), "L" | "l" | "U" | "u" | "UL" | "Ul" | "uL" | "ul" | "f" | "F" | "m" | "M" | "d" | "D"))
-        {
-            self.bump();
-        }
-        s
-    }
-
-    /// Fold `op operand` pairs after a switch-expression arm pattern
-    /// into its label string (constant-expression patterns like
-    /// `MethodDef >> RowIdBitCount`). Stops at arm terminators (`=>`,
-    /// `,`, `}`, `or`, `and`, `when`) and EOF, leaving them for the
-    /// arm loop — so only tokens that would otherwise be an immediate
-    /// parse error are ever consumed.
-    fn fold_pattern_binary_tail(&mut self, label: &mut String) {
-        /// True for tokens that continue a constant expression. Excludes
-        /// everything the arm loop or guard handling needs: `=>`, `,`,
-        /// braces, `or`/`and`/`when`, and `=`/`!`/`:`-family tokens that
-        /// never continue an expression.
-        fn is_binop(kind: &TokenKind) -> bool {
-            matches!(
-                kind,
-                TokenKind::Plus
-                    | TokenKind::Minus
-                    | TokenKind::Star
-                    | TokenKind::Slash
-                    | TokenKind::Percent
-                    | TokenKind::Caret
-                    | TokenKind::Amp
-                    | TokenKind::Pipe
-                    | TokenKind::Shl
-                    | TokenKind::Shr
-                    | TokenKind::ShrShr
-                    | TokenKind::Less
-                    | TokenKind::Greater
-                    | TokenKind::LessEq
-                    | TokenKind::GreaterEq
-                    | TokenKind::EqEq
-                    | TokenKind::NotEq
-                    | TokenKind::AmpAmp
-                    | TokenKind::PipePipe
-                    | TokenKind::QuestionQuestion
-            )
-        }
-        loop {
-            if !is_binop(&self.peek().kind) {
-                break;
-            }
-            let s = format!("{:?}", self.peek().kind);
-            label.push_str(s.trim_matches('\''));
-            label.push(' ');
-            self.bump(); // operator
-            // One operand: tokens until a terminator or the next
-            // top-level binary op. Bracket depth is tracked so
-            // `Foo(a, b)`-style operands survive intact.
-            let mut depth = 0i32;
-            let mut any = false;
-            loop {
-                let stop = match &self.peek().kind {
-                    TokenKind::FatArrow | TokenKind::Comma | TokenKind::Eof => true,
-                    TokenKind::Keyword(Keyword::And_)
-                    | TokenKind::Keyword(Keyword::Or_)
-                    | TokenKind::Keyword(Keyword::When_) => depth == 0,
-                    TokenKind::LeftParen
-                    | TokenKind::LeftBracket
-                    | TokenKind::LeftBrace => {
-                        depth += 1;
-                        false
-                    }
-                    TokenKind::RightParen
-                    | TokenKind::RightBracket
-                    | TokenKind::RightBrace => {
-                        if depth == 0 {
-                            true
-                        } else {
-                            depth -= 1;
-                            false
-                        }
-                    }
-                    k => is_binop(k) && depth == 0,
-                };
-                if stop {
-                    break;
-                }
-                let s = format!("{:?}", self.peek().kind);
-                label.push_str(s.trim_matches('\''));
-                label.push(' ');
-                self.bump();
-                any = true;
-            }
-            if !any {
-                break;
-            }
-        }
-    }
 
     pub(in crate::parser::rd) fn binary_expr(&mut self, min_precedence: u8) -> Option<Expr> {
         let lhs = self.unary()?;
@@ -769,12 +367,12 @@ impl Parser {
                 }
                 // Build the pattern rhs by parsing one primary pattern, then
                 // chaining any `and`/`or` pattern conjunctions/disjunctions.
-                let mut pattern = self.parse_is_pattern_primary()?;
+                let mut pattern = self.parse_is_pattern_primary(Some(&lhs))?;
                 loop {
                     match self.peek().kind {
                         TokenKind::Keyword(Keyword::And_) => {
                             self.bump();
-                            let rhs = self.parse_is_pattern_primary()?;
+                            let rhs = self.parse_is_pattern_primary(Some(&lhs))?;
                             let span =
                                 expr_span(&pattern).to(expr_span_last(&self.tokens[..self.pos]));
                             pattern = Expr::Binary {
@@ -786,7 +384,7 @@ impl Parser {
                         }
                         TokenKind::Keyword(Keyword::Or_) => {
                             self.bump();
-                            let rhs = self.parse_is_pattern_primary()?;
+                            let rhs = self.parse_is_pattern_primary(Some(&lhs))?;
                             let span =
                                 expr_span(&pattern).to(expr_span_last(&self.tokens[..self.pos]));
                             pattern = Expr::Binary {
@@ -937,11 +535,7 @@ impl Parser {
                 let start = self.peek().span;
                 self.bump(); // 'async' as name
                 self.expect(&TokenKind::FatArrow, "in lambda")?;
-                self.consume_lambda_body();
-                return Some(Expr::Ident {
-                    name: "lambda".to_owned(),
-                    span: start.to(self.peek_at(0).span),
-                });
+                return Some(self.lambda_expr(vec!["async".to_owned()], start));
             }
             // Look past `async [static]` for a lambda shape; only
             // consume when it matches (bare `async` may be an identifier).
@@ -1005,35 +599,13 @@ impl Parser {
                 }
             }
             if self.peek_at(offset).kind == TokenKind::FatArrow {
-                // Confirmed: consume `(params) =>` and the body.
+                // Confirmed: `(params) =>`. The parameter NAMES are kept:
+                // without them the body cannot resolve its own
+                // parameters.
                 let start = self.peek().span;
-                // Consume the parenthesized parameter list.
-                let mut depth = 1i32;
-                self.bump(); // '('
-                loop {
-                    match self.peek().kind {
-                        TokenKind::LeftParen => {
-                            depth += 1;
-                            self.bump();
-                        }
-                        TokenKind::RightParen => {
-                            depth -= 1;
-                            self.bump();
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        _ => {
-                            self.bump();
-                        }
-                    }
-                }
+                let params = self.consume_lambda_params();
                 self.expect(&TokenKind::FatArrow, "in lambda")?;
-                self.consume_lambda_body();
-                return Some(Expr::Ident {
-                    name: "lambda".to_owned(),
-                    span: start.to(self.peek_at(0).span),
-                });
+                return Some(self.lambda_expr(params, start));
             }
             return None;
         }
@@ -1044,14 +616,16 @@ impl Parser {
             && self.peek_at(1).kind == TokenKind::FatArrow
         {
             let start = self.peek().span;
+            let span = self.peek().span;
+            let name = String::from_utf8_lossy(
+                self.source
+                    .get(span.start as usize..span.end as usize)
+                    .unwrap_or(&[]),
+            )
+            .into_owned();
             self.bump(); // name
             self.expect(&TokenKind::FatArrow, "in lambda")?;
-            // Body.
-            self.consume_lambda_body();
-            return Some(Expr::Ident {
-                name: "lambda".to_owned(),
-                span: start.to(self.peek_at(0).span),
-            });
+            return Some(self.lambda_expr(vec![name], start));
         }
 
         None
@@ -1060,64 +634,103 @@ impl Parser {
     /// Consume the body of a lambda expression. If the body is a block,
     /// consume until the matching `}`. Otherwise, try to parse an expression;
     /// if the next token is `=`, it's an assignment-expression body.
-    fn consume_lambda_body(&mut self) {
+    /// Parse a lambda body: `{ stmts }` or `expr`.
+    ///
+    /// This used to consume the body and throw it away (the whole lambda
+    /// became a magic placeholder), so a lambda's reads and side effects
+    /// vanished from every downstream pass. It now returns the body.
+    fn consume_lambda_body(&mut self) -> crate::models::ast::expression::LambdaBody {
+        use crate::models::ast::expression::LambdaBody;
         if self.peek().kind == TokenKind::LeftBrace {
-            let mut depth = 0i32;
-            while self.peek().kind != TokenKind::Eof {
-                if self.peek().kind == TokenKind::LeftBrace {
-                    depth += 1;
-                } else if self.peek().kind == TokenKind::RightBrace {
-                    depth -= 1;
-                    if depth == 0 {
-                        self.bump();
-                        break;
-                    }
-                }
-                self.bump();
-            }
-        } else {
-            let mark = self.pos;
-            if self.expression().is_none() && self.pos == mark {
-                // Expression parsing failed; consume tokens until a `,` or
-                // `)` at depth 0, a `;`, or Eof.
-                self.consume_until_comma_or_close();
-            } else if self.peek().kind == TokenKind::Assign {
-                // Assignment-expression body: `x => x = 1`.
-                self.bump(); // '='
-                if self.expression().is_none() {
-                    self.consume_until_comma_or_close();
-                }
-            }
+            let block = self.block();
+            return LambdaBody::Block(block);
+        }
+        match self.expression() {
+            Some(e) => LambdaBody::Expr(Box::new(e)),
+            // Malformed body: keep the shape so the caller can still
+            // report its own diagnostics about the enclosing construct.
+            None => LambdaBody::Expr(Box::new(Expr::Literal(Literal::Int(0)))),
         }
     }
 
-    /// Consume tokens until a `,` or `)` at depth 0, a `;`, or Eof.
-    fn consume_until_comma_or_close(&mut self) {
-        let mut depth = 0i32;
-        while self.peek().kind != TokenKind::Eof {
-            match self.peek().kind {
-                TokenKind::LeftParen | TokenKind::LeftBrace | TokenKind::LeftBracket => {
+    /// Build a lambda node from the parameters already consumed and the
+    /// body just parsed.
+    fn lambda_expr(&mut self, params: Vec<String>, start: Span) -> Expr {
+        let body = self.consume_lambda_body();
+        Expr::Lambda {
+            params,
+            body,
+            span: start.to(self.peek_at(0).span),
+        }
+    }
+
+    /// Parameter names from a `( ... )` lambda parameter list, already
+    /// positioned at `(`. Types and modifiers are skipped: a group's LAST
+    /// identifier is its name (`int x` -> `x`, `x` -> `x`, `out int y` ->
+    /// `y`), which is the same rule the declaration parser uses to find a
+    /// declared name.
+    pub(super) fn consume_lambda_params(&mut self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        if self.peek().kind != TokenKind::LeftParen {
+            return names;
+        }
+        self.bump(); // '('
+        let mut current: Vec<String> = Vec::new();
+        let mut depth = 1i32;
+        while depth > 0 && self.peek().kind != TokenKind::Eof {
+            match self.peek().kind.clone() {
+                TokenKind::LeftParen => {
                     depth += 1;
+                    current.clear();
                     self.bump();
                 }
-                TokenKind::RightParen | TokenKind::RightBrace | TokenKind::RightBracket => {
-                    if depth == 0 {
-                        break;
-                    }
+                TokenKind::RightParen => {
                     depth -= 1;
+                    if !current.is_empty()
+                        && let Some(last) = current.last()
+                    {
+                        names.push(last.clone());
+                    }
+                    current.clear();
                     self.bump();
                 }
-                TokenKind::Comma if depth == 0 => break,
-                TokenKind::Semicolon => {
+                TokenKind::Comma if depth == 1 => {
+                    if let Some(last) = current.last() {
+                        names.push(last.clone());
+                    }
+                    current.clear();
                     self.bump();
-                    break;
+                }
+                TokenKind::Identifier(n) => {
+                    current.push(n);
+                    self.bump();
+                }
+                TokenKind::Keyword(_) => {
+                    // Modifiers (`ref`, `out`, `in`, `params`, `scoped`)
+                    // are not the name; a contextual keyword used AS a
+                    // name is, and it reads from the source.
+                    let span = self.peek().span;
+                    let txt = String::from_utf8_lossy(
+                        &self.source[span.start as usize..span.end as usize],
+                    )
+                    .into_owned();
+                    current.push(txt);
+                    self.bump();
                 }
                 _ => {
                     self.bump();
                 }
             }
         }
+        // A list without a trailing `)` (malformed) keeps what it found.
+        if !current.is_empty()
+            && let Some(last) = current.last()
+        {
+            names.push(last.clone());
+        }
+        names
     }
+
 
     /// Parse a static-lambda prefix: `static name =>` or
     /// `static (params) =>`. Returns `Some(expr)` if the current
@@ -1161,35 +774,25 @@ impl Parser {
         if self.peek_at(offset).kind != TokenKind::FatArrow {
             return None;
         }
-        // Confirmed: consume `static [async]`, the parameter(s), the
-        // `=>`, and the body, then return a placeholder expression.
+        // Confirmed: consume `static [async]`, the parameter NAMES, the
+        // `=>`, and the body. The names are kept: a `static` lambda is an
+        // ordinary lambda with no capture, and dropping its parameters
+        // made every use of one read as an unknown name. (This used to
+        // hand over an empty list, from when no lambda could be lowered
+        // at all.)
         self.bump(); // 'static'
         if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Async)) {
             self.bump(); // 'async'
         }
-        if self.peek().kind == TokenKind::LeftParen {
-            let mut depth = 1i32;
-            self.bump();
-            loop {
-                if self.peek().kind == TokenKind::LeftParen {
-                    depth += 1;
-                } else if self.peek().kind == TokenKind::RightParen {
-                    depth -= 1;
-                }
-                self.bump();
-                if depth == 0 || self.peek().kind == TokenKind::Eof {
-                    break;
-                }
-            }
+        let params = if self.peek().kind == TokenKind::LeftParen {
+            self.consume_lambda_params()
         } else {
-            self.bump(); // single identifier
-        }
-            self.expect(&TokenKind::FatArrow, "in static lambda")?;
-            self.consume_lambda_body();
-        Some(Expr::Ident {
-            name: "lambda".to_owned(),
-            span: self.peek_at(0).span,
-        })
+            let name = self.expect_identifier("as lambda parameter")?;
+            vec![name]
+        };
+        let start = self.peek().span;
+        self.expect(&TokenKind::FatArrow, "in static lambda")?;
+        Some(self.lambda_expr(params, start))
     }
 
     pub(in crate::parser::rd) fn unary(&mut self) -> Option<Expr> {

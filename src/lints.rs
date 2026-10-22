@@ -191,13 +191,16 @@ fn collect_lets(block: &crate::models::Block, out: &mut Vec<(String, Span)>) {
 fn collect_reads_block(block: &crate::models::Block, out: &mut Vec<String>) {
     for stmt in &block.stmts {
         match stmt {
-            Stmt::Let { init, .. } => collect_reads_expr(init, out),
+            Stmt::Let { init, .. } | Stmt::UsingDecl { init, .. } => {
+                collect_reads_expr(init, out)
+            }
             Stmt::Assign { value, .. } => collect_reads_expr(value, out),
             Stmt::MemberAssign { object, value, .. } => {
                 collect_reads_expr(object, out);
                 collect_reads_expr(value, out);
             }
             Stmt::Expression(e) => collect_reads_expr(e, out),
+            Stmt::CheckedBlock { body, .. } => collect_reads_block(body, out),
             Stmt::Block { body, .. } => collect_reads_block(body, out),
             Stmt::Fixed { declarators, body, .. } => {
                 for (_, _, init) in declarators {
@@ -309,6 +312,21 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut Vec<String>) {
 
 fn collect_reads_expr(expr: &Expr, out: &mut Vec<String>) {
     match expr {
+        Expr::NamedArg { value, .. } => collect_reads_expr(value, out),
+        Expr::Checked { inner, .. } => collect_reads_expr(inner, out),
+            // A lambda body is code that runs later, but it is still
+            // code: its reads belong to the enclosing method's set (the
+            // closure reads them), so walk it rather than skipping it.
+            Expr::Lambda { body, .. } => match body {
+                crate::models::ast::expression::LambdaBody::Expr(e) => {
+                    collect_reads_expr(e, out)
+                }
+                crate::models::ast::expression::LambdaBody::Block(b) => {
+                    for st in &b.stmts {
+                        collect_reads_stmt(st, out);
+                    }
+                }
+            },
         Expr::Binary { lhs, rhs, .. } => {
             collect_reads_expr(lhs, out);
             collect_reads_expr(rhs, out);
@@ -329,7 +347,24 @@ fn collect_reads_expr(expr: &Expr, out: &mut Vec<String>) {
             collect_reads_expr(object, out);
             collect_reads_expr(index, out);
         }
-        Expr::Call { args, .. } => {
+        Expr::Call { callee, args, .. } => {
+            // A local invoked as `f(...)` is READ: without the callee a
+            // delegate held in a local was reported as "declared but
+            // never used" while every call through it worked.
+            //
+            // An explicit generic suffix is part of the CALL, not the
+            // name: `One<string>("x")` names `One`, and recording
+            // `One<string>` reported the method unused.
+            out.push(
+                callee
+                    .split('<')
+                    .next()
+                    .unwrap_or(callee)
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(callee)
+                    .to_owned(),
+            );
             for a in args {
                 collect_reads_expr(a, out);
             }
@@ -414,8 +449,18 @@ fn unused_private_members(unit: &CompilationUnit, config: &LintConfig) -> Vec<Di
                 ClassMember::Method(m) => (m.name.clone(), m.access, false),
             };
             let is_private = matches!(access, Access::Private | Access::Default);
+            // An explicit interface implementation (`int I.M()`) is
+            // registered under its qualified spelling and is only
+            // reachable through interface dispatch, so no call site
+            // ever names it. C# does not consider it dead; nor do we.
+            let is_explicit_impl = name.contains('.');
             // Entry points are roots: never flagged as unused.
-            if !is_private || referenced.contains(&name) || name == "main" || name == "Main" {
+            if !is_private
+                || is_explicit_impl
+                || referenced.contains(&name)
+                || name == "main"
+                || name == "Main"
+            {
                 continue;
             }
             let kind = if is_field { "field" } else { "method" };
@@ -441,7 +486,7 @@ fn unused_private_members(unit: &CompilationUnit, config: &LintConfig) -> Vec<Di
 fn collect_name_refs_block(block: &crate::models::Block, out: &mut Vec<String>) {
     for stmt in &block.stmts {
         match stmt {
-            Stmt::Let { name, init, .. } => {
+            Stmt::Let { name, init, .. } | Stmt::UsingDecl { name, init, .. } => {
                 out.push(name.clone());
                 collect_name_refs_expr(init, out);
             }
@@ -460,6 +505,7 @@ fn collect_name_refs_block(block: &crate::models::Block, out: &mut Vec<String>) 
                 collect_name_refs_expr(value, out);
             }
             Stmt::Expression(e) => collect_name_refs_expr(e, out),
+            Stmt::CheckedBlock { body, .. } => collect_name_refs_block(body, out),
             Stmt::Block { body, .. } => collect_name_refs_block(body, out),
             Stmt::Fixed { declarators, body, .. } => {
                 for (_, _, init) in declarators {
@@ -574,6 +620,21 @@ fn collect_name_refs_stmt(stmt: &Stmt, out: &mut Vec<String>) {
 
 fn collect_name_refs_expr(expr: &Expr, out: &mut Vec<String>) {
     match expr {
+        Expr::NamedArg { value, .. } => collect_name_refs_expr(value, out),
+        Expr::Checked { inner, .. } => collect_name_refs_expr(inner, out),
+        // A lambda body is code that runs later, but its name references
+        // are real references for the enclosing method (a closure reads
+        // them), so they are collected like any other expression's.
+        Expr::Lambda { body, .. } => match body {
+            crate::models::ast::expression::LambdaBody::Expr(e) => {
+                collect_name_refs_expr(e, out)
+            }
+            crate::models::ast::expression::LambdaBody::Block(b) => {
+                for st in &b.stmts {
+                    collect_name_refs_stmt(st, out);
+                }
+            }
+        },
         Expr::NewArray { size, .. } => collect_name_refs_expr(size, out),
         Expr::Index { object, index, .. } => {
             collect_name_refs_expr(object, out);
@@ -595,7 +656,16 @@ fn collect_name_refs_expr(expr: &Expr, out: &mut Vec<String>) {
             collect_name_refs_expr(else_expr, out);
         }
         Expr::Call { callee, args, .. } => {
-            out.push(callee.clone());
+            out.push(
+                callee
+                    .split('<')
+                    .next()
+                    .unwrap_or(callee)
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(callee)
+                    .to_owned(),
+            );
             for a in args {
                 collect_name_refs_expr(a, out);
             }
@@ -613,7 +683,18 @@ fn collect_name_refs_expr(expr: &Expr, out: &mut Vec<String>) {
             object, name, args, ..
         } => {
             collect_name_refs_expr(object, out);
-            out.push(name.clone());
+            // `M<T>()`: the suffix names the instantiation, not the
+            // member (same false "never used" as the Call case).
+            out.push(
+                name
+                    .split('<')
+                    .next()
+                    .unwrap_or(name)
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(name)
+                    .to_owned(),
+            );
             for a in args {
                 collect_name_refs_expr(a, out);
             }

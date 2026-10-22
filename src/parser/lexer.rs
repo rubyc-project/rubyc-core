@@ -5,6 +5,29 @@
 
 use crate::models::{Diagnostic, Keyword, ScopeContext, Severity, Span, Token, TokenKind};
 
+/// C#'s definition of a whitespace character: the Unicode separator
+/// classes (Zs, Zl, Zp) plus TAB, VT, FF, CR and LF.
+///
+/// Rust's `char::is_whitespace` follows the Unicode `White_Space`
+/// property, which additionally includes NEL (U+0085). NEL is category
+/// Cc — a control character, not a separator — so C# does not treat it
+/// as whitespace, and neither does this.
+fn is_csharp_whitespace(ch: char) -> bool {
+    matches!(ch, '\t' | '\u{0B}' | '\u{0C}' | '\r' | '\n')
+        || matches!(
+            ch,
+            '\u{0020}'             // SPACE
+                | '\u{00A0}'        // NO-BREAK SPACE (Zs)
+                | '\u{1680}'        // OGHAM SPACE MARK (Zs)
+                | '\u{2000}'..='\u{200A}' // EN QUAD .. HAIR SPACE (Zs)
+                | '\u{2028}'        // LINE SEPARATOR (Zl)
+                | '\u{2029}'        // PARAGRAPH SEPARATOR (Zp)
+                | '\u{202F}'        // NARROW NO-BREAK SPACE (Zs)
+                | '\u{205F}'        // MEDIUM MATHEMATICAL SPACE (Zs)
+                | '\u{3000}'        // IDEOGRAPHIC SPACE (Zs)
+        )
+}
+
 pub struct Lexer<'src> {
     src: &'src [u8],
     pos: usize,
@@ -248,6 +271,15 @@ impl<'src> Lexer<'src> {
                 self.interpolated_raw_string()
             }
             b'$' if self.src.get(self.pos + 1) == Some(&b'@')
+                && self.src.get(self.pos + 2) == Some(&b'"')
+                && self.src.get(self.pos + 3) == Some(&b'"')
+                && self.src.get(self.pos + 4) == Some(&b'"') =>
+            {
+                // Interpolated verbatim raw string: `$@"""..."""`.
+                self.pos += 2; // Skip '$@'
+                self.interpolated_raw_string()
+            }
+            b'$' if self.src.get(self.pos + 1) == Some(&b'@')
                 && self.src.get(self.pos + 2) == Some(&b'"') =>
             {
                 // Interpolated verbatim string: `$@"..."`.
@@ -258,6 +290,46 @@ impl<'src> Lexer<'src> {
                 // Interpolated string: `$"..."`.
                 self.pos += 1; // Skip '$'
                 self.interpolated_string()
+            }
+            b'@' if self.src.get(self.pos + 1) == Some(&b'"')
+                && self.src.get(self.pos + 2) == Some(&b'"')
+                && self.src.get(self.pos + 3) == Some(&b'"') =>
+            {
+                // Verbatim raw string: `@"""..."""`.
+                self.pos += 4; // Skip '@"""'
+                let mut value = Vec::new();
+                while self.pos < self.src.len() {
+                    if self.peek() == Some(&b'"')
+                        && self.src.get(self.pos + 1) == Some(&b'"')
+                        && self.src.get(self.pos + 2) == Some(&b'"')
+                    {
+                        self.pos += 3;
+                        while self.peek() == Some(&b'"') {
+                            value.push(b'"');
+                            self.pos += 1;
+                        }
+                        break;
+                    }
+                    value.push(self.src[self.pos]);
+                    self.pos += 1;
+                }
+                TokenKind::StringLiteral(String::from_utf8_lossy(&value).trim().to_string())
+            }
+            b'@' if self.src.get(self.pos + 1) == Some(&b'$')
+                && self.src.get(self.pos + 2) == Some(&b'"')
+                && self.src.get(self.pos + 3) == Some(&b'"')
+                && self.src.get(self.pos + 4) == Some(&b'"') =>
+            {
+                // Interpolated verbatim raw string: `@$"""..."""`.
+                self.pos += 2; // Skip '@$'
+                self.interpolated_raw_string()
+            }
+            b'@' if self.src.get(self.pos + 1) == Some(&b'$')
+                && self.src.get(self.pos + 2) == Some(&b'"') =>
+            {
+                // Interpolated verbatim string: `@$"..."`.
+                self.pos += 2; // Skip '@$'
+                self.interpolated_verbatim_string()
             }
             b'@' if self.src.get(self.pos + 1) == Some(&b'"') => {
                 // Verbatim string: `@"..."`. Only `"` ends it; backslashes
@@ -288,9 +360,28 @@ impl<'src> Lexer<'src> {
                 TokenKind::Identifier(text.to_owned())
             }
             _ => {
-                // Unknown byte: consume it so lexing always makes progress.
+                // Byte the lexer has no rule for (`@`, `$`, a stray
+                // backtick, a truncated UTF-8 sequence). It used to
+                // consume the byte and return `Eof`, which silently
+                // truncated the file: the parser saw a clean end of
+                // input and every declaration after this point
+                // vanished, so a typo produced a build that "worked"
+                // with half a class. Report it and keep
+                // lexing, so the rest of the file is still analyzed.
+                self.diags.push(
+                    Diagnostic::new(
+                        "E0006",
+                        Severity::Error,
+                        crate::t!(
+                            "rubyc.parser.lexer.Lexer.next_token.unexpected_byte"
+                        )
+                        .replace("{0}", &format!("0x{b:02x}")),
+                    )
+                    .at(Span::new(self.token_start as u32, self.pos as u32 + 1))
+                    .in_context(ScopeContext::default()),
+                );
                 self.pos += 1;
-                return self.make(TokenKind::Eof);
+                return self.next_token();
             }
         };
         self.make(kind)
@@ -301,15 +392,24 @@ impl<'src> Lexer<'src> {
             if b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
                 self.pos += 1;
             } else if b >= 0x80 {
-                // Unicode whitespace (C# spec; real dotnet sources
-                // contain NBSP U+00A0, e.g. Task.cs) and the UTF-8 BOM
-                // (U+FEFF). Rust's `is_whitespace` covers the Zs
-                // category plus TAB/VT/FF/LF/CR/NEL. Anything else ends
-                // trivia (the unknown-byte arm reports it downstream).
+                // Trivia that C# actually defines: the Unicode
+                // separator classes Zs/Zl/Zp, the ASCII control
+                // whitespace, and — only at the very start of the file —
+                // a byte-order mark. NEL (U+0085) is category Cc, not
+                // a separator, so C# does not treat it as whitespace
+                // even though Rust's `is_whitespace` does.
+                //
+                // The BOM is a file prologue, not general whitespace:
+                // mid-file U+FEFF is a zero-width no-break space inside
+                // a token, and skipping it there would silently join
+                // the identifiers on either side of it.
                 let rest = &self.src[self.pos..];
                 let s = std::str::from_utf8(rest).unwrap_or("");
                 match s.chars().next() {
-                    Some(ch) if ch == '\u{FEFF}' || ch.is_whitespace() => {
+                    Some(ch)
+                        if is_csharp_whitespace(ch)
+                            || (self.pos == 0 && ch == '\u{FEFF}') =>
+                    {
                         self.pos += ch.len_utf8();
                     }
                     _ => break,
@@ -890,11 +990,10 @@ fn parse_int_literal(cleaned: &str) -> u64 {
         } else {
             0
         };
-        // Skip closing quote
         if self.peek() == Some(&b'\'') {
             self.pos += 1;
         }
-        TokenKind::IntLiteral(value)
+        TokenKind::CharLiteral(value as u32)
     }
 
     /// Read exactly `n` hex digits at `pos`, advancing past them (fewer

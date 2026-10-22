@@ -1,9 +1,119 @@
 //! Expressions: precedence climbing, unary, postfix chains, primaries.
 
-use crate::models::{Expr, Keyword, Literal, TokenKind, UnOp};
+use crate::models::{Diagnostic, Expr, Keyword, Literal, Severity, TokenKind, UnOp};
 
 use super::super::{Parser, describe, expr_span_last};
+
+/// The string a `nameof(...)` argument evaluates to: the last simple
+/// name, exactly as C# defines it.
+///
+/// Accepted shapes (everything else has no name, so the caller reports
+/// it):
+///   `x`  `this`  `int`  `default`      — a simple name
+///   `A.B`  `a.b.c`  `List<int>.Node`  — member access
+///   `m()`  `a.m()`                    — an invocation names its method
+///   `x.y`  where `x` is `this`/`base`
+///
+/// The argument text is NOT source text: generic arguments are skipped
+/// wholesale, so `nameof(List<int>.Node)` is "Node", not "List<int>".
+fn nameof_name(parts: &[TokenKind]) -> Option<String> {
+    let mut i = 0usize;
+    // First segment: a name (identifier or keyword like `int`).
+    let mut last = match parts.first()? {
+        TokenKind::Identifier(n) => n.clone(),
+        TokenKind::Keyword(kw) => format!("{kw:?}").to_lowercase(),
+        _ => return None,
+    };
+    i += 1;
+    loop {
+        // A generic argument list belongs to the previous segment.
+        if matches!(parts.get(i), Some(TokenKind::Less)) {
+            let mut depth = 0usize;
+            while let Some(t) = parts.get(i) {
+                match t {
+                    TokenKind::Less => depth += 1,
+                    TokenKind::Greater => depth -= 1,
+                    // `>>` / `>=` close two / compare: a `nameof`
+                    // argument is never a comparison, so treat the
+                    // shift operators as two closers.
+                    TokenKind::Shr => depth = depth.saturating_sub(2),
+                    TokenKind::ShrShr => depth = depth.saturating_sub(3),
+                    _ => {}
+                }
+                i += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        match parts.get(i) {
+            Some(TokenKind::Dot) => {
+                i += 1;
+                last = match parts.get(i)? {
+                    TokenKind::Identifier(n) => n.clone(),
+                    TokenKind::Keyword(kw) => format!("{kw:?}").to_lowercase(),
+                    _ => return None,
+                };
+                i += 1;
+            }
+            // A call names the callee: `nameof(m())` is "m". Arguments
+            // inside the call do not participate.
+            Some(TokenKind::LeftParen) => {
+                let mut depth = 0usize;
+                while let Some(t) = parts.get(i) {
+                    match t {
+                        TokenKind::LeftParen => depth += 1,
+                        TokenKind::RightParen => {
+                            depth -= 1;
+                            i += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                return Some(last);
+            }
+            None => return Some(last),
+            _ => return None,
+        }
+    }
+}
 impl Parser {
+    /// Render the next `n` tokens as a type spelling (`Box<int>`,
+    /// `Ns.Outer<T>.Inner`, `int[]?`). Reconstructing from tokens keeps
+    /// the element type identical to every other type in the compiler:
+    /// a source slice cannot see past a comment, an attribute, or a
+    /// non-ASCII identifier.
+    pub(in crate::parser::rd) fn render_type_tokens(&self, n: usize) -> String {
+        let mut out = String::new();
+        for k in 0..n {
+            match self.peek_at(k).kind {
+                TokenKind::Identifier(ref name) => out.push_str(name),
+                TokenKind::Dot => out.push('.'),
+                TokenKind::Less | TokenKind::Shl => out.push('<'),
+                TokenKind::Greater => out.push('>'),
+                TokenKind::Shr => out.push_str(">>"),
+                TokenKind::ShrShr => out.push_str(">>>"),
+                TokenKind::Comma => out.push(','),
+                TokenKind::Question => out.push('?'),
+                TokenKind::Star => out.push('*'),
+                TokenKind::LeftBracket => out.push('['),
+                TokenKind::RightBracket => out.push(']'),
+                TokenKind::Keyword(kw) => {
+                    out.push_str(&format!("{kw:?}").to_lowercase());
+                }
+                // Nothing else belongs in a type spelling; drop it
+                // rather than inventing text for it.
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub(in crate::parser::rd) fn primary(&mut self) -> Option<Expr> {
         let token = self.peek().clone();
         match &token.kind {
@@ -659,7 +769,10 @@ impl Parser {
                 {
                     self.bump(); // '['
                     self.bump(); // ']'
-                    let mut count = 0i64;
+                    // The elements ARE the value: dropping them produced an
+                    // array of the right length with every slot zero, which
+                    // compiles, runs, and is silently wrong.
+                    let mut elements: Vec<Expr> = Vec::new();
                     if self.eat(&TokenKind::LeftBrace).is_some() {
                         while self.peek().kind != TokenKind::RightBrace
                             && self.peek().kind != TokenKind::Eof
@@ -668,12 +781,13 @@ impl Parser {
                                 continue;
                             }
                             let mark = self.pos;
-                            if self.expression().is_none() {
-                                if self.pos == mark {
-                                    self.bump();
+                            match self.expression() {
+                                Some(e) => elements.push(e),
+                                None => {
+                                    if self.pos == mark {
+                                        self.bump();
+                                    }
                                 }
-                            } else {
-                                count += 1;
                             }
                         }
                         self.expect(&TokenKind::RightBrace, "to close array initializer")?;
@@ -681,9 +795,9 @@ impl Parser {
                     let end = expr_span_last(&self.tokens[..self.pos]);
                     return Some(Expr::NewArray {
                         elem_type: String::new(),
-                        size: Box::new(Expr::Literal(Literal::Int(count))),
+                        size: Box::new(Expr::Literal(Literal::Int(elements.len() as i64))),
                         span: token.span.to(end),
-                        init: Vec::new(),
+                        init: elements,
                     });
                 }
                 // `new T[size1, size2, ...]` followed optionally by
@@ -785,16 +899,39 @@ impl Parser {
                     // is legal C# (size + initializer). Consume balanced
                     // braces so the statement `;` is found.
                     if self.peek().kind == TokenKind::LeftBrace {
+                        // `new T[n] { e1, e2 }` — legal when the count
+                        // matches. The ELEMENTS are the value (the size
+                        // must agree), so the array is built from them.
+                        // Reporting instead would leave the written
+                        // values out of a value the program already has.
                         self.bump(); // '{'
-                        let mut depth = 1i32;
-                        while depth > 0 && self.peek().kind != TokenKind::Eof {
-                            match self.peek().kind {
-                                TokenKind::LeftBrace => depth += 1,
-                                TokenKind::RightBrace => depth -= 1,
-                                _ => {}
+                        let mut elements: Vec<Expr> = Vec::new();
+                        while self.peek().kind != TokenKind::RightBrace
+                            && self.peek().kind != TokenKind::Eof
+                        {
+                            if self.eat(&TokenKind::Comma).is_some() {
+                                continue;
                             }
-                            self.bump();
+                            let mark = self.pos;
+                            match self.expression() {
+                                Some(e) => elements.push(e),
+                                None => {
+                                    if self.pos == mark {
+                                        self.bump();
+                                    }
+                                }
+                            }
                         }
+                        self.expect(&TokenKind::RightBrace, "to close array initializer")?;
+                        let end = expr_span_last(&self.tokens[..self.pos]);
+                        return Some(Expr::NewArray {
+                            elem_type,
+                            size: Box::new(Expr::Literal(Literal::Int(
+                                elements.len() as i64,
+                            ))),
+                            span: token.span.to(end),
+                            init: elements,
+                        });
                     }
                     let end = expr_span_last(&self.tokens[..self.pos]);
                     return Some(Expr::NewArray {
@@ -825,8 +962,7 @@ impl Parser {
                         self.peek_at(j).kind,
                         TokenKind::Less | TokenKind::Shl
                     ) {
-                        // Skip balanced `<...>`.
-                        let mut depth = 0i32;
+                                let mut depth = 0i32;
                         loop {
                             match self.peek_at(j).kind {
                                 TokenKind::Less | TokenKind::Shl => depth += 1,
@@ -846,23 +982,13 @@ impl Parser {
                         && self.peek_at(j + 1).kind != TokenKind::RightBracket
                         && self.peek_at(j + 1).kind != TokenKind::Comma
                     {
-                        // Element spelling = source slice from `new`
-                        // through the end of the type (before `[`).
-                        let elem_end = self.peek_at(j).span.start as usize;
-                        let elem_start = token.span.start as usize;
-                        // `token` is the `new` keyword; element starts
-                        // after `new ` — find the first Identifier.
-                        let mut s = elem_start;
-                        while s < elem_end
-                            && !self.source[s].is_ascii_alphabetic()
-                            && self.source[s] != b'_'
-                        {
-                            s += 1;
-                        }
-                        let elem_type =
-                            String::from_utf8_lossy(&self.source[s..elem_end])
-                                .trim()
-                                .to_owned();
+                        // Element spelling from TOKENS, `Ident` through
+                        // the end of the type (before `[`). A source slice
+                        // begins at `new`, whose own `n` is the first ASCII
+                        // letter, so `new Box<int>[2]` used to spell its
+                        // element `new Box<int>` — a name that matches no
+                        // entry and silently fell back to a default layout.
+                        let elem_type = self.render_type_tokens(j);
                         // Consume through `[size]`.
                         while self.pos < self.tokens.len()
                             && self.peek().kind != TokenKind::LeftBracket
@@ -910,7 +1036,11 @@ impl Parser {
                     )?;
                 }
                 if is_array_type {
-                    // Array initializer: `{ e1, e2, ... }`.
+                    // `new int[] { e1, e2, ... }` IS an array value: the
+                    // elements are the array, and dropping them (as this
+                    // used to) produced a null/empty array that still
+                    // compiled and ran.
+                    let mut elements: Vec<Expr> = Vec::new();
                     if self.eat(&TokenKind::LeftBrace).is_some() {
                         while self.peek().kind != TokenKind::RightBrace
                             && self.peek().kind != TokenKind::Eof
@@ -919,17 +1049,28 @@ impl Parser {
                                 continue;
                             }
                             let mark = self.pos;
-                            if self.expression().is_none() {
-                                // Ensure forward progress: bump at least one
-                                // token on parse failure so the loop can
-                                // converge.
-                                if self.pos == mark {
-                                    self.bump();
+                            match self.expression() {
+                                Some(e) => elements.push(e),
+                                None => {
+                                    // Forward progress on a parse failure.
+                                    if self.pos == mark {
+                                        self.bump();
+                                    }
                                 }
                             }
                         }
                         self.expect(&TokenKind::RightBrace, "to close array initializer")?;
                     }
+                    let end = expr_span_last(&self.tokens[..self.pos]);
+                    // `int[]` -> element type `int`; the rank suffixes are
+                    // part of the ARRAY, not of its element.
+                    let elem_type = full_name.trim_end_matches("[]").to_owned();
+                    return Some(Expr::NewArray {
+                        elem_type,
+                        size: Box::new(Expr::Literal(Literal::Int(elements.len() as i64))),
+                        span: token.span.to(end),
+                        init: elements,
+                    });
                 } else if self.peek().kind == TokenKind::LeftBrace {
                     // Object or collection initializer: `{ e1, e2, ... }` or
                     // `{ Key = Value, ... }` or `{ [idx] = Value, ... }`.
@@ -949,16 +1090,36 @@ impl Parser {
                         }
                         // Index-initializer: `[expr] = value`.
                         if self.peek().kind == TokenKind::LeftBracket {
+                            // `["key"] = value` — an INDEX initializer:
+                            // `set_Item(key, value)` after construction.
+                            // It used to vanish (the collection came back
+                            // empty) and then to be reported.
+                            let idx_span = self.peek().span;
                             self.bump(); // '['
+                            let mut index: Option<Expr> = None;
                             let mark = self.pos;
-                            if self.expression().is_none() && self.pos == mark {
-                                self.bump();
+                            match self.expression() {
+                                Some(e) => index = Some(e),
+                                None => {
+                                    if self.pos == mark {
+                                        self.bump();
+                                    }
+                                }
                             }
                             self.expect(&TokenKind::RightBracket, "to close index in initializer")?;
                             if self.eat(&TokenKind::Assign).is_some() {
-                                let mark = self.pos;
-                                if self.expression().is_none() && self.pos == mark {
-                                    self.bump();
+                                let vmark = self.pos;
+                                match self.expression() {
+                                    Some(value) => init.push(crate::models::ast::MemberInit {
+                                        name: String::new(),
+                                        value,
+                                        index,
+                                        span: idx_span,
+                                    }),
+                                    None if self.pos == vmark => {
+                                        self.bump();
+                                    }
+                                    None => {}
                                 }
                             }
                         }
@@ -981,6 +1142,7 @@ impl Parser {
                                 Some(value) => init.push(crate::models::ast::MemberInit {
                                     name: key,
                                     value,
+                                    index: None,
                                     span: key_span,
                                 }),
                                 None if self.pos == mark => {
@@ -989,12 +1151,25 @@ impl Parser {
                                 None => {}
                             }
                         }
-                        // Collection initializer: just a value.
+                        // Collection initializer: a bare value is an
+                        // `Add(value)` call after construction. It used
+                        // to be parsed and dropped, so the collection
+                        // came back empty; it is recorded with an empty
+                        // member name and lowered as `Add`.
                         else {
                             let mark = self.pos;
-                            if self.expression().is_none() {
-                                if self.pos == mark {
-                                    self.bump();
+                            let span = self.peek().span;
+                            match self.expression() {
+                                Some(value) => init.push(crate::models::ast::MemberInit {
+                                    name: String::new(),
+                                    value,
+                                    index: None,
+                                    span,
+                                }),
+                                None => {
+                                    if self.pos == mark {
+                                        self.bump();
+                                    }
                                 }
                             }
                         }
@@ -1069,13 +1244,18 @@ impl Parser {
                 Some(Expr::Literal(Literal::Null))
             }
             TokenKind::Keyword(Keyword::Nameof_) if self.peek_at(1).kind == TokenKind::LeftParen => {
-                // `nameof(expr)` — returns the name of the expression as a string.
-                // Consumes tokens until the matching ')', handling nested
-                // parens/brackets: `nameof(x)`, `nameof(A.B.C)`, `nameof(m())`,
-                // `nameof(arr[0])`, etc.
+                // `nameof(expr)` — a compile-time constant naming the
+                // LAST simple name of the argument. It used to return
+                // the fixed string "name" whatever the argument was, so
+                // reflection-style code and property-name-based lookups
+                // silently read the wrong key.
+                let open_span = self.peek().span;
                 self.bump(); // 'nameof'
                 self.bump(); // '('
+                // Collect the argument's tokens up to the matching ')'.
                 let mut depth = 1usize;
+                let mut parts: Vec<TokenKind> = Vec::new();
+                let mut close_span = open_span;
                 while depth > 0 {
                     match self.peek().kind {
                         TokenKind::LeftParen
@@ -1083,19 +1263,42 @@ impl Parser {
                         | TokenKind::LeftBrace => depth += 1,
                         TokenKind::RightParen
                         | TokenKind::RightBracket
-                        | TokenKind::RightBrace => depth -= 1,
+                        | TokenKind::RightBrace => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close_span = self.peek().span;
+                                break;
+                            }
+                        }
                         TokenKind::Eof => break,
                         _ => {}
                     }
-                    if depth > 0 {
-                        self.bump();
-                    }
+                    parts.push(self.peek().kind.clone());
+                    self.bump();
                 }
                 // depth == 0 → current token is the closing ')'
                 self.bump();
-                // For now return a placeholder string; the actual name extraction
-                // is a compile-time constant fold (TODO: proper nameof lowering).
-                Some(Expr::Literal(Literal::Str("name".to_owned())))
+                match nameof_name(&parts) {
+                    Some(name) => Some(Expr::Literal(Literal::Str(name))),
+                    None => {
+                        // C# has no name to give here (`nameof(a + b)`,
+                        // `nameof(arr[0])`, a bare literal). Reporting it
+                        // beats answering a constant that is wrong.
+                        let mut diag = Diagnostic::new(
+                            "E0032",
+                            Severity::Error,
+                            crate::t!("rubyc.parser.rd.expression.primary.nameof_argument"),
+                        )
+                        .at(open_span.to(close_span))
+                        .in_context(self.context.clone());
+                        diag.help = Some(
+                            "nameof needs a name: a variable, field, property, type, or a call to one"
+                                .to_owned(),
+                        );
+                        self.errors.push(diag);
+                        Some(Expr::Literal(Literal::Str(String::new())))
+                    }
+                }
             }
             TokenKind::Keyword(Keyword::Throw) => {
                 // `throw expr` — throw expression (C# 7+)
@@ -1113,49 +1316,36 @@ impl Parser {
                     || self.peek_at(1).kind == TokenKind::LeftBrace =>
             {
                 // Anonymous method: `delegate(params) { body }` or
-                // parameterless `delegate { body }` (signature inferred
-                // from the target delegate type, per C#). We consume the
-                // whole construct as a single expression (treated as a
-                // NewArray of zero elements). The compact AST does not
-                // model closures.
+                // parameterless `delegate { body }`. It is a lambda: C#
+                // gives it the same semantics (the target delegate supplies
+                // the parameter types, the body captures like any closure),
+                // so it becomes the same `Expr::Lambda` node. Parameter
+                // TYPES are skipped for that reason — `delegate (Node n)`
+                // and `(n) =>` are the same value.
+                let start = token.span;
                 self.bump(); // 'delegate'
-                if self.peek().kind == TokenKind::LeftParen {
-                    self.expect(&TokenKind::LeftParen, "to open anonymous method params")?;
-                    while self.peek().kind != TokenKind::RightParen
-                        && self.peek().kind != TokenKind::Eof
-                    {
-                        self.bump();
-                    }
-                    self.expect(&TokenKind::RightParen, "to close anonymous method params")?;
+                let params = self.consume_lambda_params();
+                if self.peek().kind != TokenKind::LeftBrace {
+                    self.expect(&TokenKind::LeftBrace, "to open an anonymous method body")?;
                 }
-                if self.peek().kind == TokenKind::LeftBrace {
-                    let mut depth = 0i32;
-                    while self.peek().kind != TokenKind::Eof {
-                        if self.peek().kind == TokenKind::LeftBrace {
-                            depth += 1;
-                        } else if self.peek().kind == TokenKind::RightBrace {
-                            depth -= 1;
-                            if depth == 0 {
-                                self.bump();
-                                break;
-                            }
-                        }
-                        self.bump();
-                    }
-                }
-                Some(Expr::NewArray {
-                    elem_type: "anonymous_method".to_owned(),
-                    size: Box::new(Expr::Literal(Literal::Int(0))),
-                    span: token.span.to(self.peek_at(0).span),
-                    init: Vec::new(),
+                let body = self.block();
+                Some(Expr::Lambda {
+                    params,
+                    body: crate::models::ast::expression::LambdaBody::Block(body),
+                    span: start.to(self.peek_at(0).span),
                 })
             }
             TokenKind::Keyword(Keyword::From) if matches!(self.peek_at(1).kind, TokenKind::Identifier(_)) => {
-                // LINQ query expression. Swallow tokens up to the
-                // terminating `;` so the surrounding expression is
-                // balanced. The compact AST treats the whole query
-                // as a single string literal.
-                let mut text = String::from("query:");
+                // Query syntax (`from x in xs ... select ...`). It is
+                // real C#, but the compiler cannot evaluate it: there
+                // is no query lowering, so the whole expression would
+                // have to be a fabricated value. It used to become one
+                // string literal, so `var q = from ... select x;`
+                // compiled and then handed callers that string.
+                // Consume the query — so the rest of the file
+                // is still parsed and the enclosing expression stays
+                // balanced — and report it instead.
+                let start = self.peek().span;
                 let mut depth = 0i32;
                 // A closer at depth 0 ends the query without being
                 // consumed: it belongs to an enclosing construct — the
@@ -1179,13 +1369,20 @@ impl Parser {
                     } else if matches!(self.peek().kind, TokenKind::RightParen | TokenKind::RightBrace | TokenKind::RightBracket) {
                         depth -= 1;
                     }
-                    let s = format!("{:?}", self.peek().kind);
-                    let s = s.trim_matches('\'').to_string();
-                    text.push(' ');
-                    text.push_str(&s);
                     self.bump();
                 }
-                Some(Expr::Literal(Literal::Str(text)))
+                let mut diag = Diagnostic::new(
+                    "E0031",
+                    Severity::Error,
+                    crate::t!("rubyc.parser.rd.expression.primary.query_expression"),
+                )
+                .at(start.to(self.peek().span))
+                .in_context(self.context.clone());
+                diag.help = Some(
+                    "rewrite the query with method syntax (Select / Where / OrderBy)".to_owned(),
+                );
+                self.errors.push(diag);
+                Some(Expr::Literal(Literal::Int(0)))
             }
             TokenKind::Keyword(Keyword::Stackalloc) => {
                 // `stackalloc T[n]` or `stackalloc T[] { ... }` — C# 11
@@ -1295,12 +1492,34 @@ impl Parser {
                 // misparse the generic brackets as comparisons. Record
                 // the type name as the single argument.
                 if callee == "typeof" || callee == "sizeof" {
-                    // Tuple type: `typeof((TCollection, TKey, TValue))`
-                    // (System.Text.Json cache keys). Opaque — the inner
-                    // shape never affects lowering, like other compact
-                    // type names.
+                    // Tuple type: `typeof((TCollection, TKey, TValue))`.
+                    // The inner shape does not survive the compact type
+                    // model, so the argument becomes the opaque name
+                    // "tuple".
                     let type_name = if self.peek().kind == TokenKind::LeftParen {
+                        let open = self.peek().span;
                         self.skip_balanced_bracket();
+                        // `sizeof` only accepts unmanaged types and a
+                        // tuple is a managed one, so C# rejects this
+                        // outright. It used to size the opaque "tuple"
+                        // name instead, printing a number (8) for a
+                        // construct that cannot be compiled.
+                        // `typeof` is left alone: it already reports the
+                        // real gap downstream (no reflection runtime).
+                        if callee == "sizeof" {
+                            self.errors.push(
+                                Diagnostic::new(
+                                    "E0039",
+                                    Severity::Error,
+                                    crate::t!(
+                                        "rubyc.parser.rd.expression.primary.sizeof_tuple"
+                                    ),
+                                )
+                                .at(token.span.to(self.peek_at(0).span))
+                                .in_context(self.context.clone()),
+                            );
+                        }
+                        let _ = open;
                         String::from("tuple")
                     } else {
                         self.type_name()?
@@ -1333,17 +1552,33 @@ impl Parser {
             | TokenKind::Keyword(Keyword::Unchecked)
                 if self.peek_at(1).kind == TokenKind::LeftParen =>
             {
-                // `checked(expr)` / `unchecked(expr)` are C# overflow-control
-                // operators. The backend does not model overflow checking, so
-                // we desugar to the inner expression (a pass-through).
+                // `checked(expr)` / `unchecked(expr)` — C# overflow-control
+                // operators. Arithmetic in this compiler always wraps, which
+                // IS `unchecked`, so that form desugars exactly. `checked`
+                // promises an `OverflowException` that never arrives, so it
+                // is reported rather than quietly discarded.
+                let checked_kw = matches!(self.peek().kind, TokenKind::Keyword(Keyword::Checked));
+                let start = self.peek().span;
                 self.bump(); // 'checked' / 'unchecked'
                 self.bump(); // '('
                 let inner = self.expression()?;
-                self.expect(
+                let close = self.expect(
                     &TokenKind::RightParen,
                     "rubyc.parser.rd.Parser.ctx.close_arg_list",
                 );
-                Some(inner)
+                // `checked` is a real node: the lowering arms overflow
+                // checks for the arithmetic and narrowing inside it.
+                // `unchecked` is the default model, so it stays the plain
+                // expression it always was.
+                let span = start.to(close.map_or(self.peek().span, |t| t.span));
+                if checked_kw {
+                    Some(Expr::Checked {
+                        inner: Box::new(inner),
+                        span,
+                    })
+                } else {
+                    Some(inner)
+                }
             }
             TokenKind::Identifier(name) => {
                 let name_span = self.peek().span;
@@ -1394,6 +1629,10 @@ impl Parser {
             TokenKind::IntLiteral(value) => {
                 self.bump();
                 Some(Expr::Literal(Literal::Int(*value as i64)))
+            }
+            TokenKind::CharLiteral(value) => {
+                self.bump();
+                Some(Expr::Literal(Literal::Char(*value)))
             }
             TokenKind::FloatLiteral(bits) => {
                 self.bump();

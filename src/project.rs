@@ -71,6 +71,7 @@ impl Project {
             ..Default::default()
         };
         let mut section = String::new();
+        let mut dead: Vec<String> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with('#') || line.is_empty() {
@@ -78,11 +79,49 @@ impl Project {
             }
             if line.starts_with('[') && line.ends_with(']') {
                 section = line[1..line.len() - 1].to_owned();
+                if !matches!(section.as_str(), "meta" | "target" | "build" | "libs" | "hooks") {
+                    dead.push(format!("[{section}]"));
+                }
                 continue;
             }
-            let Some(eq) = line.find('=') else { continue };
+            let Some(eq) = line.find('=') else {
+                dead.push(format!("line '{line}'"));
+                continue;
+            };
             let key = line[..eq].trim();
             let val = parse_value(line[eq + 1..].trim());
+            let known = if section.is_empty() {
+                false
+            } else {
+                matches!(
+                    (section.as_str(), key),
+                    ("meta", "name" | "version" | "author" | "description")
+                        | ("target", "platform" | "language" | "output")
+                        | (
+                            "build",
+                            "sources"
+                                | "entry-point"
+                                | "defines"
+                                | "dynamic"
+                                | "optimize"
+                                | "strip"
+                                | "jobs"
+                                | "target"
+                                | "rci-only"
+                        )
+                        | ("libs", "external" | "ruby_c")
+                        | ("hooks", "pre-build" | "post-build")
+                )
+            };
+            if !known
+                && !dead.iter().any(|d| d == &format!("[{section}]"))
+            {
+                dead.push(if section.is_empty() {
+                    key.to_owned()
+                } else {
+                    format!("{section}.{key}")
+                });
+            }
 
             match (section.as_str(), key) {
                 ("meta", "name") => p.name = as_string(&val),
@@ -134,6 +173,15 @@ impl Project {
             if section == "libs" && key == "ruby_c" {
                 p.ruby_c_libs = parse_string_array(&val);
             }
+        }
+        if !dead.is_empty() {
+            dead.sort();
+            dead.dedup();
+            return Err(format!(
+                "unknown project key(s) in {}: {}",
+                path.display(),
+                dead.join(", ")
+            ));
         }
         Ok(p)
     }
@@ -202,8 +250,7 @@ impl Project {
                     return Some(candidate);
                 }
             }
-            // Check for any .rcp/.rcs in this directory
-            if let Ok(entries) = std::fs::read_dir(&d) {
+                if let Ok(entries) = std::fs::read_dir(&d) {
                 for entry in entries.flatten() {
                     let ext = entry
                         .path()
@@ -288,6 +335,7 @@ impl Solution {
             ..Default::default()
         };
         let mut section = String::new();
+        let mut dead: Vec<String> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with('#') || line.is_empty() {
@@ -304,11 +352,38 @@ impl Solution {
             }
             if line.starts_with('[') && line.ends_with(']') {
                 section = line[1..line.len() - 1].trim_start_matches('[').to_owned();
+                let known_section = matches!(section.as_str(), "solution" | "hooks")
+                    || section
+                        .strip_prefix("profile.")
+                        .is_some_and(|name| !name.is_empty());
+                if !known_section {
+                    dead.push(format!("[{section}]"));
+                }
                 continue;
             }
-            let Some(eq) = line.find('=') else { continue };
+            let Some(eq) = line.find('=') else {
+                dead.push(format!("line '{line}'"));
+                continue;
+            };
             let key = line[..eq].trim();
             let val = parse_value(line[eq + 1..].trim());
+            let known = match section.as_str() {
+                "" => matches!(key, "name" | "version"),
+                "solution" => key == "version",
+                "__project__" => key == "path",
+                "hooks" => key == "pre-solution",
+                s if s.starts_with("profile.") => {
+                    matches!(key, "defines" | "optimize" | "strip")
+                }
+                _ => false,
+            };
+            if !known && !dead.iter().any(|d| d == &format!("[{section}]")) {
+                dead.push(if section.is_empty() {
+                    key.to_owned()
+                } else {
+                    format!("{section}.{key}")
+                });
+            }
 
             match (section.as_str(), key) {
                 ("meta", "name") | (_, "name") if section.is_empty() => sol.name = as_string(&val),
@@ -336,6 +411,15 @@ impl Solution {
                     }
                 }
             }
+        }
+        if !dead.is_empty() {
+            dead.sort();
+            dead.dedup();
+            return Err(format!(
+                "unknown solution key(s) in {}: {}",
+                path.display(),
+                dead.join(", ")
+            ));
         }
         Ok(sol)
     }

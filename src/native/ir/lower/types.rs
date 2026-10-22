@@ -3,8 +3,9 @@
 use super::super::{Instr, LowerError, VReg};
 use crate::models::{BinOp as AstBinOp, Expr, Literal};
 use crate::native::ir::Ctx;
-use crate::native::semantic::{ClassInfo, FieldInfo, TypeTable};
+use crate::native::semantic::{ClassInfo, FieldInfo, INSTANCE_HEADER_SLOTS, TypeTable};
 use super::{body::*, calls::*, select::*};
+use super::typeinfo::{is_type_receiver as is_descriptor_receiver, type_member};
 /// Import symbol for a class's vtable row: the row lives in the owning
 /// image; consumers point the object's slot 0 at it via `LoadImport`.
 /// Format shared with the backend (see `target::vtable_symbol`).
@@ -17,18 +18,6 @@ pub(super) fn vtable_symbol(entry: &ClassInfo) -> String {
 /// address import. `None` means no storage anywhere (callers keep their
 /// existing miss behavior: loud error on writes, zero on reads).
 pub(super) fn static_addr(field: &FieldInfo, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Option<VReg> {
-    // TEMP-INVDIAG3: audit Invariant static slot lookups.
-    // Removed before close.
-    if std::env::var("RUBYC_INVDIAG").is_ok() && field.name == "Invariant" {
-        let key = (field.declaring_class.clone(), field.name.clone());
-        eprintln!(
-            "[rubyc] TEMP-INVDIAG3 fdecl={} in {}.{} slot={:?}",
-            field.declaring_class,
-            ctx.current_class,
-            ctx.current_method.clone().unwrap_or_default(),
-            ctx.static_index.get(&key)
-        );
-    }
     // External statics first: the local slot (if any) is hollow zeroed
     // storage — the dep's initializers ran in its home image, not here.
     if let Some(entry) = member_host(ctx.table, &field.declaring_class, &field.name)
@@ -77,7 +66,11 @@ pub(super) fn lower_external_new(
     ctx: &Ctx<'_>,
 ) -> Result<VReg, LowerError> {
     let obj = b.fresh();
-    b.alloc(obj, (info.fields.len() + 2) as u64 * 8);
+    // The header is vtable + refcount + runtime type, then the fields.
+    b.alloc(
+        obj,
+        (info.fields.len() + INSTANCE_HEADER_SLOTS) as u64 * 8,
+    );
     let lib = format!("{}.so", info.owner);
     let vt = b.fresh();
     let vidx = dep_import_index(ctx, &lib, &vtable_symbol(info));
@@ -96,7 +89,7 @@ pub(super) fn lower_external_new(
             if is_method_group(a, b, ctx) {
                 return "method-group".to_owned();
             }
-            static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned())
+            overload_arg_type(a, b, ctx)
         })
         .collect();
     let selected = select_visible(
@@ -271,8 +264,21 @@ pub(super) fn dotted_spelling(expr: &Expr) -> Option<String> {
     }
 }
 
-pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result<String, LowerError> {    match expr {
+pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result<String, LowerError> {
+    match expr {
+        // A named argument has its value's type: overload selection and
+        // coercion run before the argument list is rewritten to
+        // parameter order.
+        Expr::NamedArg { value, .. } => static_type_of(value, b, ctx),
         Expr::Ident { name, .. } => {
+            // A generic-inlined body knows its type arguments: `T` in
+            // `Test<IntNum>` IS `IntNum`, so `T.StaticMember` resolves
+            // against the concrete type.
+            if let Some(sub) = ctx.type_subst
+                && let Some(concrete) = subst_type_var(name, sub)
+            {
+                return Ok(concrete);
+            }
             // Declared bindings win over the `this` keyword (mirrors
             // eval): an `@this` parameter types as its declared type,
             // not the enclosing class.
@@ -331,6 +337,12 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
             // expression context, mirroring C# lookup order.
             if let Some(info) = this_info(ctx, name) {
                 if let Some(f) = info.field(name) {
+                    // A `using`-alias can leave a field's declared type
+                    // as the alias name (`NativeType _value` where the
+                    // alias stands for `IntPtr` or `Double`). The
+                    // spelling resolves to no single entry, so carry it
+                    // through as-is and let overload ranking treat it
+                    // as a wildcard (see `is_using_alias`).
                     return Ok(f.type_name.clone());
                 }
                 if let Some(p) = info.property(name) {
@@ -420,6 +432,24 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
             Ok("object".to_owned())
         }
         Expr::New { class_name, .. } => Ok(class_name.clone()),
+        Expr::SwitchExpr { arms, .. } => {
+            // The arm bodies decide the result type: all-int arms make
+            // the expression an int, not an unknown reference.
+            let mut common: Option<String> = None;
+            for arm in arms {
+                let t = static_type_of(&arm.body, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                match &common {
+                    None => common = Some(t),
+                    Some(c) if *c == t => {}
+                    Some(_) => {
+                        common = Some("object".to_owned());
+                        break;
+                    }
+                }
+            }
+            Ok(common.unwrap_or_else(|| "object".to_owned()))
+        }
         Expr::Member { object, name, .. } => {
             // Generic instantiation spelling (`Vector512<byte>` parses
             // as `Member(Vector512, "<byte>")`): when the object names
@@ -433,6 +463,18 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 return Ok("object".to_owned());
             }
             let mut base_type = static_type_of(object, b, ctx)?;
+            // Descriptor-backed System.Type properties: names are
+            // strings, the Is*/Has* predicates are bools. Without this
+            // the member types as `object` and comparisons/printf treat
+            // a string pointer as an integer.
+            if is_descriptor_receiver(&base_type)
+                && let Some((off, bit)) = type_member(name)
+            {
+                if off == u32::MAX {
+                    return Ok("System.RuntimeTypeHandle".to_owned());
+                }
+                return Ok(if bit.is_some() { "bool" } else { "string" }.to_owned());
+            }
             // Namespace-qualified or nested type reference (`Lib.C`
             // used as a receiver): if the receiver itself spells a
             // known class path and its root is not a value in scope,
@@ -444,17 +486,6 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
             // behavior: only non-value roots take this shortcut.
             if !dotted_root_is_value(object, b, ctx) {
                 if let Some(dotted) = dotted_spelling(object) {
-                    // TEMP-RESTYPE. Removed before close.
-                    if std::env::var("RUBYC_FIELDDBG").is_ok()
-                        && (name == "CACHE_LINE_SIZE" || name == "PaddingHelpers")
-                    {
-                        eprintln!(
-                            "[rubyc] TEMP-RESTYPE dotted={dotted} hit={} name={name} in {}.{}",
-                            ctx.table.class(&dotted).is_some(),
-                            ctx.current_class,
-                            ctx.current_method.clone().unwrap_or_default()
-                        );
-                    }
                     if ctx.table.class(&dotted).is_some() {
                         base_type = dotted;
                     }
@@ -554,37 +585,11 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
             let first = {
                 let mut hit = first;
                 if hit.field(name).is_none() && hit.property(name).is_none() {
-                    // TEMP-SIBDBG. Removed before close.
-                    if std::env::var("RUBYC_SIBDBG").is_ok() {
-                        eprintln!(
-                            "[rubyc] TEMP-SIBDBG base={} name={} first={} candidates={:?}",
-                            base_type,
-                            name,
-                            hit.key.path,
-                            ctx.table
-                                .classes
-                                .iter()
-                                .filter(|c| {
-                                    c.name.rsplit('.').next().unwrap_or(&c.name) == simple_base
-                                })
-                                .map(|c| c.key.path.clone())
-                                .collect::<Vec<_>>()
-                        );
-                    }
                     for cand in &ctx.table.classes {
                         let cand_simple =
                             cand.name.rsplit('.').next().unwrap_or(&cand.name);
                         if cand_simple != simple_base {
                             continue;
-                        }
-                        // TEMP-SIBDBG2. Removed before close.
-                        if std::env::var("RUBYC_SIBDBG").is_ok() {
-                            eprintln!(
-                                "[rubyc] TEMP-SIBDBG2 cand={} has_field={} has_prop={}",
-                                cand.key.path,
-                                cand.field(name).is_some(),
-                                cand.property(name).is_some()
-                            );
                         }
                         if cand.field(name).is_some() || cand.property(name).is_some() {
                             hit = cand;
@@ -596,15 +601,6 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
             };
             // Same-named nesting fallback (see `member_host`): prefer
             // the entry actually declaring the member.
-            // TEMP-FIELDDBG4. Removed before close.
-            if std::env::var("RUBYC_FIELDDBG").is_ok() && name == "CACHE_LINE_SIZE" {
-                eprintln!(
-                    "[rubyc] TEMP-FIELDDBG4 base={base_type} first={} field_some={} prop_some={}",
-                    first.key.path,
-                    first.field(name).is_some(),
-                    first.property(name).is_some()
-                );
-            }
             let info = if first.field(name).is_some() || first.property(name).is_some() {
                 first
             } else if member_host(ctx.table, &base_type, name).is_some() {
@@ -674,9 +670,46 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 None => name.clone(),
             };
             let base_type = static_type_of(object, b, ctx)?;
-            // TEMP-TYPEDBG.
-            if std::env::var("RUBYC_TYPEDBG").is_ok() {
-                eprintln!("[rubyc] TEMP-TYPEDBG-ENTRY {name} recv={base_type}");
+            // `x.GetType()` yields a `System.Type`: every object has
+            // the member, and the compiler answers the call with the
+            // receiver's runtime type.
+            if name == "GetType" && args.is_empty() {
+                return Ok("System.Type".to_owned());
+            }
+            // A primitive value's `ToString()` is a string: without this
+            // the call typed as `object`/`int`, so `==` compared the
+            // string HANDLE and printf printed it as a number.
+            if name == "ToString"
+                && args.is_empty()
+                && matches!(
+                    base_type_name(&base_type).as_str(),
+                    "int"
+                        | "Int32"
+                        | "uint"
+                        | "UInt32"
+                        | "long"
+                        | "Int64"
+                        | "ulong"
+                        | "UInt64"
+                        | "short"
+                        | "Int16"
+                        | "ushort"
+                        | "UInt16"
+                        | "byte"
+                        | "Byte"
+                        | "sbyte"
+                        | "SByte"
+                        | "nint"
+                        | "IntPtr"
+                        | "nuint"
+                        | "UIntPtr"
+                        | "bool"
+                        | "Boolean"
+                        | "char"
+                        | "Char"
+                )
+            {
+                return Ok("string".to_owned());
             }
             let arg_types: Vec<String> = args
                 .iter()
@@ -684,7 +717,7 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                     if is_method_group(a, b, ctx) {
                         return "method-group".to_owned();
                     }
-                    static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned())
+                    overload_arg_type(a, b, ctx)
                 })
                 .collect();
             // Overload-aware result type (a first-match `method()` may
@@ -733,10 +766,6 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                             );
                         }
                     }
-                }
-                // TEMP-TYPEDBG.
-                if std::env::var("RUBYC_TYPEDBG").is_ok() {
-                    eprintln!("[rubyc] TEMP-TYPEDBG {name} recv={base_type} ret={ret}");
                 }
                 return Ok(ret);
             }
@@ -832,6 +861,117 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                     }
                 }
             }
+            // A type-parameter receiver binds through its CONSTRAINT
+            // (C#: `x[i]` uses the constraint's indexer, so
+            // `ISimdVector<TVectorDouble, double>` makes the element a
+            // double).
+            if ctx.is_type_var(&arr_type) {
+                for clause in &b.constraints {
+                    if clause.param != arr_type {
+                        continue;
+                    }
+                    for ct in &clause.types {
+                        let (cbase, cargs) = match ct.find('<') {
+                            Some(k) => (
+                                ct[..k].trim().to_owned(),
+                                explicit_type_args(ct),
+                            ),
+                            None => (ct.clone(), Vec::new()),
+                        };
+                        // The constraint may name an INTERFACE, which
+                        // the table keeps beside the classes, so both
+                        // sources are consulted: a class's own
+                        // declaration and the table's interfaces.
+                        let cparams: Vec<String> = ctx
+                            .classes
+                            .iter()
+                            .find(|c| c.name == cbase)
+                            .map(|c| c.generic_params.clone())
+                            .or_else(|| {
+                                ctx.table
+                                    .interfaces
+                                    .iter()
+                                    .find(|i| i.name == cbase)
+                                    .map(|i| i.generic_params.clone())
+                            })
+                            .unwrap_or_default();
+                        let decl = ctx
+                            .classes
+                            .iter()
+                            .find(|c| c.name == cbase)
+                            .and_then(|c| {
+                                c.members.iter().find_map(|m| match m {
+                                    crate::models::ClassMember::Indexer(d)
+                                        if d.params.len() == 1 =>
+                                    {
+                                        Some(d.clone())
+                                    }
+                                    _ => None,
+                                })
+                            })
+                            .or_else(|| {
+                                ctx.table
+                                    .interfaces
+                                    .iter()
+                                    .find(|i| i.name == cbase)
+                                    .and_then(|i| {
+                                        i.indexers
+                                            .iter()
+                                            .find(|d| d.params.len() == 1)
+                                            .cloned()
+                                    })
+                            });
+                        let Some(decl) = decl else {
+                            continue;
+                        };
+                        let ret = decl.type_name.clone();
+                        let ret = if cargs.is_empty() {
+                            ret
+                        } else {
+                            substitute_generics(&ret, &cparams, &cargs)
+                        };
+                        if !ret.is_empty() && !ctx.is_type_var(&ret) {
+                            return Ok(ret);
+                        }
+                    }
+                }
+            }
+            // A class INDEXER: the element type is the indexer's
+            // declared type, with the RECEIVER's type arguments
+            // substituted (`Vector128<double>[i]` is a double, not
+            // `object`). Without the substitution the element typed as
+            // `object`, and an overload taking the element type
+            // (`double.Cos(x[i])`) did not resolve.
+            {
+                let resolved = ctx
+                    .table
+                    .alias_target(&arr_type)
+                    .map(|t| t.to_owned())
+                    .unwrap_or_else(|| {
+                        resolve_scoped(ctx.table, &arr_type, ctx.current_class)
+                            .unwrap_or_else(|| arr_type.clone())
+                    });
+                let (base, targs) = match resolved.find('<') {
+                    Some(k) => (
+                        resolved[..k].trim().to_owned(),
+                        explicit_type_args(&resolved),
+                    ),
+                    None => (resolved.clone(), Vec::new()),
+                };
+                if let Some(info) = ctx.table.class(&base)
+                    && let Some((_, decl)) = super::eval::find_indexer(ctx, &base, 1)
+                {
+                    let ret = decl.type_name.clone();
+                    let ret = if targs.is_empty() {
+                        ret
+                    } else {
+                        substitute_generics(&ret, &info.generic_params, &targs)
+                    };
+                    if !ret.is_empty() && !ctx.is_type_var(&ret) {
+                        return Ok(ret);
+                    }
+                }
+            }
             Ok("object".to_owned())
         }
         Expr::Literal(l) => {
@@ -844,6 +984,7 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 // for genuine `float` literals (see `compat_score`).
                 Literal::Float(_) => "double",
                 Literal::Int(_) => "int",
+                Literal::Char(_) => "char",
                 Literal::Bool(_) => "bool",
                 Literal::Str(_) => "string",
                 Literal::Null => "object",
@@ -887,7 +1028,7 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
         // layout). Tuples (`elem_type == "tuple"`) are NOT arrays
         // and stay unknown here.
         Expr::NewArray { elem_type, init, .. } => {
-            if elem_type == "tuple" || elem_type == "anonymous_method" {
+            if elem_type == "tuple" {
                 return Ok("object".to_owned());
             }
             if !elem_type.is_empty() {
@@ -982,21 +1123,6 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                     }
                 }
             }
-            // TEMP-MULDBG. Removed before close.
-            if std::env::var("RUBYC_MULDBG").is_ok()
-                && ctx
-                    .current_method
-                    .as_deref()
-                    .is_some_and(|m| m.contains("GetCurrentHashAsHash128"))
-            {
-                let dl = static_type_of(lhs, b, ctx)
-                    .map(|t| t.clone())
-                    .unwrap_or_else(|e| format!("ERR:{e:?}"));
-                let dr = static_type_of(rhs, b, ctx)
-                    .map(|t| t.clone())
-                    .unwrap_or_else(|e| format!("ERR:{e:?}"));
-                eprintln!("[rubyc] TEMP-MULDBG l={dl} r={dr}");
-            }
             let (l, r) = (
                 static_type_of(lhs, b, ctx)?,
                 static_type_of(rhs, b, ctx)?,
@@ -1055,6 +1181,19 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                 Expr::Default { type_name, .. } if type_name.is_empty() || type_name == "void"
             ) {
                 return static_type_of(else_expr, b, ctx);
+            }
+            // Both branches carry the same type: that is the expression's
+            // type. Degrading to `object` made a value-type result travel
+            // as if it were a reference (an int landing in an object slot
+            // and read back as one).
+            {
+                let tt = static_type_of(then_expr, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                let et = static_type_of(else_expr, b, ctx)
+                    .unwrap_or_else(|_| "object".to_owned());
+                if tt == et && tt != "object" {
+                    return Ok(tt);
+                }
             }
             if matches!(
                 else_expr.as_ref(),
@@ -1115,6 +1254,22 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
             if name == "typeof" {
                 return Ok("System.Type".to_owned());
             }
+            // Compiler intrinsics with a known result type: `scan_int`
+            // reads an int, and the print intrinsics return 0. Typing
+            // them as `object` (the unknown fallback) let a value type
+            // travel as a reference and be unboxed from a raw int.
+            if matches!(
+                name.as_str(),
+                "scan_int" | "printf" | "print" | "put_str" | "eprintf"
+            ) {
+                return Ok("int".to_owned());
+            }
+            // `x.GetType()` yields a `System.Type` (every object has
+            // it). The compiler answers the call from the receiver's
+            // runtime type, so the result is a real descriptor.
+            if name == "GetType" {
+                return Ok("System.Type".to_owned());
+            }
             // Static local functions type by declaration (checked
             // before method lookup, mirroring call lowering).
             if let Some(ret) = resolve_local_ret(ctx, &name, args.len()) {
@@ -1126,7 +1281,7 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
                     if is_method_group(a, b, ctx) {
                         return "method-group".to_owned();
                     }
-                    static_type_of(a, b, ctx).unwrap_or_else(|_| "object".to_owned())
+                    overload_arg_type(a, b, ctx)
                 })
                 .collect();
             let mut entries: Vec<&ClassInfo> = Vec::new();
@@ -1176,6 +1331,24 @@ pub(crate) fn static_type_of(expr: &Expr, b: &Body<'_>, ctx: &Ctx<'_>) -> Result
         // StreamWriter's `byteBuffer` stayed a raw array and Flush
         // encoded into a zero-length destination.
         Expr::Assign { value, .. } => static_type_of(value, b, ctx),
+        // A dereference reads the POINTED-TO type: `*(byte*)p` is a
+        // byte. Without this the type degraded to `object`, which
+        // poisons the generic inference (`Memmove(ref *(byte*)dst,
+        // ...)` inferred nothing) and every overload that takes the
+        // pointed-to type.
+        Expr::Unary {
+            op: crate::models::UnOp::Deref,
+            inner,
+            ..
+        } => {
+            let pointed = static_type_of(inner, b, ctx)?;
+            let t = pointed.trim();
+            if t.ends_with('*') {
+                Ok(t.trim_end_matches('*').trim().to_owned())
+            } else {
+                Ok(pointed)
+            }
+        }
         // Call-site `ref`/`in` markers (parser) and explicit
         // address-of: the inner type, &-suffixed so overload ranking
         // can require byref parameters (unmarked value behavior
@@ -1310,81 +1483,125 @@ pub(super) fn is_float_expr(b: &Body<'_>, ctx: &Ctx<'_>, expr: &Expr) -> bool {
     }
 }
 
-/// Whether a type spelling is (or contains) a managed reference —
-/// the compile-time fold for the
-/// `RuntimeHelpers.IsReferenceOrContainsReferences<T>()` intrinsic
-/// (whose managed body is a self-call placeholder that would
-/// recurse forever if lowered literally). Conservative `true`
-/// when unknown (callers take the careful path; only the fast
-/// memmove-style path is skipped). Primitives, pointers, and
-/// enums are false; arrays and classes/interfaces/delegates are
-/// true; structs recurse into instance fields (cycle-guarded);
-/// `Nullable<T>` analyzes `T`; open type variables (`TKey`)
-/// stay conservative-true.
-pub(super) fn type_contains_refs(table: &TypeTable, spelling: &str) -> bool {
-    fn go(table: &TypeTable, spelling: &str, depth: usize, seen: &mut Vec<String>) -> bool {
-        if depth > 8 {
-            return true;
-        }
-        let mut s = spelling.trim();
-        // `scoped`/`ref`/`readonly` modifiers never change ref-ness.
-        for prefix in ["scoped ", "ref ", "readonly ", "in ", "out "] {
-            if let Some(rest) = s.strip_prefix(prefix) {
-                s = rest.trim();
-            }
-        }
-        // Nullability annotations ride on the inner type.
-        s = s.trim_end().trim_end_matches('?').trim();
-        if s.is_empty() {
-            return true;
-        }
-        // Pointers carry no managed references.
-        if s.ends_with('*') {
-            return false;
-        }
-        // Arrays are reference types (any rank, incl. `[,]`).
-        if s.ends_with(']') {
-            return true;
-        }
-        // Primitives and well-known value types without references.
-        // (`nint`/`nuint`/`IntPtr`/`UIntPtr` are machine words.)
-        let base = base_type_name(s);
-        if matches!(
-            base.as_str(),
-            "SByte" | "Byte" | "Int16" | "UInt16" | "Int32" | "UInt32" | "Int64"
-                | "UInt64" | "IntPtr" | "UIntPtr" | "Char" | "Single" | "Double"
-                | "Decimal" | "Boolean" | "sbyte" | "byte" | "short" | "ushort"
-                | "int" | "uint" | "long" | "ulong" | "nint" | "nuint" | "char"
-                | "float" | "double" | "decimal" | "bool" | "void"
-        ) {
-            return false;
-        }
-        // `Nullable<T>`: the null flag is a bool; refs ride in `T`.
-        if base == "Nullable" {
-            if let Some(inner) = s.find('<').and_then(|i| s.rfind('>').map(|j| (i, j)))
-                && inner.0 + 1 < inner.1
-            {
-                return go(table, &s[inner.0 + 1..inner.1], depth + 1, seen);
-            }
-            return true;
-        }
-        let Some(entry) = table.class(&base).or_else(|| table.class(s)) else {
-            // Open type variable (`TKey`) or unknown: conservative.
-            return true;
-        };
-        if entry.is_enum {
-            return false;
-        }
-        if seen.iter().any(|k| *k == entry.key.path) {
-            return true;
-        }
-        seen.push(entry.key.path.clone());
-        if entry.is_struct {
-            return entry.fields.iter().any(|f| {
-                !f.is_static && !f.is_const && go(table, &f.type_name, depth + 1, seen)
-            });
-        }
-        true
+
+
+/// Replace a type variable with its concrete binding. The variable may
+/// be the whole spelling (`T`), a decorated one (`T[]`, `T?`), or an
+/// argument of a constructed type (`List<T>`, `Dictionary<K, V>`):
+/// specializing a generic method replaces the parameter everywhere it
+/// appears, so the specialized body names concrete types.
+pub(super) fn subst_type_var(
+    spelling: &str,
+    sub: &[(String, String)],
+) -> Option<String> {
+    let t = spelling.trim();
+    let (base, suffix) = split_type_suffix(t);
+    let base = subst_type_base(base, sub)?;
+    Some(format!("{base}{suffix}"))
+}
+
+/// The trailing decoration of a type spelling: an array rank (`[]`,
+/// `[,]`), a pointer marker (`*`), or a nullable annotation (`?`).
+fn split_type_suffix(t: &str) -> (&str, &str) {
+    if t.ends_with(']')
+        && let Some(open) = t.rfind('[')
+    {
+        return (&t[..open], &t[open..]);
     }
-    go(table, spelling, 0, &mut Vec::new())
+    if let Some(base) = t.strip_suffix('*') {
+        return (base, "*");
+    }
+    if let Some(base) = t.strip_suffix('?') {
+        return (base, "?");
+    }
+    (t, "")
+}
+
+/// Substitute inside a type spelling that carries no trailing
+/// decoration. A constructed type keeps its shape; only the arguments
+/// that name a type variable change.
+fn subst_type_base(t: &str, sub: &[(String, String)]) -> Option<String> {
+    if t.ends_with('>')
+        && let Some(open) = t.find('<')
+    {
+        let args = explicit_type_args(t);
+        if !args.is_empty() {
+            let mut changed = false;
+            let mut out = Vec::with_capacity(args.len());
+            for a in &args {
+                match subst_type_var(a, sub) {
+                    Some(c) => {
+                        changed = true;
+                        out.push(c);
+                    }
+                    None => out.push(a.clone()),
+                }
+            }
+            if changed {
+                return Some(format!("{}<{}>", &t[..open], out.join(",")));
+            }
+        }
+    }
+    for (var, concrete) in sub {
+        if t == var {
+            return Some(concrete.clone());
+        }
+    }
+    None
+}
+
+/// The DECLARED type of an expression, or `None` when the compiler
+/// cannot establish one. Unlike [`static_type_of`], an unknown shape
+/// is not reported as `object`: the difference matters where the
+/// compiler must know that a value really is a reference (implicit
+/// unboxing of a pattern binding reads the box header, which is only
+/// safe for a reference).
+pub(crate) fn declared_type_of(
+    expr: &Expr,
+    b: &Body<'_>,
+    ctx: &Ctx<'_>,
+) -> Option<String> {
+    match expr {
+        Expr::Ident { name, .. } => b.scopes.lookup(name).map(|s| s.type_name.clone()),
+        Expr::Member { object, name, .. } => {
+            let recv = declared_type_of(object, b, ctx)?;
+            let info = ctx.table.class(&recv).or_else(|| definition_entry(ctx.table, &recv))?;
+            if let Some(f) = info.field(name) {
+                return Some(f.type_name.clone());
+            }
+            info.property(name).map(|p| p.type_name.clone())
+        }
+        Expr::Index { object, .. } => {
+            let recv = declared_type_of(object, b, ctx)?;
+            if recv.trim_end().ends_with("[]") {
+                Some(recv.trim_end_matches("[]").to_owned())
+            } else {
+                None
+            }
+        }
+        Expr::Cast { type_name, .. } => Some(type_name.clone()),
+        Expr::Literal(crate::models::Literal::Null) => Some("object".to_owned()),
+        Expr::Call { .. } => {
+            // A call types by its declared return type; an unresolved
+            // callee (a compiler intrinsic the table does not know) has
+            // no declared type.
+            let t = static_type_of(expr, b, ctx).ok()?;
+            if t == "object" { None } else { Some(t) }
+        }
+        _ => None,
+    }
+}
+
+/// Argument type for overload selection. The literal zero keeps its
+/// own spelling: C# converts the constant 0 implicitly to any enum
+/// type, and no other integer literal may convert to one.
+pub(crate) fn overload_arg_type(
+    expr: &Expr,
+    b: &Body<'_>,
+    ctx: &Ctx<'_>,
+) -> String {
+    if matches!(expr, Expr::Literal(crate::models::Literal::Int(0))) {
+        return "int-zero".to_owned();
+    }
+    static_type_of(expr, b, ctx).unwrap_or_else(|_| "object".to_owned())
 }

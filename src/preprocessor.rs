@@ -222,7 +222,7 @@ pub fn preprocess(
 
         // ---- inside #Assembly capture: everything is raw until #EndAssembly
         if in_asm {
-            if matches!(trimmed_start, "#EndAssembly" | "#EndAssmbly" | "#End") {
+            if trimmed_start == "#EndAssembly" {
                 in_asm = false;
                 out.assembly_blocks.push(std::mem::take(&mut asm_buf));
             } else {
@@ -383,7 +383,7 @@ pub fn preprocess(
                         ));
                     }
                 }
-                "Assembly" | "Assmbly" => {
+                "Assembly" => {
                     if in_asm {
                         out.diagnostics.push(err_diag(
                             "nested #Assembly block",
@@ -395,12 +395,20 @@ pub fn preprocess(
                     out.source.push('\n');
                     continue 'lines;
                 }
-                "EndAssembly" | "EndAssmbly" | "End" => {
-                    out.diagnostics.push(err_diag(
-                        "#EndAssembly without matching #Assembly",
-                        file,
-                        lineno,
-                    ));
+                // `#EndAssembly` closes the block. It used to share this
+                // arm with two misspellings (`#EndAssmbly`, `#End`) and
+                // then only ever REPORT "without matching #Assembly" —
+                // so `#Assembly … #EndAssembly` reported an error and
+                // left `in_asm` set, blanking the rest of the file.
+                "EndAssembly" => {
+                    if !in_asm {
+                        out.diagnostics.push(err_diag(
+                            "#EndAssembly without matching #Assembly",
+                            file,
+                            lineno,
+                        ));
+                    }
+                    in_asm = false;
                 }
                 other => {
                     if active_branches {

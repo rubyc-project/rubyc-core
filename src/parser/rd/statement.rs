@@ -66,10 +66,9 @@ impl Parser {
         let mut rest_pre = std::mem::take(&mut self.pre_pending);
         self.pre_pending = stashed_pre;
         self.pre_pending.append(&mut rest_pre);
-        Block {
-            stmts,
-            span: start.to(close.map_or(self.peek().span, |t| t.span)),
-        }
+        let span = start.to(close.map_or(self.peek().span, |t| t.span));
+        let stmts = wrap_using_decls(stmts, span);
+        Block { stmts, span }
     }
 
     /// Weak tuple-declaration shape: `(...)` validated by
@@ -512,13 +511,18 @@ impl Parser {
     /// `Stmt::LocalFunction` when static, non-generic, and bodied
     /// (lowered to a real function); anything else keeps the legacy
     /// zero placeholder (`Let fn = 0` + `Break`).
-    fn parse_local_function(&mut self, start: Span) -> Option<Stmt> {
+    fn parse_local_function(
+        &mut self,
+        start: Span,
+        attrs: Vec<crate::models::ast::attribute::Attribute>,
+    ) -> Option<Stmt> {
         // Optional `static` / `async` / `unsafe` modifiers, plus `ref` /
         // `readonly` / `scoped` return modifiers (by-ref-ness has no
         // runtime representation here), plus `extern` (extern locals
         // are bodyless `[UnsafeAccessor]` declarations).
         let mut is_static = false;
         let mut is_async = false;
+        let mut is_extern = false;
         while matches!(
             self.peek().kind,
             TokenKind::Keyword(Keyword::Static)
@@ -534,6 +538,9 @@ impl Parser {
             }
             if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Async)) {
                 is_async = true;
+            }
+            if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Extern)) {
+                is_extern = true;
             }
             self.bump();
         }
@@ -685,6 +692,7 @@ impl Parser {
         // value when it does not). Push it AFTER the body so the
         // enclosing `block()` (not the body's own block) drains it.
         self.pending.push(Stmt::Let {
+            is_const: false,
             is_byref: false,
             type_name: String::from("fn"),
             name: lf_name.clone(),
@@ -708,6 +716,25 @@ impl Parser {
                 ret_type: ret_type.unwrap_or_else(|| "void".to_owned()),
                 body: b,
                 is_static: true,
+                is_extern: false,
+                attrs,
+                span: end,
+            }),
+            // A bodiless `extern` local function (an `[UnsafeAccessor]`
+            // declaration) is a real declaration: the attribute names
+            // the target method. It keeps the legacy placeholder name
+            // binding above, and the body is empty.
+            (true, LocalBody::Missing) if is_extern => Some(Stmt::LocalFunction {
+                name: lf_name,
+                params,
+                ret_type: ret_type.unwrap_or_else(|| "void".to_owned()),
+                body: Block {
+                    stmts: Vec::new(),
+                    span: end,
+                },
+                is_static: true,
+                is_extern: true,
+                attrs,
                 span: end,
             }),
             _ => Some(Stmt::Break { span: end }),
@@ -844,28 +871,57 @@ impl Parser {
     /// Parse a single-parameter or parenthesized lambda statement. The
     /// body is consumed up to the matching `;` or closing brace.
     fn parse_lambda_statement(&mut self, start: Span) -> Option<Stmt> {
+        // A lambda is an EXPRESSION, and C# allows only a narrow set of
+        // expressions as statements (call, assignment, increment,
+        // `await`, `new`). A bare lambda statement is CS0201. The shape is
+        // still consumed so the rest of the block parses, and the rule is
+        // reported rather than the lambda being silently dropped.
+        let mut params: Vec<String> = Vec::new();
         if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Static)) {
             self.bump();
         }
         if self.peek().kind == TokenKind::LeftParen {
-            // Parenthesized parameter list. Consume up to and including
-            // the matching `)`.
             let mut depth = 1i32;
+            let mut current: Vec<String> = Vec::new();
             self.bump();
             while depth > 0 && self.peek().kind != TokenKind::Eof {
-                if self.peek().kind == TokenKind::LeftParen {
-                    depth += 1;
-                } else if self.peek().kind == TokenKind::RightParen {
-                    depth -= 1;
-                }
-                if depth > 0 {
-                    self.bump();
-                } else {
-                    self.bump();
-                    break;
+                match self.peek().kind.clone() {
+                    TokenKind::LeftParen => {
+                        depth += 1;
+                        current.clear();
+                        self.bump();
+                    }
+                    TokenKind::RightParen => {
+                        depth -= 1;
+                        if let Some(last) = current.last() {
+                            params.push(last.clone());
+                        }
+                        current.clear();
+                        self.bump();
+                    }
+                    TokenKind::Comma if depth == 1 => {
+                        if let Some(last) = current.last() {
+                            params.push(last.clone());
+                        }
+                        current.clear();
+                        self.bump();
+                    }
+                    TokenKind::Identifier(n) => {
+                        current.push(n);
+                        self.bump();
+                    }
+                    _ => {
+                        self.bump();
+                    }
                 }
             }
         } else {
+            let span = self.peek().span;
+            let name = String::from_utf8_lossy(
+                &self.source[span.start as usize..span.end as usize],
+            )
+            .into_owned();
+            params.push(name);
             self.bump();
         }
         if self.eat(&TokenKind::FatArrow).is_none() {
@@ -877,26 +933,24 @@ impl Parser {
             return None;
         }
         if self.peek().kind == TokenKind::LeftBrace {
-            let mut depth = 0i32;
-            while self.peek().kind != TokenKind::Eof {
-                if self.peek().kind == TokenKind::LeftBrace {
-                    depth += 1;
-                } else if self.peek().kind == TokenKind::RightBrace {
-                    depth -= 1;
-                    if depth == 0 {
-                        self.bump();
-                        break;
-                    }
-                }
-                self.bump();
-            }
+            let _ = self.block();
         } else {
             let _ = self.expression();
         }
         self.expect(&TokenKind::Semicolon, "after lambda body")?;
-        Some(Stmt::Break {
-            span: start.to(self.peek_at(0).span),
-        })
+        let mut diag = Diagnostic::new(
+            "E0040",
+            Severity::Error,
+            crate::t!("rubyc.parser.rd.statement.lambda_not_a_statement"),
+        )
+        .at(start.to(self.peek_at(0).span))
+        .in_context(self.context.clone());
+        diag.help = Some(
+            "assign the lambda to a delegate-typed variable first, then call that".to_owned(),
+        );
+        self.errors.push(diag);
+        let _ = params;
+        None
     }
 
     /// Parse a control-flow body: a braced block, or a single statement
@@ -963,16 +1017,35 @@ impl Parser {
             });
         }
 
-        // `checked { stmts }` / `unchecked { stmts }` — overflow-checking
-        // regions. The backend does not model overflow checking (all
-        // arithmetic wraps), so these are plain blocks, exactly like the
-        // expression forms desugar to their inner expression.
+        // `checked { stmts }` / `unchecked { stmts }`. Wrapping is the
+        // default, so `unchecked` stays a plain block; `checked` becomes a
+        // region the lowering arms overflow checks in.
         if matches!(
             self.peek().kind,
             TokenKind::Keyword(Keyword::Checked) | TokenKind::Keyword(Keyword::Unchecked)
         ) && self.peek_at(1).kind == TokenKind::LeftBrace
         {
+            let is_checked =
+                matches!(self.peek().kind, TokenKind::Keyword(Keyword::Checked));
+            let start_kw = self.peek().span;
             self.bump(); // 'checked' / 'unchecked'
+            if is_checked {
+                let inner = self.statement()?;
+                let (body, end) = match inner {
+                    Stmt::Block { body, span } => (body, span),
+                    other => (
+                        crate::models::Block {
+                            stmts: vec![other],
+                            span: start_kw,
+                        },
+                        start_kw,
+                    ),
+                };
+                return Some(Stmt::CheckedBlock {
+                    body,
+                    span: start_kw.to(end),
+                });
+            }
         }
 
         // `unsafe { stmts }` — an unsafe region. The backend does not
@@ -1048,15 +1121,15 @@ impl Parser {
         if self.peek().kind == TokenKind::LeftBracket {
             let mark = self.pos;
             let err_mark = self.errors.len();
-            let _ = self.attribute_lists();
+            let attrs = self.attribute_lists();
             if self.looks_like_local_function() {
-                return self.parse_local_function(start);
+                return self.parse_local_function(start, attrs);
             }
             self.pos = mark;
             self.errors.truncate(err_mark);
         }
         if self.looks_like_local_function() {
-            return self.parse_local_function(start);
+            return self.parse_local_function(start, Vec::new());
         }
 
         // C# 7+ tuple type declaration: `(T1 Name1, T2 Name2, ...) name = ...;`.
@@ -1078,6 +1151,7 @@ impl Parser {
             for name in bindings {
                 if name != "_" {
                     self.pending.push(Stmt::Let {
+                        is_const: false,
                         is_byref: false,
                         type_name: String::from("var"),
                         name,
@@ -1285,6 +1359,7 @@ impl Parser {
                     "rubyc.parser.rd.Parser.ctx.after_declaration",
                 )?;
                 return Some(Stmt::Let {
+                    is_const: false,
                     is_byref: false,
                     type_name: format!("tuple{tuple_suffix}"),
                     name,
@@ -1306,6 +1381,7 @@ impl Parser {
                 let end = start.to(self.peek_at(0).span);
                 let tmp = "__tuple_tmp".to_owned();
                 self.pending.push(Stmt::Let {
+                    is_const: false,
                     is_byref: false,
                     type_name: "tuple[]".to_owned(),
                     name: tmp.clone(),
@@ -1315,6 +1391,7 @@ impl Parser {
                 });
                 for (ty, dn) in &decon_names {
                     self.pending.push(Stmt::Let {
+                        is_const: false,
                         is_byref: false,
                         type_name: ty.clone(),
                         name: dn.clone(),
@@ -1338,6 +1415,7 @@ impl Parser {
                                 span: end,
                             }),
                             index: Box::new(Expr::Literal(Literal::Int(i as i64))),
+                            extra: Vec::new(),
                             is_range: false,
                             span: end,
                         }),
@@ -1581,12 +1659,14 @@ impl Parser {
                     span: sp,
                 };
                 let mut stmts = vec![Stmt::Let {
+                    is_const: false,
                     is_byref: false,
                     type_name: var_type,
                     name: var_name,
                     init: Expr::Index {
                         object: Box::new(ident(&coll_name)),
                         index: Box::new(ident(&idx_name)),
+                        extra: Vec::new(),
                         is_range: false,
                         span: sp,
                     },
@@ -1598,6 +1678,7 @@ impl Parser {
                     body: Block {
                         stmts: vec![
                             Stmt::Let {
+                                is_const: false,
                                 is_byref: false,
                                 type_name: "var".to_owned(),
                                 name: coll_name.clone(),
@@ -1607,6 +1688,7 @@ impl Parser {
                             },
                             Stmt::For {
                                 init: Some(Box::new(Stmt::Let {
+                                    is_const: false,
                                     is_byref: false,
                                     type_name: "int".to_owned(),
                                     name: idx_name.clone(),
@@ -1756,18 +1838,23 @@ impl Parser {
                         }
                         self.expect(&TokenKind::RightParen, "to close catch parameter")?;
                     }
-                    // Optional `when (filter)` clause — parsed and accepted, but
-                    // the filter is not evaluated yet (C# catch filter).
+                    // `when (filter)` — part of the clause's test: it is
+                    // evaluated after the type matches, and a false
+                    // filter falls through to the next clause. It used to
+                    // be parsed and DISCARDED, so `catch (E) when (false)`
+                    // caught anyway.
+                    let mut filter: Option<Expr> = None;
                     if matches!(self.peek().kind, TokenKind::Keyword(Keyword::When_)) {
                         self.bump(); // 'when'
                         self.expect(&TokenKind::LeftParen, "to open when clause")?;
-                        let _ = self.expression();
+                        filter = self.expression();
                         self.expect(&TokenKind::RightParen, "to close when clause")?;
                     }
                     let cbody = self.block();
                     catches.push(CatchClause {
                         ty,
                         name,
+                        filter,
                         body: cbody,
                         span: cs.to(self.peek_at(0).span),
                     });
@@ -1827,6 +1914,7 @@ impl Parser {
                     Expr::Literal(Literal::Int(0))
                 };
                 self.pending.push(Stmt::Let {
+                    is_const: false,
                     is_byref: false,
                     type_name: format!("{elem_type}[]"),
                     name: next,
@@ -1837,6 +1925,7 @@ impl Parser {
             }
             self.expect(&TokenKind::Semicolon, "after array declaration")?;
             return Some(Stmt::Let {
+                is_const: false,
                 is_byref: false,
                 type_name: format!("{elem_type}[]"),
                 name,
@@ -1909,6 +1998,7 @@ impl Parser {
             self.expect(&TokenKind::Semicolon, "after function pointer declaration")?;
             let type_str = format!("delegate*<{}>", type_args.join(", "));
             return Some(Stmt::Let {
+                is_const: false,
                 is_byref: false,
                 type_name: type_str,
                 name,
@@ -1921,8 +2011,10 @@ impl Parser {
         // Local constant: `const Type name = expr;`. Const-ness is a
         // compile-time assignment rule, not a runtime representation —
         // lower exactly like a regular local declaration.
+        let mut saw_const = false;
         if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Const)) {
             self.bump();
+            saw_const = true;
         }
 
         // Declaration: `Type name = expr;` / `Type name;`
@@ -1932,7 +2024,7 @@ impl Parser {
         // type name, or the unmistakable `T x =` shape; anything else
         // falls through to expression-statement, whose diagnostic lands
         // on the actual typo.
-        if self.likely_type_decl() {
+        if saw_const || self.likely_type_decl() {
             // `ref` / `out` / `scoped` modifiers on the local:
             // `ref int x = ref y;`, `scoped Span<char> s = ..;`.
             // `ref`/`out` locals alias their initializer's address
@@ -1961,12 +2053,20 @@ impl Parser {
             let type_name = self.type_name_full()?;
             let name = self.expect_identifier("rubyc.parser.rd.Parser.ctx.as_variable_name")?;
             let init = if self.eat(&TokenKind::Assign).is_some() {
-                // Detect explicit-return-type lambda:
-                // `Type (params) => body;` — the leading identifier is the
-                // return type, the parenthesized list is the params.
-                if self.looks_like_typed_lambda() {
-                    // Skip optional attribute lists (`[Attr]`).
-                    while self.peek().kind == TokenKind::LeftBracket {
+                // A plain lambda RHS (`var f = (x) => x;`) is handled by
+                // `expression()` below, which builds a real Lambda node.
+                // The explicit-return-type form is `Type (params) => body`
+                // and is genuinely different, so this arm is only taken
+                // when there IS a return type: with the cursor already at
+                // `(`, the parenthesised list is the PARAMETERS, not a
+                // return type. Getting this wrong used to swallow the
+                // body: `var f = (x) => x;` produced `init: 0` with the
+                // lambda discarded, and the leftover `(x) => x;` was then
+                // re-parsed as a statement and rejected.
+                if self.peek().kind != TokenKind::LeftParen
+                    && self.looks_like_typed_lambda()
+                {
+                        while self.peek().kind == TokenKind::LeftBracket {
                         self.bump();
                         let mut depth = 1i32;
                         loop {
@@ -2003,6 +2103,7 @@ impl Parser {
                     }
                     let _ = self.parse_lambda_body();
                     return Some(Stmt::Let {
+                        is_const: false,
                         is_byref: false,
                         type_name,
                         name,
@@ -2026,6 +2127,7 @@ impl Parser {
                     // neutral init so the scanner does not try to resolve
                     // the param name.
                     return Some(Stmt::Let {
+                        is_const: false,
                         is_byref: false,
                         type_name,
                         name,
@@ -2105,6 +2207,7 @@ impl Parser {
                     Expr::Literal(Literal::Int(0))
                 };
                 self.pending.push(Stmt::Let {
+                    is_const: saw_const,
                     is_byref: false,
                     type_name: type_name.clone(),
                     name: tname,
@@ -2118,6 +2221,7 @@ impl Parser {
                 "rubyc.parser.rd.Parser.ctx.after_declaration",
             )?;
             return Some(Stmt::Let {
+                is_const: saw_const,
                 is_byref: is_byref_local,
                 type_name,
                 name,
@@ -2466,6 +2570,7 @@ impl Parser {
                     self.bump(); // '='
                     let value = self.expression()?;
                     let first = Stmt::Let {
+                        is_const: false,
                         is_byref: false,
                         type_name: type_name.clone(),
                         name,
@@ -2481,6 +2586,7 @@ impl Parser {
                             Expr::Literal(Literal::Int(0))
                         };
                         extra_inits.push(Stmt::Let {
+                            is_const: false,
                             is_byref: false,
                             type_name: type_name.clone(),
                             name: extra,
@@ -2826,6 +2932,9 @@ impl Parser {
             let mark = self.pos;
             let err_mark = self.errors.len();
             let mut preamble: Vec<Stmt> = Vec::new();
+            // Resources disposed when the body finishes, in the order
+            // they were declared (disposal runs in reverse).
+            let mut disposables: Vec<String> = Vec::new();
             let mut ok = true;
             if self.peek().kind == TokenKind::RightParen {
                 self.bump();
@@ -2873,13 +2982,15 @@ impl Parser {
                             preamble.extend(pre);
                         }
                         preamble.push(Stmt::Let {
+                            is_const: false,
                             is_byref: false,
                             type_name: ty,
-                            name: rname,
+                            name: rname.clone(),
                             init,
                             access: Access::Default,
                             span: start.to(self.peek().span),
                         });
+                        disposables.push(rname);
                         preamble.append(&mut self.pending);
                     } else {
                         let Some(e) = self.expression() else {
@@ -2890,7 +3001,20 @@ impl Parser {
                             let pre = std::mem::take(&mut self.pre_pending);
                             preamble.extend(pre);
                         }
-                        preamble.push(Stmt::Expression(e));
+                        // `using (expr)`: the resource is disposed, so
+                        // it needs a name. C# treats it as an anonymous
+                        // local; the span offset keeps it unique.
+                        let temp = format!("__using{}", start.start);
+                        preamble.push(Stmt::Let {
+                            is_const: false,
+                            is_byref: false,
+                            type_name: String::from("var"),
+                            name: temp.clone(),
+                            init: e,
+                            access: Access::Default,
+                            span: start.to(self.peek().span),
+                        });
+                        disposables.push(temp);
                         preamble.append(&mut self.pending);
                     }
                     if self.eat(&TokenKind::Comma).is_none() {
@@ -2926,25 +3050,57 @@ impl Parser {
             }
             let body = self.control_body();
             let end = self.peek().span;
-            let mut stmts = preamble;
-            stmts.extend(body.stmts);
+            let span = start.to(end);
+            let mut body_stmts = body.stmts;
             if !self.pre_pending.is_empty() {
-                stmts.extend(std::mem::take(&mut self.pre_pending));
+                body_stmts.extend(std::mem::take(&mut self.pre_pending));
             }
-            stmts.append(&mut self.pending);
-            return Some(Stmt::Block {
+            body_stmts.append(&mut self.pending);
+            // `using (R r = e) { body }` is `{ let r = e; try { body }
+            // } finally { r.Dispose(); } }`, with the resources disposed
+            // in reverse order. The finally also runs on `return` and on
+            // a throw (the try lowering routes both through it).
+            let mut wrapped = Stmt::Block {
                 body: Block {
-                    stmts,
-                    span: start.to(end),
+                    stmts: body_stmts,
+                    span,
                 },
-                span: start.to(end),
+                span,
+            };
+            for name in disposables.into_iter().rev() {
+                let dispose = Expr::MethodCall {
+                    object: Box::new(Expr::Ident {
+                        name: name.clone(),
+                        span,
+                    }),
+                    name: String::from("Dispose"),
+                    args: Vec::new(),
+                    span,
+                };
+                wrapped = Stmt::Try {
+                    body: Block {
+                        stmts: vec![wrapped],
+                        span,
+                    },
+                    catches: Vec::new(),
+                    finally_block: Some(Block {
+                        stmts: vec![Stmt::Expression(dispose)],
+                        span,
+                    }),
+                    span,
+                };
+            }
+            let mut stmts = preamble;
+            stmts.push(wrapped);
+            return Some(Stmt::Block {
+                body: Block { stmts, span },
+                span,
             });
         }
-        // `using Type name = expr;` (declaration). Model it as a
-        // plain `Let`: the name is in scope for the rest of the
-        // enclosing block (C# scoping), and the initializer still
-        // evaluates. (Disposal itself is not modeled — same as the
-        // parenthesized form, whose body is skipped.)
+        // `using Type name = expr;` (declaration). `block()` rewrites
+        // this into a `Let` plus a try/finally that disposes at the end
+        // of the enclosing block; only a block may contain it (C# does
+        // not allow a using declaration as an embedded statement).
         let type_name = self.type_name().unwrap_or_else(|| "var".to_owned());
         let name = self.expect_identifier("as using-decl name")?;
         let init = if self.eat(&TokenKind::Assign).is_some() {
@@ -2955,12 +3111,10 @@ impl Parser {
         let end = self
             .expect(&TokenKind::Semicolon, "after using declaration")
             .map_or(self.peek().span, |token| token.span);
-        Some(Stmt::Let {
-            is_byref: false,
+        Some(Stmt::UsingDecl {
             type_name,
             name,
             init,
-            access: Access::Default,
             span: start.to(end),
         })
     }
@@ -2991,6 +3145,8 @@ impl Parser {
         while self.peek().kind != TokenKind::RightBrace && self.peek().kind != TokenKind::Eof {
             // Collect one arm's labels: `case A: case B:` … or `default:`.
             let mut labels: Vec<Expr> = Vec::new();
+            let mut guards: Vec<Option<Expr>> = Vec::new();
+            let mut arm_binding: Option<(String, String)> = None;
             let mut is_default_arm = false;
             loop {
                 match self.peek().kind {
@@ -2999,8 +3155,26 @@ impl Parser {
                         // Parse the case label. Handle relational patterns like `>= 10`,
                         // `and`/`or` patterns, and `when` clauses.
                         let label = self.case_label()?;
+                        // `case X when cond:` — the guard is part of the
+                        // arm's test, evaluated only after the label
+                        // matched.
+                        let guard = if matches!(
+                            self.peek().kind,
+                            TokenKind::Keyword(Keyword::When_)
+                        ) {
+                            self.bump();
+                            self.expression()
+                        } else {
+                            None
+                        };
                         self.expect(&TokenKind::Colon, "after case label")?;
+                        if let Some(b) = self.case_binding.take() {
+                            // One binding per section (C# requires every
+                            // label in a section to bind the same names).
+                            arm_binding = Some(b);
+                        }
                         labels.push(label);
+                        guards.push(guard);
                     }
                     TokenKind::Keyword(Keyword::Default) => {
                         self.bump();
@@ -3067,7 +3241,7 @@ impl Parser {
                     default_body = Some(body);
                 }
             } else {
-                arms.push(SwitchArm { labels, body });
+                arms.push(SwitchArm { labels, guards, binding: arm_binding, body });
             }
         }
 
@@ -3139,11 +3313,10 @@ impl Parser {
                 _ => break,
             }
         }
-        // Optional `when` clause.
-        if matches!(self.peek().kind, TokenKind::Keyword(Keyword::When_)) {
-            self.bump();
-            let _ = self.expression();
-        }
+        // A `when` guard is NOT consumed here: it belongs to the arm
+        // (evaluated only after the label matched), and the switch loop
+        // records it per label. This used to swallow the expression, so
+        // `case 1 when false:` matched anyway.
         Some(label)
     }
 
@@ -3241,6 +3414,7 @@ impl Parser {
         }
         if binding != "_" {
             self.pre_pending.push(Stmt::Let {
+                is_const: false,
                 is_byref: false,
                 type_name: head,
                 name: binding,
@@ -3252,7 +3426,8 @@ impl Parser {
         true
     }
 
-    fn parse_pattern_primary(&mut self) -> Option<Expr> {        let start = self.peek().span;
+    fn parse_pattern_primary(&mut self) -> Option<Expr> {
+        let start = self.peek().span;
         // Discard / var pattern: `_`, `var x`, `var (x)`, `var _`.
         if matches!(self.peek().kind, TokenKind::Identifier(_))
             && let TokenKind::Identifier(name) = &self.peek().kind
@@ -3269,6 +3444,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_const: false,
                             is_byref: false,
                             type_name: String::from("var"),
                             name: binding,
@@ -3451,7 +3627,6 @@ impl Parser {
             // optional binding identifier (declared in the enclosing
             // scope; `_` needs nothing).
             if self.peek_at(offset).kind == TokenKind::LeftParen {
-                // Skip the type segment + parens.
                 for _ in 0..offset {
                     self.bump();
                 }
@@ -3464,6 +3639,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_const: false,
                             is_byref: false,
                             type_name: String::from("var"),
                             name: binding,
@@ -3488,6 +3664,7 @@ impl Parser {
                 if let Some((binding, span)) = self.take_pattern_binding() {
                     if binding != "_" {
                         self.pre_pending.push(Stmt::Let {
+                            is_const: false,
                             is_byref: false,
                             type_name: String::from("var"),
                             name: binding,
@@ -3513,23 +3690,26 @@ impl Parser {
                 for _ in 0..offset {
                     self.bump();
                 }
-                // The binding may be a contextual keyword (`case T record:`).
-                if let Some((binding, span)) = self.take_pattern_binding() {
-                    if binding != "_" {
-                        self.pre_pending.push(Stmt::Let {
-                            is_byref: false,
-                            type_name: head_ty,
-                            name: binding,
-                            init: Expr::Literal(Literal::Int(0)),
-                            access: Access::Default,
-                            span: start.to(span),
-                        });
+                // A type pattern selects the arm by RUNTIME TYPE. With a
+                // BINDING (`case B b:`) the matched value must also be
+                // assigned to the arm variable, which the pattern parser
+                // cannot do (it does not see the switch subject), so that
+                // form is still reported. WITHOUT a binding (`case B:`)
+                // the arm test is exactly `subject is B`, which the
+                // lowering implements, so it parses as the type test.
+                let has_binding = self.peek_is_pattern_binding(0);
+                if has_binding {
+                    // `case T x:` — record the designation for the switch
+                    // lowering, which has the subject and binds it there.
+                    if let Some((binding, span)) = self.take_pattern_binding() {
+                        if binding != "_" {
+                            self.case_binding = Some((binding.clone(), head_ty.clone()));
+                        }
+                        let _ = span;
                     }
-                } else {
-                    self.bump(); // binding identifier
                 }
                 return Some(Expr::Ident {
-                    name: "<pattern>".to_owned(),
+                    name: head_ty,
                     span: start.to(self.peek_at(0).span),
                 });
             }
@@ -3539,11 +3719,15 @@ impl Parser {
             // (comparisons need a right operand; dotted constants like
             // `X.Y:` have no generics and keep the constant path below).
             if saw_generic && matches!(self.peek_at(offset).kind, TokenKind::Colon) {
+                // `case GenericEqualityComparer<string>:` — a GENERIC
+                // type pattern without a binding. The spelling (with its
+                // arguments) is what the type test resolves.
+                let spelling = self.render_type_tokens(offset);
                 for _ in 0..offset {
                     self.bump();
                 }
                 return Some(Expr::Ident {
-                    name: "<pattern>".to_owned(),
+                    name: spelling,
                     span: start.to(self.peek_at(0).span),
                 });
             }
@@ -3714,5 +3898,72 @@ impl Parser {
         // The next token must be a name (the variable name; contextual
         // keywords qualify).
         self.peek_is_name(off)
+    }
+}
+
+/// Rewrite `using Type name = expr;` declarations into the try/finally C#
+/// compiles them to.
+///
+/// A declaration disposes at the END OF THE ENCLOSING BLOCK, so the tail
+/// after it moves inside `try { … } finally { name.Dispose(); }`, with the
+/// `Let` outside it (the finally must be able to read the name). Several
+/// declarations nest from the last to the first, which disposes them in
+/// reverse order — the same rule the parenthesized form follows.
+fn wrap_using_decls(mut stmts: Vec<Stmt>, span: crate::models::Span) -> Vec<Stmt> {
+    loop {
+        let Some(idx) = stmts
+            .iter()
+            .rposition(|s| matches!(s, Stmt::UsingDecl { .. }))
+        else {
+            return stmts;
+        };
+        let Stmt::UsingDecl {
+            type_name,
+            name,
+            init,
+            span: decl_span,
+        } = stmts[idx].clone()
+        else {
+            unreachable!()
+        };
+        let tail: Vec<Stmt> = stmts.split_off(idx + 1);
+        stmts.pop(); // the declaration itself
+        let dispose = Expr::MethodCall {
+            object: Box::new(Expr::Ident {
+                name: name.clone(),
+                span: decl_span,
+            }),
+            name: String::from("Dispose"),
+            args: Vec::new(),
+            span: decl_span,
+        };
+        let try_stmt = Stmt::Try {
+            body: Block {
+                stmts: tail,
+                span,
+            },
+            catches: Vec::new(),
+            finally_block: Some(Block {
+                stmts: vec![Stmt::Expression(dispose)],
+                span,
+            }),
+            span,
+        };
+        let let_stmt = Stmt::Let {
+            is_const: false,
+            is_byref: false,
+            type_name,
+            name,
+            init,
+            access: Access::Default,
+            span: decl_span,
+        };
+        stmts.push(Stmt::Block {
+            body: Block {
+                stmts: vec![let_stmt, try_stmt],
+                span,
+            },
+            span,
+        });
     }
 }

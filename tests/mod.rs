@@ -26,17 +26,21 @@
 #[path = "models/coverage_net.rs"] mod models_coverage_net;
 
 // ir + native semantic
+#[path = "native/precise_class_identity.rs"] mod precise_class_identity;
 #[path = "native/ir_constant_folding.rs"] mod ir_constant_folding;
 #[path = "native/ir_container_roundtrip.rs"] mod ir_container_roundtrip;
 #[path = "native/rci_roundtrip.rs"] mod native_rci_roundtrip;
 #[path = "native/async_smoke.rs"] mod native_async_smoke;
 #[path = "native/ir_chained_field.rs"] mod native_ir_chained_field;
+#[path = "native/ir_function_index.rs"] mod native_ir_function_index;
+
 #[path = "native/virtual_property_dispatch.rs"] mod native_virtual_property_dispatch;
 #[path = "native/float_lowering.rs"] mod native_float_lowering;
 #[path = "native/postfix_incdec.rs"] mod native_postfix_incdec;
 #[path = "native/string_lowering.rs"] mod native_string_lowering;
 #[path = "native/optional_args.rs"] mod native_optional_args;
 #[path = "native/switch_scoping.rs"] mod native_switch_scoping;
+#[path = "native/spec_defects.rs"] mod native_spec_defects;
 #[path = "native/extension_calls.rs"] mod native_extension_calls;
 #[path = "native/dep_import_probe.rs"] mod native_dep_import_probe;
 #[path = "native/exe_dep_guard.rs"] mod native_exe_dep_guard;
@@ -76,6 +80,9 @@
 #[path = "utilities/base64_codec.rs"] mod utilities_base64_codec;
 #[path = "utilities/suggest_did_you_mean.rs"] mod utilities_suggest_did_you_mean;
 #[path = "extensions/discovery.rs"] mod extensions_discovery;
+
+// hygiene/ — invariants about the repository itself, not about compiling.
+#[path = "hygiene/band_aid_guard.rs"] mod hygiene_band_aid_guard;
 
 
 

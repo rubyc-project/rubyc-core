@@ -323,13 +323,21 @@ impl Parser {
                         }
                     }
                 }
+                // `x[i, j]` — a multi-parameter indexer. The extra
+                // arguments are KEPT: dropping them made the read answer
+                // the wrong slot (measured: 0 where `i + j` gives 7), and
+                // they are what `get_Item`/`set_Item` need.
+                let mut extra: Vec<Expr> = Vec::new();
                 while self.eat(&TokenKind::Comma).is_some() {
-                    let _ = self.expression();
+                    if let Some(e) = self.expression() {
+                        extra.push(e);
+                    }
                 }
                 self.expect(&TokenKind::RightBracket, "to close index")?;
                 expr = Expr::Index {
                     object: Box::new(expr),
                     index: Box::new(index.unwrap_or(Expr::Literal(Literal::Int(0)))),
+                    extra,
                     is_range,
                     span: obj_span.to(self.peek_at(0).span),
                 };
@@ -403,8 +411,11 @@ impl Parser {
                 if self.peek().kind != TokenKind::RightBracket {
                     index = Some(self.expression()?);
                 }
+                let mut extra: Vec<Expr> = Vec::new();
                 while self.eat(&TokenKind::Comma).is_some() {
-                    let _ = self.expression();
+                    if let Some(e) = self.expression() {
+                        extra.push(e);
+                    }
                 }
                 let close = self
                     .expect(&TokenKind::RightBracket, "to close null-conditional index");
@@ -413,6 +424,7 @@ impl Parser {
                 let node = Expr::Index {
                     object: Box::new(recv.clone()),
                     index: Box::new(index.unwrap_or(Expr::Literal(Literal::Int(0)))),
+                    extra,
                     is_range: false,
                     span: s.to(close.map_or(self.peek().span, |t| t.span)),
                 };

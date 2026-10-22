@@ -1,9 +1,9 @@
 # `rubyc-core`
 
 The RubyC compiler core: every compilation stage, the plugin ABI and
-cross-OS loader, the project system, diagnostics, i18n, and the C embedding
-ABI. This is a **library crate** (`lib`) — the `rubyc` CLI and every plugin
-link against it. It ships no binary of its own.
+cross-OS loader, the project system, diagnostics, and i18n. This is a
+**library crate** (`lib`) — the `rubyc` CLI and every plugin link against
+it. It ships no binary of its own.
 
 ```
 rubyc-core/
@@ -28,20 +28,26 @@ rubyc-core/
 | AST | `src/models/` | `CompilationUnit`, declarations, statements, expressions |
 | Semantic | `src/native/semantic/` | type tables, inheritance, C# access rules (E0017/E0018) |
 | IR | `src/native/ir/` | virtual-register three-address lowering; `encode_program`/`decode_program` |
-| Regalloc | `src/native/codegen/regalloc.rs` | linear scan over the callee-saved pool |
-| Image writers | `src/native/target_os/linux_x86_64/` | static ELF, ET_DYN shared libs, JIT support |
+| Linker | `src/native/linker.rs` | resolves IR symbols into machine code |
+| Type fragments | `src/native/rci.rs` | the `.rci` sidecar: a library's own semantic entries |
+| Target trait | `src/native/target.rs` | what a backend must provide (lower, write image, run) |
 | JIT | `src/native/jit.rs` | W^X: mmap W → copy → mprotect RX |
 | Lints | `src/lints.rs` | rule engine (`--warn/--deny/--allow`), stable ids |
-| Diagnostics | `src/diagnostics/`, `src/diagnostics_semantic/` | codes, spans, scope context, carets |
-| i18n | `src/i18n/` | locale lookup; English fallback |
-| Project | `src/project/` | `.rcp` / `.rcs` project + solution system |
-| Preprocessor | `src/preprocessor/` | `#define/#If/#Error/#Assembly`, `#macro` |
-| Inliner | `src/inliner/` | `[Inline]` method expansion |
+| Diagnostics | `src/diagnostics.rs`, `src/diagnostics_semantic.rs` | codes, spans, scope context, carets |
+| i18n | `src/i18n.rs` | locale lookup; English fallback |
+| Project | `src/project.rs` | `.rcp` / `.rcs` project + solution system |
+| Preprocessor | `src/preprocessor.rs` | `#define/#If/#Error/#Assembly`, `#macro` |
+| Inliner | `src/inliner.rs` | `[Inline]` method expansion |
 | Plugins | `src/plugin/` | ABI (`PluginBytes`), loader, function pointers |
 | Lib loader | `src/libloader/` | cross-OS `.so`/`.dylib`/`.dll` loading (libloading + goblin) |
 | CLI | `src/cli/` | argument parsing, command specs, driver glue |
-| Extensions | `src/extensions/` | `install_root()`, `ExtensionMetadata`, target traits |
-| C ABI | `src/cabi.rs` + `include/rubyc.h` | embedding from C |
+| Extensions | `src/extensions.rs` | `install_root()`, `ExtensionMetadata`, target traits |
+
+The x86-64 backend is a separate crate, not a module here:
+`plugins/targets/rubyc-target-linux-x86_64/src/x86/` holds the
+encoder (`encode_x64.rs`), the register allocator (`regalloc.rs`), the
+image writers (`elf.rs`, `shlib.rs`), the allocator and the runtime
+shims (`runtime.rs`).
 
 ## Public API
 
@@ -63,12 +69,26 @@ use rubyc::prelude::{parse, parse_file, CompilationUnit, ToBytecode, FromBytecod
 
 ### Driver
 
-`src/driver.rs` orchestrates the full source → artifact pipeline:
+`src/driver.rs` is the pipeline: parse → preprocess → lower → emit, and
+the entry point the CLI drives.
 
 ```rust
-// Parse → preprocess → lower → emit, returning the final image bytes.
-pub fn drive(source: &str, config: &DriverConfig) -> Result<DriveResult, DriveError>;
+// Compile source text to a native executable image.
+pub fn compile_source(
+    source: &str,
+    libs: &[PathBuf],
+    pipeline: &NativePipeline,
+) -> Result<Vec<u8>, String>;
+
+// JIT-execute source text, returning its exit status.
+pub fn run_source(source: &str, pipeline: &NativePipeline) -> Result<i32, String>;
+
+// Parse only; the error carries the diagnostics.
+pub fn parse_source(source: &str) -> Result<CompilationUnit, Vec<Diagnostic>>;
 ```
+
+`cli_main` mirrors the CLI and is the entry point the `rubyc` binary
+calls.
 
 ### IR
 
@@ -77,7 +97,7 @@ pub fn drive(source: &str, config: &DriverConfig) -> Result<DriveResult, DriveEr
 ```rust
 // A target can build ANY language; a language targets ANY target.
 pub fn lower(unit: &CompilationUnit) -> Result<Program, LowerError>;
-pub fn lower_with(unit: &CompilationUnit, entry: bool) -> Result<Program, LowerError>;
+pub fn lower_with(unit: &CompilationUnit, require_main: bool) -> Result<Program, LowerError>;
 pub fn encode_program(program: &Program) -> Vec<u8>;     // IR → bytes
 pub fn decode_program(bytes: &[u8]) -> Result<Program, _>; // bytes → IR
 ```
@@ -107,9 +127,9 @@ with per-OS modules (`elf/`, `macho/`, `pe/`). Two entry points:
 
 ```rust
 /// Load a real on-disk cdylib via dlopen / LoadLibrary.
-pub fn load_path(path: &Path) -> Result<LoadedLib, LibError>;
+pub fn load_path(path: &Path) -> Result<Handle, LibError>;
 /// Load hand-assembled bytes via the mmap loader (dlopen would crash).
-pub fn load_bytes(bytes: &[u8]) -> Result<LoadedLib, LibError>;
+pub fn load_bytes(bytes: &[u8]) -> Result<Handle, LibError>;
 ```
 
 ### Extensions & discovery
@@ -124,23 +144,23 @@ pub fn install_root() -> PathBuf;
 
 pub struct ExtensionMetadata { name, display_name, author, version, description, license, homepage, repository }
 
-pub trait TargetExtension { fn metadata(&self) -> &ExtensionMetadata; fn triple(&self) -> &str; }
+pub trait TargetExtension: Send + Sync { fn metadata(&self) -> &ExtensionMetadata; fn triple(&self) -> &str; }
 ```
 
 ### Project system
 
-`src/project/` reads and resolves `.rcp` (project) and `.rcs` (solution) files:
+`src/project.rs` reads and resolves `.rcp` (project) and `.rcs` (solution) files:
 
 ```rust
-pub fn nearest_project(dir: &Path) -> Option<PathBuf>;  // walk up for .rcp/.rcs
-pub fn load_project(path: &Path) -> Result<Project, ProjectError>;
+pub fn find_nearest(start_dir: &Path) -> Option<PathBuf>;  // walk up for .rcp/.rcs
+pub fn load(path: &Path) -> Result<Self, String>;          // a project or a solution
 ```
 
 ### Lints
 
 ```rust
-pub fn run_lints(unit: &CompilationUnit, policy: &LintPolicy) -> Vec<Lint>;
-// policy: --warn / --deny / --allow; warnings never fail builds unless denied
+pub fn analyze(unit: &CompilationUnit, config: &LintConfig) -> Vec<Diagnostic>;
+// config: --warn / --deny / --allow; warnings never fail builds unless denied
 ```
 
 ## Plugin directory layout

@@ -215,6 +215,23 @@ fn parse_rows(text: &str) -> Vec<Row> {
     rows
 }
 
+/// The library artifact a `using` namespace names DIRECTLY (decision
+/// A): `using X.Y;` means the artifact `X.Y` in the libraries
+/// directory. The index is the fallback for assemblies installed under
+/// a different name (CoreLib), not the authority for a direct hit.
+pub fn direct_library(ns: &str, lib_dir: &Path) -> Option<String> {
+    for candidate in [
+        lib_dir.join(format!("{ns}.so")),
+        lib_dir.join(format!("{ns}.a")),
+        lib_dir.join("static").join(format!("{ns}.a")),
+    ] {
+        if candidate.is_file() {
+            return Some(ns.to_owned());
+        }
+    }
+    None
+}
+
 /// Lexically collect `using X;` namespaces from source text: plain
 /// namespace imports only (`using Alias =` and `using static` carry
 /// no namespace to discover and are skipped).
@@ -310,6 +327,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let class = ClassInfo {
+            is_record: false,
+            type_arg_index: Vec::new(),
             name: "Widget".into(),
             key: TypeKey::new("A.B.Widget", 0),
             bases: vec![],

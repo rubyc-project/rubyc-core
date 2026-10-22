@@ -78,9 +78,11 @@ class C {
 }
 
 #[test]
-fn case_type_pattern_binds_arm_variable() {
-    // `case TC tc:` declares `tc` for the arm (evaluated as zero —
-    // pattern tests are placeholders, but the NAME must resolve).
+fn case_type_pattern_binds_and_selects() {
+    // `case TC tc:` selects the arm by runtime type and binds the
+    // SUBJECT to `tc`. It used to parse into an always-false test (the
+    // arm NEVER ran); later it was reported. Now the arm body lowers
+    // against the bound value.
     let p = lower(
         r#"namespace t;
 class TC {
@@ -102,18 +104,18 @@ class M {
 }"#,
     );
     assert!(
-        has(&p, |i| matches!(i, Instr::CallVirt { .. })),
-        "expected arm call on the pattern variable to lower"
+        has(&p, |i| matches!(i, Instr::CallFn { .. })),
+        "the arm body must call tc.Run()"
     );
 }
 
 #[test]
-fn same_pattern_name_across_arms_is_legal() {
+fn same_pattern_name_across_arms_is_still_consumed() {
     // C# scopes case pattern variables per arm: `case TA tc:` and
-    // `case TB tc:` in one switch is legal (sibling to the
-    // `RunContinuations` shape). Our shared section scope degrades
-    // the second declaration to a re-bind instead of erroring.
-    let p = lower(
+    // `case TB tc:` in one switch is legal. Both bind the subject in
+    // their own arm, so the shared name declares twice without a
+    // diagnostic and the rest of the switch is consumed.
+    let unit = crate::parser::parse(
         r#"namespace t;
 class TA { }
 class TB { }
@@ -134,11 +136,9 @@ class M {
         return r;
     }
 }"#,
-    );
-    assert!(
-        has(&p, |i| matches!(i, Instr::Const { imm: 1, .. })),
-        "expected switch arms to lower"
-    );
+    )
+    .unwrap_or_else(|e| panic!("per-arm bindings are legal: {e:?}"));
+    crate::native::ir::lower(&unit).expect("both arms lower");
 }
 
 #[test]
@@ -258,13 +258,11 @@ class M3 {
 }
 
 #[test]
-fn switch_pattern_var_retypes_per_arm() {
-    // Pattern variables are arm-scoped in C# (`case A a:` + `case B a:`
-    // is legal): re-binding re-types the shared home so member calls
-    // in the later arm resolve against the new type
-    // (`Task.RunContinuations`: `case TaskContinuation tc:` after
-    // `case RuntimeAsyncTaskContinuation tc:`).
-    let src = r#"namespace t;
+fn switch_pattern_bindings_are_scoped_per_arm() {
+    // `case A a:` + `case B a:` — the binding lives only in its arm, so
+    // the shared name is declared twice without a re-declaration path.
+    let unit = crate::parser::parse(
+        r#"namespace t;
 class A { public int Am() { return 1; } }
 class B { public int Bm() { return 2; } }
 class User {
@@ -276,9 +274,10 @@ class User {
         return 0;
     }
     int main() { return 0; }
-}"#;
-    let unit = crate::parser::parse(src).unwrap();
-    crate::native::ir::lower(&unit).expect("pattern re-binding must re-type");
+}"#,
+    )
+    .unwrap_or_else(|e| panic!("per-arm bindings are legal: {e:?}"));
+    crate::native::ir::lower(&unit).expect("both arms lower");
 }
 
 #[test]
@@ -299,3 +298,53 @@ class User {
     let unit = crate::parser::parse(src).unwrap();
     crate::native::ir::lower(&unit).expect("tuple element must bind");
 }
+
+#[test]
+fn type_pattern_in_a_switch_selects_and_binds() {
+    // The old placeholder made `case T x:` test false, so the switch
+    // fell through to `default` and reported success. The arm now
+    // tests the runtime type and the body runs against the binding.
+    let p = lower(
+        r#"namespace t;
+class T { public int V() { return 7; } }
+class M {
+    int Run(object o) {
+        switch (o) {
+            case T t: return t.V();
+        }
+        return -1;
+    }
+    int main() { return Run(new T()); }
+}"#,
+    );
+    assert!(
+        has(&p, |i| matches!(i, Instr::CallFn { .. })),
+        "the arm body must call t.V()"
+    );
+}
+
+#[test]
+fn constant_patterns_still_work() {
+    // `case 1:`, `case "s":` and dotted constant paths are ordinary
+    // constant comparisons, not type tests — they keep lowering.
+    let p = lower(
+        r#"namespace t;
+class C {
+    int main() {
+        object o = 1;
+        int r = 0;
+        switch (o) {
+            case 1: r = 10; break;
+            case "s": r = 20; break;
+            default: r = 30; break;
+        }
+        return r;
+    }
+}"#,
+    );
+    assert!(
+        has(&p, |i| matches!(i, Instr::Const { imm: 10, .. })),
+        "constant arms still lower"
+    );
+}
+
