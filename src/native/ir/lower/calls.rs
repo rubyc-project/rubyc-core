@@ -736,7 +736,7 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
         // context. The receiver would be `VReg(0)`, which in a static
         // method is not a `this` at all — the call compiled and read
         // garbage. Reported with the C# rule rather than lowered.
-        if !mi.is_static && enclosing_is_static(ctx) {
+        if !mi.is_static && enclosing_is_static(ctx, b) {
             return Err(LowerError::UnsupportedConstruct(crate::tf!(
                 "rubyc.native.ir.lower_call.instance_from_static",
                 name.to_string(),
@@ -1397,7 +1397,7 @@ pub(super) fn outer_static_property<'t>(
 /// The enclosing context is a name plus an entry, so this looks the
 /// declaration up rather than carrying a flag — accessors and inlined
 /// bodies rebuild the context and would have to repeat it anyway.
-fn enclosing_is_static(ctx: &Ctx<'_>) -> bool {
+fn enclosing_is_static(ctx: &Ctx<'_>, b: &Body<'_>) -> bool {
     let Some(info) = ctx.current_info else {
         return false;
     };
@@ -1410,11 +1410,21 @@ fn enclosing_is_static(ctx: &Ctx<'_>) -> bool {
     // The overload under lowering is named, not identified: a class can
     // declare a static and an instance method with the same name
     // (`RuntimeTypeHandle.GetConstraints`), and the first same-named
-    // entry answered for the other one. The declared return type tells
-    // them apart; the name alone is the fallback.
+    // entry answered for the other one. The declared return type and
+    // the arity tell them apart; the name alone is the fallback.
+    let arity = b.f.arity;
     info.methods
         .iter()
-        .find(|m| same_name(m) && Some(&m.ret_type) == ctx.current_ret.as_ref())
+        .find(|m| {
+            same_name(m)
+                && Some(&m.ret_type) == ctx.current_ret.as_ref()
+                && m.param_types.len() == arity
+        })
+        .or_else(|| {
+            info.methods.iter().find(|m| {
+                same_name(m) && Some(&m.ret_type) == ctx.current_ret.as_ref()
+            })
+        })
         .or_else(|| info.methods.iter().find(same_name))
         .map(|m| m.is_static)
         .unwrap_or(false)
