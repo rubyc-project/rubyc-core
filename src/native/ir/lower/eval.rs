@@ -535,9 +535,17 @@ pub(super) fn ref_target_address(
         // A nullable annotation is not part of the type's name
         // (`CompletionState?` is `CompletionState`).
         let recv_base = recv_ty.trim().trim_end_matches('?');
-        if let Some(info) = ctx.table.class(recv_base) {
+        if let Some(info) = member_entry(ctx.table, recv_base) {
             if let Some(f) = info.field(name) {
-                if !f.is_static {
+                if f.is_static {
+                    // A static field HAS an address: its storage slot
+                    // (or, for a field owned by another image, the
+                    // owner's slot via address import). `ref Type
+                    // .Field` passes that address.
+                    if let Some(addr) = static_addr(f, b, ctx) {
+                        return Ok(Some(addr));
+                    }
+                } else {
                     // `ref` fields hold addresses: `ref field`
                     // collapses to the target (C# ref-of-ref collapses),
                     // so load the slot instead of taking its address
