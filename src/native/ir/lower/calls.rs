@@ -179,6 +179,19 @@ fn unify_type_arg(
             unify_type_arg(ctx, inner, arg_inner, vars, map)?;
         }
         Ok(())
+    } else if p.ends_with('*') {
+        // Pointer-typed generic parameters (`LoadAligned<T>(T* source)`):
+        // bind the element type from a pointer argument.
+        let inner = p.trim_end_matches('*').trim();
+        let arg_inner = if a.ends_with('*') {
+            a.trim_end_matches('*').trim()
+        } else {
+            a
+        };
+        if !inner.is_empty() && !arg_inner.is_empty() {
+            unify_type_arg(ctx, inner, arg_inner, vars, map)?;
+        }
+        Ok(())
     } else if let Some(inner) = p.strip_suffix('?') {
         let arg_inner = a.strip_suffix('?').unwrap_or(a);
         unify_type_arg(ctx, inner, arg_inner, vars, map)
