@@ -195,6 +195,7 @@ impl Writer {
         self.string(&p.declaring_class);
         self.u8(u8::from(p.is_static));
         self.u8(u8::from(p.is_abstract));
+        self.u8(u8::from(p.is_intrinsic));
     }
 
     fn param(&mut self, p: &Param) {
@@ -462,6 +463,7 @@ impl<'a> Reader<'a> {
         let declaring_class = self.string();
         let is_static = self.u8() != 0;
         let is_abstract = self.u8() != 0;
+        let is_intrinsic = self.u8() != 0;
         PropertyInfo {
             name,
             type_name,
@@ -469,6 +471,7 @@ impl<'a> Reader<'a> {
             declaring_class,
             is_static,
             is_abstract,
+            is_intrinsic,
         }
     }
 

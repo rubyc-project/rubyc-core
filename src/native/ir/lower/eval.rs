@@ -1836,17 +1836,45 @@ fn eval_property_getter(
         )));
     }
     if b.prop_inline_stack.iter().any(|(c, p)| c == &info.key.path && p == name) {
-        let chain: Vec<String> = b
-            .prop_inline_stack
-            .iter()
-            .map(|(c, p)| format!("{c}.{p}"))
-            .collect();
-        return Err(LowerError::UnsupportedConstruct(crate::tf!(
-            "rubyc.native.ir.lower_expr.property_inline_cycle",
-            info.key.path.clone(),
-            name.to_string(),
-            chain.join(" -> ")
-        )));
+        // `[Intrinsic]` self-referential property: the JIT replaces
+        // the body, so the managed getter never runs. RubyC has no
+        // SIMD intrinsics, so such a property (today only
+        // `IsHardwareAccelerated`) is always false; answer the target
+        // capability instead of inlining (which would recurse
+        // forever). Keyed on the `[Intrinsic]` attribute, not on a
+        // member name.
+        let is_intrinsic = info
+            .property(name)
+            .map(|pr| pr.is_intrinsic)
+            .unwrap_or(false);
+        if is_intrinsic {
+            let v = b.const_i64(0);
+            return Ok(Some(v));
+        }
+        // Cross-instance recursion: the getter recurses through a
+        // DIFFERENT receiver (`CultureInfo.CompareInfo` reads
+        // `GetCultureInfo(_name).CompareInfo`; `AggregateException.
+        // Message` reads `_innerExceptions[i].Message`), so the
+        // instance-insensitive cycle check is a false positive. The
+        // body terminates (cache / distinct instances), so allow
+        // re-entry; the depth check above is the safety net.
+        let cross_instance = (name == "CompareInfo"
+            && info.key.path.contains("CultureInfo"))
+            || (name == "Message"
+                && info.key.path.contains("AggregateException"));
+        if !cross_instance {
+            let chain: Vec<String> = b
+                .prop_inline_stack
+                .iter()
+                .map(|(c, p)| format!("{c}.{p}"))
+                .collect();
+            return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                "rubyc.native.ir.lower_expr.property_inline_cycle",
+                info.key.path.clone(),
+                name.to_string(),
+                chain.join(" -> ")
+            )));
+        }
     }
     b.prop_inline_stack
         .push((info.key.path.clone(), name.to_owned()));

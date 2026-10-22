@@ -1817,6 +1817,11 @@ pub fn analyze_with_preloaded(
                             // only a bodyless-abstract incoming keeps it.
                             existing.is_abstract =
                                 existing.is_abstract && p.is_abstract;
+                            // Intrinsic is sticky: if any declaration
+                            // carries it, the merged property is intrinsic.
+                            existing.is_intrinsic =
+                                existing.is_intrinsic
+                                    || p.attrs.iter().any(|a| a.name == "Intrinsic");
                         } else {
                             properties.push(PropertyInfo {
                                 name: p.name.clone(),
@@ -1825,6 +1830,10 @@ pub fn analyze_with_preloaded(
                                 declaring_class: src.decl.name.clone(),
                                 is_static: p.is_static,
                                 is_abstract: p.is_abstract,
+                                is_intrinsic: p
+                                    .attrs
+                                    .iter()
+                                    .any(|a| a.name == "Intrinsic"),
                             });
                         }
                         if p.get.is_some() || p.set.is_some() || p.get_expr.is_some() {

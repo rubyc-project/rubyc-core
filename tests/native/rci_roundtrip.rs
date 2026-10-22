@@ -74,6 +74,7 @@ fn sample_class() -> ClassInfo {
             declaring_class: "Widget".into(),
             is_static: true,
             is_abstract: false,
+            is_intrinsic: false,
         }],
         is_enum: false,
         generic_params: vec!["T".into()],

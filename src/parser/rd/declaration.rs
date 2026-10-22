@@ -835,7 +835,7 @@ impl Parser {
         )?;
         let (init, get, set, get_expr, is_settable) =
             if self.peek().kind == TokenKind::LeftBrace {
-                let (init, get, set, get_expr, _is_init, is_settable) =
+                let (init, get, set, get_expr, _is_init, is_settable, _gi) =
                     self.property_accessors()?;
                 (init, get, set, get_expr, is_settable)
             } else {
@@ -1736,7 +1736,7 @@ impl Parser {
             if is_property {
                 let type_name = self.type_name_full()?;
                 let name = self.qualified_name()?;
-            let (init, get, set, get_expr, is_init, is_settable) =
+            let (init, get, set, get_expr, is_init, is_settable, getter_is_intrinsic) =
                 if self.peek().kind == TokenKind::LeftBrace {
                     self.property_accessors()?
                 } else {
@@ -1759,8 +1759,16 @@ impl Parser {
                         Some(expression),
                         false,
                         false,
+                        false,
                     )
                 };
+            if getter_is_intrinsic {
+                attrs.push(Attribute {
+                    name: "Intrinsic".into(),
+                    arguments: vec![],
+                    span: start,
+                });
+            }
             let end = self.peek_at(0).span;
             return Some(ClassMember::Property(PropertyDecl {
                 access,
@@ -3299,19 +3307,23 @@ impl Parser {
     /// a backing value).
     pub(super) fn property_accessors(
         &mut self,
-    ) -> Option<(Expr, Option<Block>, Option<Block>, Option<Expr>, bool, bool)> {
+    ) -> Option<(Expr, Option<Block>, Option<Block>, Option<Expr>, bool, bool, bool)> {
         self.expect(&TokenKind::LeftBrace, "to open accessor list")?;
         let mut get: Option<Block> = None;
         let mut set: Option<Block> = None;
         let mut get_expr: Option<Expr> = None;
         let mut is_init = false;
         let mut is_settable = false;
+        let mut getter_is_intrinsic = false;
 
         while self.peek().kind != TokenKind::RightBrace && self.peek().kind != TokenKind::Eof {
             // Attributes on individual accessors (e.g. `[MemberNotNull(..)]
             // set`): contracts only, inert for codegen — consume and drop.
             if self.peek().kind == TokenKind::LeftBracket {
-                let _ = self.attribute_lists();
+                let a = self.attribute_lists();
+                if a.iter().any(|x| x.name == "Intrinsic") {
+                    getter_is_intrinsic = true;
+                }
                 continue;
             }
             // Consume optional access modifier before accessor keyword
@@ -3400,7 +3412,7 @@ impl Parser {
             }
             Expr::Literal(Literal::Int(0))
         };
-        Some((init, get, set, get_expr, is_init, is_settable))
+        Some((init, get, set, get_expr, is_init, is_settable, getter_is_intrinsic))
     }
 
     /// `enum Name : UnderlyingType { A = 0, B = 1, … }`

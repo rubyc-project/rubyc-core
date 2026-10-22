@@ -1381,6 +1381,14 @@ pub(super) fn is_stringy(t: &str) -> bool {
 /// defers to a numeric other side (`sepList[i] - currIndex` types as
 /// `int`, not `object`).
 pub(super) fn numeric_result(l: &str, r: &str) -> String {
+    // Same-typed operands keep their type: `Vector<T> & Vector<T>` is
+    // `Vector<T>`, not `object`. Without this, a bitwise/logical op on
+    // a non-numeric type degraded to `object`, which poisoned the
+    // generic inference (`IsZero(vector & Vector<T>.One)` inferred
+    // nothing for `T`).
+    if l == r && !l.trim().is_empty() {
+        return l.to_owned();
+    }
     const NUM: &[&str] = &[
         "sbyte", "byte", "short", "ushort", "int", "uint", "long", "ulong", "char", "float",
         "double", "decimal", "SByte", "Byte", "Int16", "UInt16", "Int32", "UInt32", "Int64",

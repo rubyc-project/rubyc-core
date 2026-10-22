@@ -174,6 +174,11 @@ pub struct PropertyInfo {
     /// `abstract` modifier: body-less accessors declare no storage
     /// (never auto-property backing fields).
     pub is_abstract: bool,
+    /// `[Intrinsic]` attribute: the JIT replaces the body, so the
+    /// managed getter never runs. Used to answer self-referential
+    /// intrinsics (e.g. `IsHardwareAccelerated`) as a target
+    /// capability instead of inlining into infinite recursion.
+    pub is_intrinsic: bool,
 }
 
 /// A field with its object-layout offset (in slots, after the vtable word).
