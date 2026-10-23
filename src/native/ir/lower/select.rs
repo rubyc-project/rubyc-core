@@ -545,7 +545,7 @@ pub(super) fn rank_candidates<'m>(
     class_vars: &[String],
 ) -> Option<&'m MethodInfo> {
     // Tier 1: exact arity, applicable, best score.
-    let mut best: Option<(&MethodInfo, (usize, std::cmp::Reverse<u32>))> = None;
+    let mut best: Option<(&MethodInfo, (usize, std::cmp::Reverse<u32>, std::cmp::Reverse<usize>))> = None;
     for m in cands {
         // Byref alignment first: a marked (`T&`) argument never
         // binds a by-value parameter (see `byref_applicable`).
@@ -563,6 +563,7 @@ pub(super) fn rank_candidates<'m>(
             let key = (
                 byref_hits(m, arg_types, recv_skip),
                 std::cmp::Reverse(s),
+                std::cmp::Reverse(m.generic_params.len()),
             );
             let better = match &best {
                 None => true,
@@ -578,7 +579,7 @@ pub(super) fn rank_candidates<'m>(
     }
     // Tier 2: defaults-fillable (or params-expanded), given args
     // applicable — best score, then fewest params.
-    let mut best2: Option<(&MethodInfo, ((std::cmp::Reverse<usize>, u32), usize))> = None;
+    let mut best2: Option<(&MethodInfo, (((std::cmp::Reverse<usize>, u32, std::cmp::Reverse<usize>)), usize))> = None;
     for m in cands {
         if !byref_applicable(m, arg_types, recv_skip) {
             continue;
@@ -603,6 +604,7 @@ pub(super) fn rank_candidates<'m>(
             (
                 std::cmp::Reverse(byref_hits(m, arg_types, recv_skip)),
                 s,
+                std::cmp::Reverse(m.generic_params.len()),
             ),
             len,
         );
