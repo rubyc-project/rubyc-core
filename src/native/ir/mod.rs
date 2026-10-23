@@ -2945,10 +2945,11 @@ fn pick_chain_ctor(
                         // binding is the address stored in the delegate
                         // object, so the body's reads dereference and its
                         // writes store through — C# capture semantics.
-                        let slot = match fb.scope_mut().declare(
+                        let slot = match fb.scope_mut().declare_byref(
                             cname,
                             "object",
                             crate::models::Access::Default,
+                            true,
                         ) {
                             Ok(s) => s,
                             Err(e) => return Err(LowerError::UnsupportedConstruct(e)),

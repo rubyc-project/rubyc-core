@@ -575,7 +575,6 @@ pub(super) fn rank_candidates<'m>(
         }
     }
     if let Some((m, _)) = best {
-        if m.name == "WhenAll" { eprintln!("[D4] tier1 selected generic_params={:?} name={}", m.generic_params, m.name); }
         return Some(m);
     }
     // Tier 2: defaults-fillable (or params-expanded), given args
@@ -617,7 +616,6 @@ pub(super) fn rank_candidates<'m>(
             best2 = Some((*m, key));
         }
     }
-    if let Some((m,_)) = best2 { if m.name == "WhenAll" { eprintln!("[D4] tier2 selected generic_params={:?} name={}", m.generic_params, m.name); } }
     best2.map(|(m, _)| m)
 }
 
