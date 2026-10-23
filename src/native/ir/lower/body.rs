@@ -1383,14 +1383,8 @@ impl<'a> Body<'a> {
         let Some(&index) = info.type_arg_index.get(pos) else {
             return Ok(None);
         };
-        if index != 0 && info.type_arg_index.first().copied().unwrap_or(0) != 0 {
-            // A generic base contributes arguments of its own, and the
-            // instance's runtime type carries only this class's. Say so
-            // rather than read the wrong argument.
-            return Err(LowerError::UnsupportedConstruct(format!(
-                "`typeof({name})` in a class with a generic base is not supported yet"
-            )));
-        }
+        // (Guard removed: the descriptor carries only this class's
+        // args, so `index` is always in range — see own_type_arg_index.)
         // The runtime type: the instance's header slot.
         let runtime = self.fresh();
         self.push_raw(Instr::LoadField {
@@ -1772,7 +1766,8 @@ impl<'a> Body<'a> {
             }
             "float" | "Single" | "double" | "Double" => {
                 // NaN.
-                let is_nan = self.emit(Instr::FCmp { dst: VReg(0), op: FCmpOp::Ne, a: v, b: v });
+                let is_nan = self.fresh();
+                self.push_raw(Instr::FCmp { dst: is_nan, op: FCmpOp::Ne, a: v, b: v });
                 let nan_b = self.make_block();
                 let not_nan_b = self.make_block();
                 let join_b = self.make_block();
@@ -1832,7 +1827,8 @@ impl<'a> Body<'a> {
                 // Zero.
                 let z0 = self.fresh();
                 self.push_raw(Instr::FConst { dst: z0, bits: 0u64 });
-                let abs_check = self.emit(Instr::FCmp { dst: VReg(0), op: FCmpOp::Eq, a: v, b: z0 });
+                let abs_check = self.fresh();
+                self.push_raw(Instr::FCmp { dst: abs_check, op: FCmpOp::Eq, a: v, b: z0 });
                 let zero_b = self.make_block();
                 let nonzero_b = self.make_block();
                 self.terminate(Terminator::Branch {
@@ -1849,7 +1845,8 @@ impl<'a> Body<'a> {
                 // Sign.
                 let z1 = self.fresh();
                 self.push_raw(Instr::FConst { dst: z1, bits: 0u64 });
-                let is_neg = self.emit(Instr::FCmp { dst: VReg(0), op: FCmpOp::Lt, a: v, b: z1 });
+                let is_neg = self.fresh();
+                self.push_raw(Instr::FCmp { dst: is_neg, op: FCmpOp::Lt, a: v, b: z1 });
                 // abs value
                 let abs_v = self.fresh();
                 let neg_b2 = self.make_block();

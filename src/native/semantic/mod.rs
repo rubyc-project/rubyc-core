@@ -419,18 +419,17 @@ struct ScopedClass {
 /// first (.NET order: a base class's `T` is argument 0), so a derived
 /// class's own parameters follow the base chain's count.
 fn own_type_arg_index(
-    chain: &[crate::native::semantic::table::TypeKey],
-    raw_classes: &[ScopedClass],
+    _chain: &[crate::native::semantic::table::TypeKey],
+    _raw_classes: &[ScopedClass],
     decl: &ClassDecl,
 ) -> Vec<u32> {
-    let base_args: u32 = chain
-        .iter()
-        .filter_map(|k| raw_classes.iter().find(|c| &c.key() == k))
-        .map(|c| c.decl.generic_params.len() as u32)
-        .sum();
-    (0..decl.generic_params.len() as u32)
-        .map(|i| base_args + i)
-        .collect()
+    // The instance's runtime type descriptor carries only THIS
+    // class's type arguments (at indices 0..), not the base chain's
+    // (those live in the base's own descriptor). So each parameter
+    // sits at its own position, regardless of generic bases. The
+    // base_args offset previously stored here read out of bounds and
+    // made `typeof(T)` fail for classes with generic bases.
+    (0..decl.generic_params.len() as u32).collect()
 }
 
 impl ScopedClass {
