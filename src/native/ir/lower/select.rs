@@ -575,11 +575,12 @@ pub(super) fn rank_candidates<'m>(
         }
     }
     if let Some((m, _)) = best {
+        if m.name == "WhenAll" { eprintln!("[D4] tier1 selected generic_params={:?} name={}", m.generic_params, m.name); }
         return Some(m);
     }
     // Tier 2: defaults-fillable (or params-expanded), given args
     // applicable — best score, then fewest params.
-    let mut best2: Option<(&MethodInfo, (((std::cmp::Reverse<usize>, u32, std::cmp::Reverse<usize>)), usize))> = None;
+    let mut best2: Option<(&MethodInfo, (((std::cmp::Reverse<usize>, u32, usize)), usize))> = None;
     for m in cands {
         if !byref_applicable(m, arg_types, recv_skip) {
             continue;
@@ -604,7 +605,7 @@ pub(super) fn rank_candidates<'m>(
             (
                 std::cmp::Reverse(byref_hits(m, arg_types, recv_skip)),
                 s,
-                std::cmp::Reverse(m.generic_params.len()),
+                m.generic_params.len(),
             ),
             len,
         );
@@ -616,6 +617,7 @@ pub(super) fn rank_candidates<'m>(
             best2 = Some((*m, key));
         }
     }
+    if let Some((m,_)) = best2 { if m.name == "WhenAll" { eprintln!("[D4] tier2 selected generic_params={:?} name={}", m.generic_params, m.name); } }
     best2.map(|(m, _)| m)
 }
 
