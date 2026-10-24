@@ -731,9 +731,6 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
     } else {
         entries.extend(all_entries);
     }
-    if name == "Equals" {
-        eprintln!("[DBG15] name={} current_class={} enclosing_static={} entries={:?}", name, ctx.current_class, is_static, entries.iter().map(|e| e.key.path.clone()).collect::<Vec<_>>());
-    }
     // In a static context, prefer static overloads: an inherited
     // instance `Equals`/`ToString` must not shadow the intended
     // static one. Try statics first; fall back to both so an instance
