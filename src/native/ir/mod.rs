@@ -697,6 +697,19 @@ impl Ctx<'_> {
         owner_type: &str,
         member: &str,
     ) -> Result<(), LowerError> {
+        // An inlined generic body accesses members through its type
+        // parameters, which resolve to concrete types' private
+        // implementation details (e.g. `TDecimal.SNaNMask` ->
+        // `Decimal32.SNaNMask`). The member is really the
+        // interface's public member; allow private access when the
+        // owner type is a substitution target of an active type
+        // substitution (i.e. reached through a type parameter).
+        if let Some(subst) = self.type_subst {
+            if subst.iter().any(|(_, v)| v == owner_type) {
+                return Ok(());
+            }
+        }
+
         // The owner is the class under lowering when the member is
         // read on `this`: a bare type spelling is ambiguous (25
         // same-named `Enumerator`s), so the anchored entry is the

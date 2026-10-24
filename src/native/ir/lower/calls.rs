@@ -731,6 +731,9 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
     } else {
         entries.extend(all_entries);
     }
+    // Two-pass: try static-only first in static context.
+    if is_static {
+    }
     // In a static context, prefer static overloads: an inherited
     // instance `Equals`/`ToString` must not shadow the intended
     // static one. Try statics first; fall back to both so an instance
@@ -750,6 +753,9 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
         ctx.current_class,
         explicit_arity,
     );
+    // Fall back to instance methods only when no static overload
+    // with this name exists at all: a call that simply has the wrong
+    // arity for the available statics is not a CS0120 case.
     if selected.is_none() && staticness.is_some() {
         selected = select_visible(
             ctx.table,
@@ -1457,6 +1463,12 @@ fn enclosing_is_static(ctx: &Ctx<'_>, b: &Body<'_>) -> bool {
     // entry answered for the other one. The declared return type and
     // the arity tell them apart; the name alone is the fallback.
     let arity = b.f.arity;
+    // Conservative: only report static when the CURRENT method
+    // (matched by name + return type + arity) is static. Falling
+    // through to a same-named sibling with a different signature
+    // (e.g. a static `Equals<T>` when lowering an instance
+    // `Equals(object?)`) produced false positives that treated
+    // instance methods as static.
     info.methods
         .iter()
         .find(|m| {
@@ -1464,12 +1476,6 @@ fn enclosing_is_static(ctx: &Ctx<'_>, b: &Body<'_>) -> bool {
                 && Some(&m.ret_type) == ctx.current_ret.as_ref()
                 && m.param_types.len() == arity
         })
-        .or_else(|| {
-            info.methods.iter().find(|m| {
-                same_name(m) && Some(&m.ret_type) == ctx.current_ret.as_ref()
-            })
-        })
-        .or_else(|| info.methods.iter().find(same_name))
         .map(|m| m.is_static)
         .unwrap_or(false)
 }
