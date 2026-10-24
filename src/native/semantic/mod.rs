@@ -2150,8 +2150,45 @@ pub fn analyze_with_preloaded(
             interfaces: implemented,
             properties,
             is_enum: false,
-            generic_params: decl.decl.generic_params.clone(),
-            type_arg_index: own_type_arg_index(&res.chain, &raw_classes, &decl.decl),
+            generic_params: {
+                let mut gps = Vec::new();
+                let mut outer_prefix: Vec<String> = Vec::new();
+                for o in &decl.outer {
+                    if let Some(oc) = raw_classes.iter().find(|c| {
+                        c.decl.name == *o
+                            && c.ns == decl.ns
+                            && c.outer == outer_prefix
+                    }) {
+                        gps.extend(oc.decl.generic_params.clone());
+                    }
+                    outer_prefix.push(o.clone());
+                }
+                gps.extend(decl.decl.generic_params.clone());
+                gps
+            },
+            type_arg_index: {
+                // Recompute from the combined generic_params.
+                // own_type_arg_index only knows decl.decl (own params).
+                // For nested types, outer params are prepended, so the
+                // indices shift.
+                let n = {
+                    let mut gps = Vec::new();
+                    let mut outer_prefix: Vec<String> = Vec::new();
+                    for o in &decl.outer {
+                        if let Some(oc) = raw_classes.iter().find(|c| {
+                            c.decl.name == *o
+                                && c.ns == decl.ns
+                                && c.outer == outer_prefix
+                        }) {
+                            gps.extend(oc.decl.generic_params.clone());
+                        }
+                        outer_prefix.push(o.clone());
+                    }
+                    gps.extend(decl.decl.generic_params.clone());
+                    gps.len()
+                };
+                (0..n as u32).collect()
+            },
             is_struct: decl.decl.is_struct,
             is_record: decl.decl.is_record,
             // Ownership is attributed by the post-pass below (needs the
