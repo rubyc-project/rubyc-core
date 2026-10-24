@@ -645,8 +645,31 @@ impl Ctx<'_> {
         if self.method_vars.iter().any(|p| p == base) {
             return true;
         }
-        self.current_info
+        if self
+            .current_info
             .is_some_and(|info| info.generic_params.iter().any(|p| p == base))
+        {
+            return true;
+        }
+        // Nested types inherit their enclosing (generic) type's type
+        // parameters: `ConcurrentDictionary<TKey,TValue>.KeyCollection`
+        // has no type parameters of its own, but `TKey`/`TValue`
+        // are in scope from the outer class.
+        if let Some(path) = self.current_path {
+            // Walk each prefix of the qualified path.
+            let parts: Vec<&str> = path.split('.').collect();
+            for depth in 1..parts.len() {
+                let prefix = parts[..depth].join(".");
+                for decl in self.classes.iter() {
+                    if self.class_paths.get(&(*decl as *const _)) == Some(&prefix)
+                        && decl.generic_params.iter().any(|g| g == base)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// The class the current code is in, as the access rules see it:
@@ -2251,7 +2274,8 @@ fn pick_chain_ctor(
 ) -> Option<usize> {
     let mut best: Option<(u32, usize)> = None;
     for (sig, idx) in cands {
-        if let Some((total, _)) = lower::score_call(sig, arg_tys, 0, table, class_vars, false) {
+        let sc = lower::score_call(sig, arg_tys, 0, table, class_vars, false);
+        if let Some((total, _)) = sc {
             let better = match &best {
                 None => true,
                 Some((b, _)) => total < *b,

@@ -5009,10 +5009,41 @@ fn emit_is_pattern(
         // failing loudly (the feature is not implemented for them).
         if ctx.is_type_var(&simple) {
             if is_value_type_spelling(ctx, subject_ty) {
-                return Err(LowerError::UnsupportedConstruct(crate::tf!(
-                    "rubyc.native.ir.lower_expr.type_var_test",
-                    simple.to_string()
-                )));
+                let t_desc = b.type_token(&simple, ctx)?;
+                let subj_desc = b.type_token(subject_ty, ctx)?;
+                let obj_desc = b.type_token("object", ctx)?;
+                let vt_desc = b.type_token("ValueType", ctx)?;
+                let c1 = b.emit(Instr::Cmp {
+                    dst: VReg(0),
+                    op: CmpOp::Eq,
+                    a: t_desc,
+                    b: subj_desc,
+                });
+                let c2 = b.emit(Instr::Cmp {
+                    dst: VReg(0),
+                    op: CmpOp::Eq,
+                    a: t_desc,
+                    b: obj_desc,
+                });
+                let c3 = b.emit(Instr::Cmp {
+                    dst: VReg(0),
+                    op: CmpOp::Eq,
+                    a: t_desc,
+                    b: vt_desc,
+                });
+                let r12 = b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitOr,
+                    a: c1,
+                    b: c2,
+                });
+                let r = b.emit(Instr::Bin {
+                    dst: VReg(0),
+                    op: IrBinOp::BitOr,
+                    a: r12,
+                    b: c3,
+                });
+                return Ok(r);
             }
             let zero = b.const_i64(0);
             let is_null = b.emit(Instr::Cmp {

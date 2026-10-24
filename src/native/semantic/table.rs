@@ -462,9 +462,22 @@ impl TypeTable {
         {
             return Some(zero);
         }
+        // Prefer non-nested (top-level) types over nested ones that
+        // share a simple name: `Scalar` should resolve to
+        // `System.Runtime.Intrinsics.Scalar`, not
+        // `PropertyValue.Scalar`, when both are in scope.
+        let is_nested = |c: &ClassInfo| -> bool {
+            let prefix = c.key.scope_prefix();
+            if prefix.is_empty() {
+                return false;
+            }
+            let last = prefix.rsplit('.').next().unwrap_or(prefix);
+            self.classes.iter().any(|o| o.name == last)
+        };
         self.classes
             .iter()
-            .find(|c| c.name == name || c.key.path == name)
+            .filter(|c| c.name == name || c.key.path == name)
+            .min_by_key(|c| is_nested(c))
             .or_else(|| {
                 // Alias targets carry generic arguments
                 // (`WorkQueue` → `...Queue<object>`): match by base
@@ -537,7 +550,21 @@ impl TypeTable {
         if candidates.len() == 1 {
             return Some(candidates.swap_remove(0));
         }
-        // Ambiguous: prefer the referrer's own scope, then global.
+        // Ambiguous: prefer non-nested (top-level) types over nested
+        // ones sharing the simple name (e.g. `Scalar` in
+        // `System.Runtime.Intrinsics` vs `PropertyValue.Scalar`), then
+        // the referrer's own scope, then global.
+        let is_nested = |k: &TypeKey| -> bool {
+            let prefix = k.scope_prefix();
+            if prefix.is_empty() {
+                return false;
+            }
+            let last = prefix.rsplit('.').next().unwrap_or(prefix);
+            self.classes.iter().any(|c| c.name == last)
+        };
+        if let Some(k) = candidates.iter().find(|k| !is_nested(k)) {
+            return Some(k.clone());
+        }
         if let Some(ctx) = context {
             if let Some(k) = candidates
                 .iter()

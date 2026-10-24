@@ -321,6 +321,27 @@ pub(super) fn compat_score(arg: &str, param: &str, table: &TypeTable, vars: &[St
     {
         return Some(2);
     }
+    // `Delegate`/`MulticastDelegate` parameters accept any delegate-
+    // typed argument (an implicit reference conversion in C#). The
+    // compiler has no metadata for imported delegate types, so a
+    // delegate is recognised here as any non-value-type, non-array
+    // reference spelling — value types and arrays never convert.
+    {
+        let p_base = base_type_name(param);
+        if p_base == "Delegate" || p_base == "MulticastDelegate" {
+            let a_base = base_type_name(arg);
+            const VALUE: &[&str] = &[
+                "sbyte", "byte", "short", "ushort", "int", "uint", "long", "ulong", "nint",
+                "nuint", "char", "float", "double", "decimal", "bool", "SByte", "Byte",
+                "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64", "IntPtr", "UIntPtr",
+                "Char", "Single", "Double", "Decimal", "Boolean",
+            ];
+            if !VALUE.contains(&a_base.as_str()) && !arg.contains('[') {
+                return Some(1);
+            }
+            return None;
+        }
+    }
     // The literal ZERO converts to any numeric or enum target (C#'s
     // implicit constant-zero conversion) and to `object` (boxing), but
     // never to a reference type.
@@ -455,6 +476,7 @@ pub(super) fn compat_score(arg: &str, param: &str, table: &TypeTable, vars: &[St
     {
         return Some(1);
     }
+
     // Class implements interface (transitively, precomputed):
     // `Dictionary<K,V>` converts to an `IEnumerable` parameter or
     // extension receiver (`TryGetSpan` in Linq). Simple-name match on
