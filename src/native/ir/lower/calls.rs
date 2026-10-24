@@ -720,16 +720,50 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
     if let Some(cur) = ctx.current_info {
         entries.push(cur);
     }
-    entries.extend(entries_for(ctx.table, ctx.current_class));
-    let selected = select_visible(
+    let all_entries = entries_for(ctx.table, ctx.current_class);
+    let is_static = enclosing_is_static(ctx, b);
+    if is_static {
+        if let Some(first) = all_entries.first() {
+            if !entries.iter().any(|e| e.key == first.key) {
+                entries.push(first);
+            }
+        }
+    } else {
+        entries.extend(all_entries);
+    }
+    if name == "Equals" {
+        eprintln!("[DBG15] name={} current_class={} enclosing_static={} entries={:?}", name, ctx.current_class, is_static, entries.iter().map(|e| e.key.path.clone()).collect::<Vec<_>>());
+    }
+    // In a static context, prefer static overloads: an inherited
+    // instance `Equals`/`ToString` must not shadow the intended
+    // static one. Try statics first; fall back to both so an instance
+    // member reached from a static context still surfaces as CS0120
+    // (reported by the check below) instead of "unknown method".
+    let staticness = if enclosing_is_static(ctx, b) {
+        Some(true)
+    } else {
+        None
+    };
+    let mut selected = select_visible(
         ctx.table,
         &entries,
         name,
         &arg_types,
-        None,
+        staticness,
         ctx.current_class,
         explicit_arity,
     );
+    if selected.is_none() && staticness.is_some() {
+        selected = select_visible(
+            ctx.table,
+            &entries,
+            name,
+            &arg_types,
+            None,
+            ctx.current_class,
+            explicit_arity,
+        );
+    }
     if let Some(mi) = selected {
         if mi
             .conditional_symbol
