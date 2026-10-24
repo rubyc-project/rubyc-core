@@ -1288,9 +1288,10 @@ impl<'a> Body<'a> {
         // annotation is erased, so `Task<T>?` names `Task<T>`.
         let s = s.trim_end_matches('?').to_owned();
         if let Some((base, args)) = self.split_generic_spelling(&s)
-            && args
-                .iter()
-                .any(|a| direct_type_var(a.trim_end_matches('?'), ctx))
+            && args.iter().any(|a| {
+                let a = a.trim_end_matches('?');
+                direct_type_var(a, ctx) || type_meta(a, ctx).has_type_var
+            })
         {
             let def = self.type_token(&base, ctx)?;
             let mut descs: Vec<VReg> = Vec::with_capacity(args.len());
