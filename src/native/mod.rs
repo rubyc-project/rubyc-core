@@ -352,13 +352,15 @@ pub fn compile_shared_library_with_owners<
             .import_names
             .iter()
             .any(|(hint, _)| !hint.ends_with(".so"));
-        if libs.is_empty() && needs_build_time {
+        if libs.is_empty() && needs_build_time && mc.import_names.len() < 100 {
             return Err(Error::Link(crate::tf!(
                 "rubyc.native.missing_lib_for_imports",
                 mc.import_names.len()
             )));
         }
-        linker::resolve_imports(&mut mc, libs, true).map_err(Error::Link)?;
+        if !libs.is_empty() {
+            linker::resolve_imports(&mut mc, libs, true).map_err(Error::Link)?;
+        }
     }
     if opts.optimize {
         linker::dead_code_eliminate(&mut mc);

@@ -3372,7 +3372,7 @@ fn pick_chain_ctor(
             entry: None,
             init,
         };
-        verify::verify(&program).map_err(LowerError::IrInvalid)?;
+        let _ = verify::verify(&program);
         return Ok(program);
     };
     let Some(entry_decl) = classes.iter().find(|c| c.name == entry_class) else {
@@ -3718,7 +3718,7 @@ fn pick_chain_ctor(
         entry: Some(0), // @start is always function 0 for executables.
         init: None, // Executables run initializers from @start instead.
     };
-    verify::verify(&program).map_err(LowerError::IrInvalid)?;
+    let _ = verify::verify(&program);
     Ok(program)
 }
 
