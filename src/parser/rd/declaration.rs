@@ -1783,6 +1783,7 @@ impl Parser {
                 is_settable,
                 is_static,
                 is_abstract,
+                is_byref,
                 is_override,
                 is_virtual,
                 is_hiding,

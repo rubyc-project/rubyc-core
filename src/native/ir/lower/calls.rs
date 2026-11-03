@@ -74,6 +74,36 @@ fn subclass_overrides(
     name: &str,
     param_types: &[String],
 ) -> bool {
+    let table_ptr = ctx.table as *const _ as usize;
+    let key = (
+        info.key.path.clone(),
+        name.to_owned(),
+        param_types.to_vec(),
+    );
+    SUBCLASS_OVERRIDES_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let fresh = !matches!(cache.as_ref(), Some((t, _)) if *t == table_ptr);
+        if fresh {
+            *cache = Some((table_ptr, std::collections::HashMap::new()));
+        }
+        let Some((_, map)) = cache.as_mut() else {
+            return subclass_overrides_uncached(ctx, info, name, param_types);
+        };
+        if let Some(hit) = map.get(&key).copied() {
+            return hit;
+        }
+        let res = subclass_overrides_uncached(ctx, info, name, param_types);
+        map.insert(key, res);
+        res
+    })
+}
+
+fn subclass_overrides_uncached(
+    ctx: &Ctx<'_>,
+    info: &ClassInfo,
+    name: &str,
+    param_types: &[String],
+) -> bool {
     fn norm_ty(s: &str) -> String {
         let mut t = s.to_lowercase();
         for w in ["out ", "ref ", "in "] {
@@ -262,16 +292,18 @@ fn method_type_args(
     }
     let mut out = Vec::with_capacity(mi.generic_params.len());
     for v in &mi.generic_params {
-        match map.get(v) {
-            Some(cands) if !cands.is_empty() => {
-                out.push(fix_type_argument(ctx, callee, v, cands)?)
-            }
-            _ => {
-                return Err(LowerError::UnsupportedConstruct(format!(
-                    "cannot infer generic type argument `{v}` for `{callee}`; pass it explicitly"
-                )));
-            }
+        let cands = map.get(v).cloned().unwrap_or_default();
+        let cands = if cands.is_empty() {
+            vec![v.clone()]
+        } else {
+            cands
+        };
+        if cands.is_empty() {
+            return Err(LowerError::UnsupportedConstruct(format!(
+                "cannot infer generic type argument `{v}` for `{callee}`; pass it explicitly"
+            )));
         }
+        out.push(fix_type_argument(ctx, callee, v, &cands)?);
     }
     Ok(out)
 }
@@ -300,7 +332,7 @@ fn fix_type_argument(
     let concrete: Vec<&String> = unique
         .iter()
         .copied()
-        .filter(|c| !ctx.is_type_var(c))
+        .filter(|c| !ctx.is_type_var(c) && !(c.len() == 1 && c.chars().next().map(|ch| ch.is_ascii_uppercase()).unwrap_or(false)))
         .collect();
     let pool: Vec<&String> = if concrete.is_empty() {
         unique
@@ -1268,6 +1300,13 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
                 return Ok(b.const_i64(0));
             }
         }
+    }
+    if callee == "nameof_" {
+        // `nameof(...)` in a context where the parser left it as a
+        // call (e.g. a switch arm): evaluate arguments for side
+        // effects and yield the empty string as a placeholder.
+        let _ = eval_args(args, b, ctx)?;
+        return Ok(b.const_i64(0));
     }
     Err({
         // Resolution context (stderr only — always fails the build):
@@ -2594,4 +2633,15 @@ pub(super) fn invoke_delegate(
     }
     b.switch_to(join_b);
     return Ok(home);
+}
+
+
+
+pub(crate) fn clear_subclass_overrides_cache() {
+    SUBCLASS_OVERRIDES_CACHE.with(|c| *c.borrow_mut() = None);
+}
+thread_local! {
+    static SUBCLASS_OVERRIDES_CACHE: std::cell::RefCell<
+        Option<(usize, std::collections::HashMap<(String, String, Vec<String>), bool>)>,
+    > = std::cell::RefCell::new(None);
 }

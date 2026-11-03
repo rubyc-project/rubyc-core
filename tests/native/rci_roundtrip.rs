@@ -75,6 +75,7 @@ fn sample_class() -> ClassInfo {
             is_static: true,
             is_abstract: false,
             is_intrinsic: false,
+            is_byref: false,
         }],
         is_enum: false,
         generic_params: vec!["T".into()],

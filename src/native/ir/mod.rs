@@ -630,6 +630,35 @@ impl Ctx<'_> {
         if name.contains('.') || name.contains('<') {
             return false;
         }
+        let table_ptr = self.table as *const _ as usize;
+        let cur_info = self.current_info.map(|i| i as *const _ as usize).unwrap_or(0);
+        let cur_path = self.current_path.unwrap_or("");
+        let mv_key = self.method_vars.join(",");
+        let cache_key = (table_ptr, cur_info, cur_path.to_owned(), mv_key, name.to_owned());
+        let cached = IS_TYPE_VAR_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            let fresh = !matches!(c.as_ref(), Some((t, _)) if *t == table_ptr);
+            if fresh {
+                *c = Some((table_ptr, std::collections::HashMap::new()));
+            }
+            c.as_ref().unwrap().1.get(&cache_key).copied()
+        });
+        if let Some(v) = cached {
+            return v;
+        }
+        let res = self.is_type_var_impl(name);
+        IS_TYPE_VAR_CACHE.with(|c| {
+            if let Some((_, map)) = c.borrow_mut().as_mut() {
+                map.insert(cache_key, res);
+            }
+        });
+        res
+    }
+
+    pub(crate) fn is_type_var_impl(&self, name: &str) -> bool {
+        if name.contains('.') || name.contains('<') {
+            return false;
+        }
         // Strip nullable/pointer/array suffixes (`T?`, `T*`, `T[]`):
         // the variable is still unbound.
         let mut base = name.trim();
@@ -1815,7 +1844,13 @@ pub fn lower_with_owners(
 ) -> Result<Program, LowerError> {
     // Fresh run, fresh call-index cache (keyed by table address).
     lower::clear_fn_index_cache();
+    clear_is_type_var_cache();
+    lower::clear_subclass_overrides_cache();
     lower::clear_subclass_cache();
+    lower::clear_member_host_cache();
+    lower::clear_pick_overload_cache();
+    lower::clear_vtable_row_cache();
+    lower::Body::clear_object_target_cache();
     lower::clear_lookup_cache();
     let table = semantic::analyze_with_preloaded(unit, owners, preloaded)
         .map_err(LowerError::Semantic)?;
@@ -2259,23 +2294,52 @@ fn split_generic_spelling(spelling: &str) -> (String, Vec<String>) {
 /// and `Func<T>?` becomes `Func<int>?`. The variables are whole
 /// identifiers, so the substitution never touches a name that merely
 /// starts with the same letters.
+thread_local! {
+    static SUBSTITUTE_TYPE_VARS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<(String, Vec<(String, String)>), String>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 fn substitute_type_vars(spelling: &str, sub: &[(String, String)]) -> String {
     if sub.is_empty() {
         return spelling.to_owned();
     }
+    let key = (spelling.to_owned(), sub.to_vec());
+    if let Some(cached) = SUBSTITUTE_TYPE_VARS_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    use std::collections::HashMap;
+    let map: HashMap<&str, &str> = sub.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let mut out = String::with_capacity(spelling.len());
     let mut rest = spelling;
     while !rest.is_empty() {
         let end = rest
-            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .bytes()
+            .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
             .unwrap_or(rest.len());
+        if end == 0 {
+            // Leading delimiter / non-identifier byte: copy it verbatim
+            // and advance past it, otherwise the loop never terminates.
+            let mut chars = rest.chars();
+            if let Some(c) = chars.next() {
+                out.push(c);
+                rest = chars.as_str();
+            } else {
+                break;
+            }
+            continue;
+        }
         let (word, tail) = rest.split_at(end);
-        match sub.iter().find(|(v, _)| v == word) {
-            Some((_, concrete)) => out.push_str(concrete),
-            None => out.push_str(word),
+        if let Some(concrete) = map.get(word) {
+            out.push_str(concrete);
+        } else {
+            out.push_str(word);
         }
         rest = tail;
     }
+    SUBSTITUTE_TYPE_VARS_CACHE.with(|c| {
+        c.borrow_mut().insert(key, out.clone());
+    });
     out
 }
 
@@ -3764,4 +3828,14 @@ fn method_arity(class: &ClassDecl, method: &str) -> Option<usize> {
         ClassMember::Method(md) if md.name == method && md.body.is_some() => Some(md.params.len()),
         _ => None,
     })
+}
+
+
+pub(crate) fn clear_is_type_var_cache() {
+    IS_TYPE_VAR_CACHE.with(|c| *c.borrow_mut() = None);
+}
+thread_local! {
+    static IS_TYPE_VAR_CACHE: std::cell::RefCell<
+        Option<(usize, std::collections::HashMap<(usize, usize, String, String, String), bool>)>,
+    > = std::cell::RefCell::new(None);
 }

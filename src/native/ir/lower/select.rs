@@ -786,6 +786,48 @@ pub(super) fn pick_overload<'t>(
     viewer: Option<&str>,
     explicit_arity: Option<usize>,
 ) -> Option<&'t MethodInfo> {
+    let table_ptr = table as *const _ as usize;
+    let info_ptr = info as *const _ as usize;
+    let viewer_key = viewer.unwrap_or("").to_owned();
+    let key = (
+        info_ptr,
+        name.to_owned(),
+        arg_types.to_vec(),
+        staticness,
+        viewer_key,
+        explicit_arity,
+    );
+    let cached = PICK_OVERLOAD_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let fresh = !matches!(c.as_ref(), Some((t, _)) if *t == table_ptr);
+        if fresh {
+            *c = Some((table_ptr, std::collections::HashMap::new()));
+        }
+        c.as_ref().unwrap().1.get(&key).copied()
+    });
+    if let Some(idx) = cached {
+        return if idx == usize::MAX { None } else { info.methods.get(idx) };
+    }
+    let res = pick_overload_uncached(info, name, arg_types, table, staticness, viewer, explicit_arity);
+    let idx = res.and_then(|m| info.methods.iter().position(|x| std::ptr::eq(x, m))).unwrap_or(usize::MAX);
+    let store = if res.is_none() { usize::MAX } else { idx };
+    PICK_OVERLOAD_CACHE.with(|c| {
+        if let Some((_, map)) = c.borrow_mut().as_mut() {
+            map.insert(key, store);
+        }
+    });
+    res
+}
+
+pub(super) fn pick_overload_uncached<'t>(
+    info: &'t ClassInfo,
+    name: &str,
+    arg_types: &[String],
+    table: &TypeTable,
+    staticness: Option<bool>,
+    viewer: Option<&str>,
+    explicit_arity: Option<usize>,
+) -> Option<&'t MethodInfo> {
     // Explicit generic type arguments (`services.AddOptions<NoOp>()`)
     // restrict candidates to overloads with exactly that many type
     // parameters (C# errors otherwise): without this, a non-generic
@@ -1204,6 +1246,33 @@ pub(super) fn member_host<'t>(
     class_name: &str,
     member: &str,
 ) -> Option<&'t ClassInfo> {
+    let table_ptr = table as *const _ as usize;
+    let key = (class_name.to_owned(), member.to_owned());
+    let idx = MEMBER_HOST_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let fresh = !matches!(cache.as_ref(), Some((t, _)) if *t == table_ptr);
+        if fresh {
+            *cache = Some((table_ptr, std::collections::HashMap::new()));
+        }
+        let Some((_, map)) = cache.as_mut() else {
+            return None;
+        };
+        if let Some(hit) = map.get(&key).copied() {
+            return if hit == usize::MAX { None } else { Some(hit) };
+        }
+        let computed = member_host_uncached(table, class_name, member)
+            .and_then(|c| table.classes.iter().position(|x| std::ptr::eq(x, c)));
+        map.insert(key, computed.unwrap_or(usize::MAX));
+        computed
+    });
+    idx.map(|i| &table.classes[i])
+}
+
+pub(super) fn member_host_uncached<'t>(
+    table: &'t TypeTable,
+    class_name: &str,
+    member: &str,
+) -> Option<&'t ClassInfo> {
     pub(super) fn declares(info: &ClassInfo, member: &str) -> bool {
         info.field(member).is_some()
             || info.properties.iter().any(|p| p.name == member)
@@ -1286,12 +1355,19 @@ pub(super) fn resolve_scoped(table: &TypeTable, name: &str, context_class: &str)
         return None;
     }
     let ctx_key = table.class(context_class)?.key.path.clone();
-    // Nested directly in context, then enclosing scopes outward.
+    // Nested directly in context, then enclosing (class) scopes
+    // outward — but only across actual classes, never across a
+    // namespace, so a top-level type with the same simple name does
+    // not shadow a primitive alias (e.g. `decimal`).
     let mut prefix = ctx_key;
     loop {
-        let cand = format!("{prefix}.{name}");
-        if table.classes.iter().any(|c| c.key.path == cand) {
-            return Some(cand);
+        if table.class(&prefix).is_some() {
+            let cand = format!("{prefix}.{name}");
+            if table.classes.iter().any(|c| c.key.path == cand) {
+                return Some(cand);
+            }
+        } else {
+            break;
         }
         let Some(i) = prefix.rfind('.') else {
             break;
@@ -1985,7 +2061,29 @@ mod tests {
             delegates: Vec::new(),
             imports: Vec::new(),
             aliases: Vec::new(),
+            class_cache: Default::default(),
+            class_paths_cache: Default::default(),
+            derives_from_cache: Default::default(),
         };
         assert_eq!(entries_for(&table, "Dup").len(), 1);
     }
+}
+
+pub(crate) fn clear_member_host_cache() {
+    MEMBER_HOST_CACHE.with(|c| *c.borrow_mut() = None);
+}
+thread_local! {
+    static MEMBER_HOST_CACHE: std::cell::RefCell<
+        Option<(usize, std::collections::HashMap<(String, String), usize>)>,
+    > = std::cell::RefCell::new(None);
+}
+
+
+pub(crate) fn clear_pick_overload_cache() {
+    PICK_OVERLOAD_CACHE.with(|c| *c.borrow_mut() = None);
+}
+thread_local! {
+    static PICK_OVERLOAD_CACHE: std::cell::RefCell<
+        Option<(usize, std::collections::HashMap<(usize, String, Vec<String>, Option<bool>, String, Option<usize>), usize>)>,
+    > = std::cell::RefCell::new(None);
 }

@@ -63,6 +63,9 @@ pub struct PropertyDecl {
     pub is_init: bool,
     /// `set` accessor present (`{ get; set; }`); auto-property write flag.
     pub is_settable: bool,
+    /// `ref` modifier: the property returns by reference, so writes
+    /// through it land on the referenced storage even without a setter.
+    pub is_byref: bool,
     /// `static` modifier: the property lives in per-class static storage
     /// (accessed through the type name), mirroring FieldDecl.
     pub is_static: bool,

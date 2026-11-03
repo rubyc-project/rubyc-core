@@ -572,6 +572,7 @@ impl Reader<'_> {
                     is_settable,
                     is_static,
                     is_abstract,
+                    is_byref: false,
                     span: Span::default(),
                 }))
             }

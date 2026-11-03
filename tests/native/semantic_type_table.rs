@@ -115,6 +115,9 @@ fn table() -> TypeTable {
         interfaces: vec![],
         imports: vec![],
         aliases: vec![],
+        class_cache: Default::default(),
+        class_paths_cache: Default::default(),
+        derives_from_cache: Default::default(),
     }
 }
 

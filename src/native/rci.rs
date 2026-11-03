@@ -196,6 +196,7 @@ impl Writer {
         self.u8(u8::from(p.is_static));
         self.u8(u8::from(p.is_abstract));
         self.u8(u8::from(p.is_intrinsic));
+        self.u8(u8::from(p.is_byref));
     }
 
     fn param(&mut self, p: &Param) {
@@ -464,6 +465,7 @@ impl<'a> Reader<'a> {
         let is_static = self.u8() != 0;
         let is_abstract = self.u8() != 0;
         let is_intrinsic = self.u8() != 0;
+        let is_byref = self.u8() != 0;
         PropertyInfo {
             name,
             type_name,
@@ -472,6 +474,7 @@ impl<'a> Reader<'a> {
             is_static,
             is_abstract,
             is_intrinsic,
+            is_byref,
         }
     }
 

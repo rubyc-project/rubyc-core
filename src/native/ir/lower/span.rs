@@ -136,12 +136,46 @@ pub(super) fn vtable_row_for(
     entry_name: &str,
     entry_path: &str,
 ) -> u32 {
+    let table_ptr = ctx.table as *const _ as usize;
+    let key = (entry_name.to_owned(), entry_path.to_owned());
+    VT_ROW_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let fresh = !matches!(cache.as_ref(), Some((t, _)) if *t == table_ptr);
+        if fresh {
+            *cache = Some((table_ptr, std::collections::HashMap::new()));
+        }
+        let Some((_, map)) = cache.as_mut() else {
+            return vtable_row_for_uncached(ctx, entry_name, entry_path);
+        };
+        if let Some(hit) = map.get(&key).copied() {
+            return hit;
+        }
+        let res = vtable_row_for_uncached(ctx, entry_name, entry_path);
+        map.insert(key, res);
+        res
+    })
+}
+
+pub(super) fn vtable_row_for_uncached(
+    ctx: &Ctx<'_>,
+    entry_name: &str,
+    entry_path: &str,
+) -> u32 {
+    // Cache the set of table-backed class simple names so the
+    // per-class lookup is O(1) instead of scanning the whole table
+    // for every entry (which made allocation of boxed structs
+    // quadratic and stalled builds).
+    let mut table_names: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    for c in ctx.table.classes.iter() {
+        table_names.insert(c.name.as_str());
+    }
     let mut vi: u32 = 0;
     for c in ctx.classes.iter() {
         if c.name == entry_name || c.name == entry_path {
             break;
         }
-        if ctx.table.class(&c.name).is_some() {
+        if table_names.contains(c.name.as_str()) {
             vi += 1;
         }
     }
@@ -1392,4 +1426,14 @@ pub(super) fn pack_span_from_string(
     // into `w`-byte slots.
     pack_loop(b, data, src, len, w, 2, 2);
     span_object(b, ctx, span_ty, data, len)
+}
+
+
+pub(crate) fn clear_vtable_row_cache() {
+    VT_ROW_CACHE.with(|c| *c.borrow_mut() = None);
+}
+thread_local! {
+    static VT_ROW_CACHE: std::cell::RefCell<
+        Option<(usize, std::collections::HashMap<(String, String), u32>)>,
+    > = std::cell::RefCell::new(None);
 }

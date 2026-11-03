@@ -962,6 +962,9 @@ pub fn analyze_with_preloaded(
                 .map(|a| (a.name.clone(), a.target.clone()))
                 .collect()
         },
+        class_cache: Default::default(),
+        class_paths_cache: Default::default(),
+        derives_from_cache: Default::default(),
     };
 
     // ---- pass 0: [LibraryImport] stubs.
@@ -1821,6 +1824,7 @@ pub fn analyze_with_preloaded(
                             existing.is_intrinsic =
                                 existing.is_intrinsic
                                     || p.attrs.iter().any(|a| a.name == "Intrinsic");
+                            existing.is_byref = existing.is_byref || p.is_byref;
                         } else {
                             properties.push(PropertyInfo {
                                 name: p.name.clone(),
@@ -1833,6 +1837,7 @@ pub fn analyze_with_preloaded(
                                     .attrs
                                     .iter()
                                     .any(|a| a.name == "Intrinsic"),
+                                is_byref: p.is_byref,
                             });
                         }
                         if p.get.is_some() || p.set.is_some() || p.get_expr.is_some() {
@@ -2662,12 +2667,11 @@ pub fn context_of(unit: &CompilationUnit, class_name: &str, function: &str) -> S
 /// contract (lowering `Length` and the indexer off the builtin type) so
 /// no library's private field names are known here.
 pub fn builtin_string_interior_offset(declaring_type: &str, member: &str) -> Option<u32> {
-    if declaring_type
+    let simple = declaring_type
         .rsplit('.')
         .next()
-        .unwrap_or(declaring_type)
-        != "String"
-    {
+        .unwrap_or(declaring_type);
+    if simple != "String" && simple != "string" {
         return None;
     }
     match member {
@@ -2778,25 +2782,34 @@ fn same_nesting_family(table: &TypeTable, a: &str, b: &str) -> bool {
 /// so an unrelated `Inner` inherited access it never had. Ambiguity is
 /// not evidence; a dotted spelling is what disambiguates.
 fn class_paths(table: &TypeTable, n: &str) -> Vec<String> {
+    if let Some(cached) = table.class_paths_cache.borrow().get(n).cloned() {
+        return cached;
+    }
     let hits: Vec<String> = table
         .classes
         .iter()
         .filter(|c| {
-            c.name == n
-                || c.key.path == n
-                // Namespace-relative spellings
-                // (`WaitSubsystem.ThreadWaitInfo` as-written inside
-                // `System.Threading`): match by dot-boundary suffix.
-                // That is C# name lookup, which searches enclosing
-                // namespaces outward.
-                || c.key.path.ends_with(&format!(".{n}"))
+            if c.name == n || c.key.path == n {
+                return true;
+            }
+            let plen = c.key.path.len();
+            let nlen = n.len();
+            plen > nlen
+                && c.key.path.ends_with(n)
+                && c.key.path.as_bytes()[plen - nlen - 1] == b'.'
         })
         .map(|c| c.key.path.clone())
         .collect();
-    if !n.contains('.') && hits.len() > 1 {
-        return Vec::new();
-    }
-    hits
+    let result = if !n.contains('.') && hits.len() > 1 {
+        Vec::new()
+    } else {
+        hits
+    };
+    table
+        .class_paths_cache
+        .borrow_mut()
+        .insert(n.to_owned(), result.clone());
+    result
 }
 
 /// The last segment of a qualified path (`Ns.Foo` → `Foo`).

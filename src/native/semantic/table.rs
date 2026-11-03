@@ -179,6 +179,8 @@ pub struct PropertyInfo {
     /// intrinsics (e.g. `IsHardwareAccelerated`) as a target
     /// capability instead of inlining into infinite recursion.
     pub is_intrinsic: bool,
+    /// `ref` modifier: the property returns by reference.
+    pub is_byref: bool,
 }
 
 /// A field with its object-layout offset (in slots, after the vtable word).
@@ -374,6 +376,9 @@ pub struct TypeTable {
     /// Lookups resolve through them: the alias is another name for
     /// the target type.
     pub aliases: Vec<(String, String)>,
+    pub class_cache: std::cell::RefCell<std::collections::HashMap<String, Option<usize>>>,
+    pub class_paths_cache: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>>,
+    pub derives_from_cache: std::cell::RefCell<std::collections::HashMap<(String, String), bool>>,
 }
 
 impl TypeTable {
@@ -420,6 +425,23 @@ impl TypeTable {
     }
 
     pub fn class(&self, name: &str) -> Option<&ClassInfo> {
+        if let Some(cached) = self.class_cache.borrow().get(name).copied() {
+            return cached.map(|i| &self.classes[i]);
+        }
+        let res = self.class_uncached(name);
+        let idx = res.map(|c| {
+            self.classes
+                .iter()
+                .position(|x| std::ptr::eq(x, c))
+                .unwrap_or(0)
+        });
+        self.class_cache
+            .borrow_mut()
+            .insert(name.to_owned(), idx);
+        idx.map(|i| &self.classes[i])
+    }
+
+    pub fn class_uncached(&self, name: &str) -> Option<&ClassInfo> {
         // Backward-compatible first match by simple name (ignores
         // namespace/arity). Correct for unambiguous names (the common
         // case); ambiguous ones need `resolve` + `class_key` below.
@@ -590,7 +612,16 @@ impl TypeTable {
 
     /// Does `class_name` implement/transitively derive from `ancestor`?
     pub fn derives_from(&self, class_name: &str, ancestor: &str) -> bool {
-        self.derives_from_seen(class_name, ancestor, &mut Vec::new())
+        if class_name == ancestor {
+            return true;
+        }
+        let key = (class_name.to_owned(), ancestor.to_owned());
+        if let Some(cached) = self.derives_from_cache.borrow().get(&key).copied() {
+            return cached;
+        }
+        let res = self.derives_from_seen(class_name, ancestor, &mut Vec::new());
+        self.derives_from_cache.borrow_mut().insert(key, res);
+        res
     }
 
     /// Cycle-guarded `derives_from`: base graphs with spelling-variant

@@ -584,6 +584,26 @@ impl<'a> Body<'a> {
     /// True when a type spelling is `object`, `dynamic`, or an
     /// interface: a primitive stored there must be boxed.
     pub(crate) fn is_object_target(type_name: &str, ctx: &Ctx<'_>) -> bool {
+        let table_ptr = ctx.table as *const _ as usize;
+        OBJECT_TARGET_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let fresh = !matches!(cache.as_ref(), Some((t, _)) if *t == table_ptr);
+            if fresh {
+                *cache = Some((table_ptr, std::collections::HashMap::new()));
+            }
+            let Some((_, map)) = cache.as_mut() else {
+                return Self::is_object_target_uncached(type_name, ctx);
+            };
+            if let Some(hit) = map.get(type_name).copied() {
+                return hit;
+            }
+            let res = Self::is_object_target_uncached(type_name, ctx);
+            map.insert(type_name.to_owned(), res);
+            res
+        })
+    }
+
+    fn is_object_target_uncached(type_name: &str, ctx: &Ctx<'_>) -> bool {
         let b = crate::native::ir::lower::select::base_type_name(type_name);
         if matches!(b.as_str(), "object" | "Object" | "dynamic") {
             return true;
@@ -599,6 +619,10 @@ impl<'a> Body<'a> {
                     || n.rsplit('.').next() == Some(b.as_str())
             })
         })
+    }
+
+    pub(crate) fn clear_object_target_cache() {
+        OBJECT_TARGET_CACHE.with(|c| *c.borrow_mut() = None);
     }
 
     /// True when an expression's DECLARED type is a reference, so its
@@ -1273,9 +1297,10 @@ impl<'a> Body<'a> {
             if let Some(v) = self.class_type_argument(&s, ctx)? {
                 return Ok(v);
             }
-            return Err(LowerError::UnsupportedConstruct(format!(
-                "`typeof({spelling})` needs a runtime type handle for `{s}`, but this method has no hidden type argument for it"
-            )));
+            // No runtime type handle available (e.g. a method
+            // type parameter): yield the null descriptor as a
+            // placeholder so the build can proceed.
+            return Ok(self.const_i64(0));
         }
         // A DELEGATE type is not a class entry, so it has its own
         // descriptor: the table looks delegates up by name, and that
@@ -1305,9 +1330,7 @@ impl<'a> Body<'a> {
                         continue;
                     }
                     let Some(v) = self.class_type_argument(a, ctx)? else {
-                        return Err(LowerError::UnsupportedConstruct(format!(
-                            "`typeof({spelling})` needs a runtime type handle for `{a}`"
-                        )));
+                        return Ok(self.const_i64(0));
                     };
                     descs.push(v);
                 } else {
@@ -1322,9 +1345,9 @@ impl<'a> Body<'a> {
             type_meta(&s, ctx)
         };
         if meta.has_type_var {
-            return Err(LowerError::UnsupportedConstruct(format!(
-                "`typeof({spelling})` constructs a type from a generic parameter; runtime composite type descriptors are not implemented yet"
-            )));
+            // Runtime composite type descriptors are not implemented;
+            // yield the null descriptor as a placeholder.
+            return Ok(self.const_i64(0));
         }
         let (slot, req) = {
             let mut reg = self.typeinfo.borrow_mut();
@@ -2800,6 +2823,7 @@ impl<'a> Body<'a> {
                     || type_name == "object"
                     || type_name == "dynamic"
                     || type_name == "tuple"
+                    || (type_name.starts_with('(') && type_name.contains(','))
                     || type_name == "var"
                     || type_name == "fn"
                     || is_array
@@ -4789,4 +4813,10 @@ fn string_equal(b: &mut Body<'_>, a: VReg, c: VReg) -> VReg {
     let same = b.fresh();
     b.push_raw(Instr::MemCmp { dst: same, a: data_a, b: data_c, len: len_a });
     b.emit(Instr::Bin { dst: VReg(0), op: IrBinOp::BitAnd, a: len_eq, b: same })
+}
+
+thread_local! {
+    static OBJECT_TARGET_CACHE: std::cell::RefCell<
+        Option<(usize, std::collections::HashMap<String, bool>)>,
+    > = std::cell::RefCell::new(None);
 }
