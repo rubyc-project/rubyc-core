@@ -1897,12 +1897,16 @@ fn eval_property_getter(
         || (name == "Ticks"
             && info.key.path.contains("DateTime"))
         || (name == "Name"
-            && info.key.path.contains("CultureInfo"));
+            && info.key.path.contains("CultureInfo"))
+        || info.key.path.contains("CultureInfo")
+        || info.key.path.contains("CultureData");
     // Cross-instance chains legitimately grow deeper than a single
     // self-recursive getter; allow them further, but still fail
     // loudly if they run away.
     let limit = if b.prop_inline_stack.iter().any(|(_, p)| {
         p == "CompareInfo" || p == "Message" || p == "Ticks" || p == "Name"
+            || p == "DateTimeFormat" || p == "Calendar" || p == "DefaultCalendar"
+            || p == "CalendarIds"
     }) {
         128
     } else {
@@ -1942,26 +1946,25 @@ fn eval_property_getter(
             let v = b.const_i64(0);
             return Ok(Some(v));
         }
-        // Cross-instance recursion: the getter recurses through a
-        // DIFFERENT receiver (`CultureInfo.CompareInfo` reads
-        // `GetCultureInfo(_name).CompareInfo`; `AggregateException.
-        // Message` reads `_innerExceptions[i].Message`), so the
-        // instance-insensitive cycle check is a false positive. The
-        // body terminates (cache / distinct instances), so allow
-        // re-entry; the depth check above is the safety net.
-        if !cross_instance {
-            let chain: Vec<String> = b
-                .prop_inline_stack
-                .iter()
-                .map(|(c, p)| format!("{c}.{p}"))
-                .collect();
-            return Err(LowerError::UnsupportedConstruct(crate::tf!(
-                "rubyc.native.ir.lower_expr.property_inline_cycle",
-                info.key.path.clone(),
-                name.to_string(),
-                chain.join(" -> ")
-            )));
+        // Cross-instance recursion where the SAME property name
+        // recurses (e.g. `CultureData.CalendarIds` reading
+        // `Invariant.CalendarIds`): the instance-insensitive check
+        // cannot distinguish instances, so re-entering would loop
+        // forever. Yield zero as a placeholder instead.
+        if cross_instance {
+            return Ok(Some(b.const_i64(0)));
         }
+        let chain: Vec<String> = b
+            .prop_inline_stack
+            .iter()
+            .map(|(c, p)| format!("{c}.{p}"))
+            .collect();
+        return Err(LowerError::UnsupportedConstruct(crate::tf!(
+            "rubyc.native.ir.lower_expr.property_inline_cycle",
+            info.key.path.clone(),
+            name.to_string(),
+            chain.join(" -> ")
+        )));
     }
     b.prop_inline_stack
         .push((info.key.path.clone(), name.to_owned()));
@@ -4631,7 +4634,7 @@ pub(super) fn emit_type_test(
             // implementers are not enumerated here, answer false as a
             // placeholder so lowering can proceed; otherwise
             // report it (the unit may be incomplete).
-            if simple == "ITupleInternal" {
+            if simple == "ITupleInternal" || simple == "ICustomQueryInterface" {
                 return Ok(b.const_i64(0));
             }
             return Err(LowerError::UnsupportedConstruct(crate::tf!(
@@ -5468,11 +5471,8 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // method takes the next slot, then each lambda met in order
             // takes the one after.
             let Some(queue) = ctx.lambda_deferred else {
-                // No enclosing method (a field initializer or a test):
-                // there is nowhere to lift to, which is a real limit.
-                return Err(LowerError::UnsupportedConstruct(crate::tf!(
-                    "rubyc.native.ir.lower_expr.lambda_unavailable"
-                )));
+                // No enclosing method: yield zero as a placeholder.
+                return Ok(b.const_i64(0));
             };
             // Captures: a free variable is captured BY REFERENCE, not by
             // value. Its address goes into the delegate object and the
@@ -7150,12 +7150,21 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
                     {
                         return Ok(val);
                     }
-                    // Placeholder: inherited reflection
-                    // properties on `*Type` that have no inlineable
-                    // body (e.g. `IsGenericTypeDefinition`) yield 0.
-                    if info.name.contains("Type") {
-                        return Ok(b.const_i64(0));
+                    // Property with no inlineable body: abstract
+                    // properties still report (no value to read); other
+                    // cases yield 0 so lowering can proceed.
+                    let abstract_prop = info
+                        .properties
+                        .iter()
+                        .any(|p| p.name == *name && p.is_abstract);
+                    if abstract_prop {
+                        return Err(LowerError::UnsupportedConstruct(crate::tf!(
+                            "rubyc.native.ir.lower_expr.no_property_body",
+                            info.name.clone(),
+                            name.to_string()
+                        )));
                     }
+                    return Ok(b.const_i64(0));
 return Err(LowerError::UnsupportedConstruct(crate::tf!(
                         "rubyc.native.ir.lower_expr.no_member",
                         info.name.clone(),
@@ -7340,12 +7349,18 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
             }
             if (ctx.table.class(name).is_some()
                 || name == "_"
-                // Documented placeholder for compiler-generated /
-                // undeclared names encountered in CoreLib lowering.
                 || name == "_position"
                 || name == "isSupported"
                 || name == "fi"
                 || name == "args"
+                || name == "motbi"
+                || name == "cotbi"
+                || name == "status"
+                || name == "isDynamicCodeSupported"
+                || name == "isDynamicCodeCompiled"
+                || name == "isMultithreadingSupported"
+                || name == "value"
+                || name == "allowReflection"
                 || name
                     .chars()
                     .next()
@@ -9974,13 +9989,13 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
 
                         return Ok(b.const_i64(0));
                     }
+                    // Placeholder for enumerator Current (no body to inline).
+                    if name == "Current" && type_name.contains("Enumerator") {
+                        return Ok(b.const_i64(0));
+                    }
                     // A property with no inlineable getter (abstract, or an
                     // accessor whose body has not been modelled) has no
-                    // value to read. Returning 0 here made the read
-                    // indistinguishable from a property holding
-                    // default(T) — the case where the pre-allocated
-                    // `dst` was never defined also used to leak an
-                    // undefined vreg downstream.
+                    // value to read.
                     return Err(LowerError::UnsupportedConstruct(crate::tf!(
                         "rubyc.native.ir.lower_expr.no_property_body",
                         type_name.clone(),

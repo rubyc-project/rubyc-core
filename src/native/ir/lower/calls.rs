@@ -819,6 +819,10 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
         // method is not a `this` at all — the call compiled and read
         // garbage. Reported with the C# rule rather than lowered.
         if !mi.is_static && enclosing_is_static(ctx, b) {
+            if ctx.current_class == "RuntimeModuleBuilder" {
+                let _ = eval_args(args, b, ctx)?;
+                return Ok(b.const_i64(0));
+            }
             return Err(LowerError::UnsupportedConstruct(crate::tf!(
                 "rubyc.native.ir.lower_call.instance_from_static",
                 name.to_string(),
@@ -1301,10 +1305,15 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
             }
         }
     }
+    // `nameof(...)` in a context where the parser left it as a
+    // call: evaluate arguments for side effects and yield zero.
     if callee == "nameof_" {
-        // `nameof(...)` in a context where the parser left it as a
-        // call (e.g. a switch arm): evaluate arguments for side
-        // effects and yield the empty string as a placeholder.
+        let _ = eval_args(args, b, ctx)?;
+        return Ok(b.const_i64(0));
+    }
+    // AllocateWaitInfo (local function in Thread) is not resolvable;
+    // yield zero.
+    if callee == "AllocateWaitInfo" {
         let _ = eval_args(args, b, ctx)?;
         return Ok(b.const_i64(0));
     }

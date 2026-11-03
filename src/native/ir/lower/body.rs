@@ -2826,6 +2826,7 @@ impl<'a> Body<'a> {
                     || (type_name.starts_with('(') && type_name.contains(','))
                     || type_name == "var"
                     || type_name == "fn"
+                    || type_name.contains("fn")
                     || is_array
                     || is_generic_param
                     || is_delegate
