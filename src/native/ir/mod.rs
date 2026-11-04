@@ -804,8 +804,7 @@ impl Ctx<'_> {
                 }
             }
         }
-        // Access check failure: yield Ok for CoreLib lowering
-        // (access semantics are enforced at source level).
+        // Access check failure: yield Ok for CoreLib lowering.
         Ok(())
     }
 
@@ -2614,8 +2613,6 @@ fn pick_chain_ctor(
             };
             // Skip methods with goto (deeply nested control flow
             // overflows the stack during lowering).
-            if class.name.contains("Number") {
-            }
             if class.name == "Ascii" || class.name == "Base64Url" || class.name.starts_with("Base64")
                 || class.name.contains("Number") || class.name == "Enum" {
                 continue;
@@ -2891,8 +2888,6 @@ fn pick_chain_ctor(
                             } else if base_name == "AssemblyLoadContext" {
                                 // Optional-arg base ctor not resolved; skip.
                             } else {
-                                // `: base(args)` with no applicable
-                                // constructor: report it.
                                 return Err(LowerError::UnsupportedConstruct(
                                     format!(
                                         "no constructor of '{base_name}' accepts {} argument(s) for '{}.{}(: base(...))'",

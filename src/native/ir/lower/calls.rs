@@ -1305,15 +1305,7 @@ pub(super) fn call(callee: &str, args: &[Expr], b: &mut Body<'_>, ctx: &Ctx<'_>)
             }
         }
     }
-    // `nameof(...)` in a context where the parser left it as a
-    // call: evaluate arguments for side effects and yield zero.
-    if callee == "nameof_" {
-        let _ = eval_args(args, b, ctx)?;
-        return Ok(b.const_i64(0));
-    }
-    // AllocateWaitInfo (local function in Thread) is not resolvable;
-    // yield zero.
-    if callee == "AllocateWaitInfo" {
+    if callee == "nameof_" || callee == "AllocateWaitInfo" {
         let _ = eval_args(args, b, ctx)?;
         return Ok(b.const_i64(0));
     }

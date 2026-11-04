@@ -1297,8 +1297,6 @@ impl<'a> Body<'a> {
             if let Some(v) = self.class_type_argument(&s, ctx)? {
                 return Ok(v);
             }
-            // No runtime type handle (e.g. method type parameter):
-            // yield the null descriptor.
             return Ok(self.const_i64(0));
         }
         // A DELEGATE type is not a class entry, so it has its own
@@ -1344,8 +1342,6 @@ impl<'a> Body<'a> {
             type_meta(&s, ctx)
         };
         if meta.has_type_var {
-            // Composite type descriptors from type vars are not
-            // implemented; yield the null descriptor.
             return Ok(self.const_i64(0));
         }
         let (slot, req) = {

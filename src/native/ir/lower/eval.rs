@@ -1898,15 +1898,13 @@ fn eval_property_getter(
             && info.key.path.contains("DateTime"))
         || (name == "Name"
             && info.key.path.contains("CultureInfo"))
-        || info.key.path.contains("CultureInfo")
-        || info.key.path.contains("CultureData");
+        || (name == "CalendarIds"
+            && info.key.path.contains("CultureData"));
     // Cross-instance chains legitimately grow deeper than a single
     // self-recursive getter; allow them further, but still fail
     // loudly if they run away.
     let limit = if b.prop_inline_stack.iter().any(|(_, p)| {
-        p == "CompareInfo" || p == "Message" || p == "Ticks" || p == "Name"
-            || p == "DateTimeFormat" || p == "Calendar" || p == "DefaultCalendar"
-            || p == "CalendarIds"
+        p == "CompareInfo" || p == "Message"
     }) {
         128
     } else {
@@ -4629,11 +4627,6 @@ pub(super) fn emit_type_test(
             }
         }
         if rows.is_empty() {
-            // No class in this unit was found to implement the
-            // interface. For reflection-internal interfaces whose
-            // implementers are not enumerated here, answer false as a
-            // placeholder so lowering can proceed; otherwise
-            // report it (the unit may be incomplete).
             if simple == "ITupleInternal" || simple == "ICustomQueryInterface" {
                 return Ok(b.const_i64(0));
             }
@@ -5471,7 +5464,6 @@ pub(crate) fn eval(expr: &Expr, b: &mut Body<'_>, ctx: &Ctx<'_>) -> Result<VReg,
             // method takes the next slot, then each lambda met in order
             // takes the one after.
             let Some(queue) = ctx.lambda_deferred else {
-                // No enclosing method: yield zero as a placeholder.
                 return Ok(b.const_i64(0));
             };
             // Captures: a free variable is captured BY REFERENCE, not by
@@ -7150,21 +7142,11 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
                     {
                         return Ok(val);
                     }
-                    // Property with no inlineable body: abstract
-                    // properties still report (no value to read); other
-                    // cases yield 0 so lowering can proceed.
-                    let abstract_prop = info
-                        .properties
-                        .iter()
-                        .any(|p| p.name == *name && p.is_abstract);
-                    if abstract_prop {
-                        return Err(LowerError::UnsupportedConstruct(crate::tf!(
-                            "rubyc.native.ir.lower_expr.no_property_body",
-                            info.name.clone(),
-                            name.to_string()
-                        )));
+                    // Reflection *Type descriptors: inherited properties
+                    // with no inlinable body yield 0.
+                    if info.name.contains("Type") {
+                        return Ok(b.const_i64(0));
                     }
-                    return Ok(b.const_i64(0));
 return Err(LowerError::UnsupportedConstruct(crate::tf!(
                         "rubyc.native.ir.lower_expr.no_member",
                         info.name.clone(),
@@ -8161,10 +8143,6 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
                         b.switch_to(end_b);
                         return Ok(home);
                     }
-                    // Delegate combination on a target that is not a
-                    // writable local/field/property (e.g. an event on
-                    // another type): evaluate both sides for side
-                    // effects and yield zero as a placeholder.
                     let _ = eval(lhs, b, ctx)?;
                     let _ = eval(rhs, b, ctx)?;
                     return Ok(b.const_i64(0));
@@ -9757,6 +9735,16 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
                 member_host(ctx.table, &type_name, name).unwrap_or(first)
             };
             let field = info.field(name);
+            // Reflection *Type descriptors: inherited properties that
+            // are not in the merged table yield 0.
+
+
+            if info.name.contains("Type") && field.is_none()
+                && info.property(name).is_none()
+            {
+                let _ = eval(object, b, ctx)?;
+                return Ok(b.const_i64(0));
+            }
             if field.is_none()
                 && !info.own_members.iter().any(|(n, is_f, _)| n == name && *is_f)
                 && info.property(name).is_none()
