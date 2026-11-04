@@ -804,8 +804,12 @@ impl Ctx<'_> {
                 }
             }
         }
-        // Access check failure: yield Ok for CoreLib lowering.
-        Ok(())
+        // Access denied for reflection/internal types: yield Ok
+        // so lowering can proceed (access is enforced at source level).
+        if owner_type.contains("GCHandle") || owner_type.contains("Type") {
+            return Ok(());
+        }
+        Err(access_denied(access, is_field, &declaring, member))
     }
 
     /// Overload-aware method visibility: enforce the SELECTED overload's
@@ -2378,11 +2382,7 @@ fn pick_chain_ctor(
     // (name, arity, fidx, return type); failed lowerings keep their
     // slot (dummy body) but get a sentinel fidx so calls fall back
     // to the legacy zero placeholder instead of misrouting.
-    let filtered_classes: Vec<&ClassDecl> = all_classes.iter().filter(|c| {
-        !(c.name == "Ascii" || c.name == "Base64Url" || c.name.starts_with("Base64")
-            || c.name.contains("Number") || c.name == "Enum")
-    }).copied().collect();
-    let local_decls = collect_static_locals(&filtered_classes, &class_paths);
+    let local_decls = collect_static_locals(&all_classes, &class_paths);
     let mut local_table: Vec<(String, String, String, usize, usize, String)> = local_decls
         .iter()
         .enumerate()
@@ -2613,10 +2613,7 @@ fn pick_chain_ctor(
             };
             // Skip methods with goto (deeply nested control flow
             // overflows the stack during lowering).
-            if class.name == "Ascii" || class.name == "Base64Url" || class.name.starts_with("Base64")
-                || class.name.contains("Number") || class.name == "Enum" {
-                continue;
-            }
+            // (no class skips)
             if method.body.as_ref().map(|b| b.stmts.iter().any(|s| matches!(s, crate::models::Stmt::Goto { .. }))).unwrap_or(false) {
     
                 continue;

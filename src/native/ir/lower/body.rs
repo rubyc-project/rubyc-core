@@ -103,6 +103,8 @@ pub(crate) struct Body<'a> {
     pub(crate) heap_locals: Vec<(VReg, u64, usize)>,
     /// Current nesting depth; the function body itself is depth 1.
     pub(crate) depth: usize,
+    pub(crate) block_depth: usize,
+    pub(crate) block_inline_depth: usize,
     /// Innermost-first loop context for break/continue.
     loops: Vec<LoopCtx>,
     /// Inline return capture for inlined property getters (and similar
@@ -170,6 +172,8 @@ pub(crate) struct Checkpoint {
     const_vals: std::collections::BTreeMap<u32, i64>,
     heap_len: usize,
     depth: usize,
+    block_depth: usize,
+    block_inline_depth: usize,
     loops_len: usize,
     inline_ret: Option<(BlockId, VReg)>,
     scopes_depth: usize,
@@ -226,6 +230,8 @@ impl<'a> Body<'a> {
             const_vals: Default::default(),
             heap_locals: Vec::new(),
             depth: 1,
+            block_depth: 0,
+            block_inline_depth: 0,
             loops: Vec::new(),
             inline_ret: None,
             prop_inline_stack: Vec::new(),
@@ -329,6 +335,8 @@ impl<'a> Body<'a> {
             const_vals: self.const_vals.clone(),
             heap_len: self.heap_locals.len(),
             depth: self.depth,
+        block_depth: self.block_depth,
+        block_inline_depth: self.block_inline_depth,
             loops_len: self.loops.len(),
             inline_ret: self.inline_ret,
             prop_stack_len: self.prop_inline_stack.len(),
@@ -356,6 +364,8 @@ impl<'a> Body<'a> {
         self.const_vals = cp.const_vals;
         self.heap_locals.truncate(cp.heap_len);
         self.depth = cp.depth;
+        self.block_depth = cp.block_depth;
+        self.block_inline_depth = cp.block_inline_depth;
         self.try_depth = cp.try_depth;
         self.fin_ctx.truncate(cp.fin_ctx_len);
         self.ret_home = cp.ret_home;

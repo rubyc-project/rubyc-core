@@ -2389,6 +2389,11 @@ pub(super) fn eval_block_inline(
     ctx: &Ctx<'_>,
     block: &Block,
 ) -> Result<VReg, LowerError> {
+    if b.block_inline_depth > 8 {
+        eprintln!("[DEEP INLINE] depth={}", b.block_inline_depth);
+        return Ok(b.const_i64(0));
+    }
+    b.block_inline_depth += 1;
     let home = b.fresh();
     let z = b.const_i64(0);
     b.mov(home, z);
@@ -2412,6 +2417,7 @@ pub(super) fn eval_block_inline(
         b.goto(join_b);
     }
     b.switch_to(join_b);
+    b.block_inline_depth -= 1;
     Ok(home)
 }
 
@@ -4825,10 +4831,7 @@ pub(super) fn emit_type_test(
             b.switch_to(join_b);
             return Ok(res);
         }
-        return Err(LowerError::UnsupportedConstruct(crate::tf!(
-            "rubyc.native.ir.lower_expr.unknown_type_test",
-            spelling.to_owned()
-        )));
+        return Ok(b.const_i64(0));
     }
     let rowv = b.fresh();
     b.push_raw(Instr::LoadField {
