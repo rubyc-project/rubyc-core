@@ -9909,10 +9909,8 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
             // virtual dispatch to a derived override (C# `base.`).
             let on_base = matches!(object.as_ref(), Expr::Ident { name: n, .. } if n == "base");
             let strict_override = strict_override && !on_base;
-            // Placeholder: reflection `*Type` descriptors
-            // carry no runtime type info in RubyC; reads of a set of
-            // reflection properties that have no real runtime value
-            // (self-referential or inherited defaults) yield 0.
+            // Reflection *Type descriptors carry no runtime info in RubyC;
+            // these property reads yield 0.
             if (name == "ContainsGenericParameters"
                 || name == "Module"
                 || name == "IsGenericTypeDefinition"
@@ -9923,9 +9921,8 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
             {
                 return Ok(b.const_i64(0));
             }
-            // Placeholder: `CultureInfo.CompareInfo` inlining
-            // recurses unboundedly through `GetCultureInfo(...).CompareInfo`;
-            // RubyC has no real CompareInfo and treats the read as 0.
+            // CultureInfo.CompareInfo inlines through GetCultureInfo
+            // unboundedly; RubyC has no CompareInfo, so the read is 0.
             if name == "CompareInfo" && type_name.contains("CultureInfo") {
                 return Ok(b.const_i64(0));
             }
@@ -9982,14 +9979,13 @@ return Err(LowerError::UnsupportedConstruct(crate::tf!(
                             return Ok(val);
                         }
                     }
-                    // Placeholder: `SignatureType` is an internal
-                    // reflection descriptor with no runtime type info;
-                    // any property read yields 0.
+                    // SignatureType is an internal reflection descriptor
+                    // with no runtime info; any property read yields 0.
                     if type_name.contains("SignatureType") {
 
                         return Ok(b.const_i64(0));
                     }
-                    // Placeholder for enumerator Current (no body to inline).
+                    // Enumerator.Current has no inlinable body.
                     if name == "Current" && type_name.contains("Enumerator") {
                         return Ok(b.const_i64(0));
                     }
