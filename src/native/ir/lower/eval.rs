@@ -1210,7 +1210,11 @@ fn strict_subclass_has_explicit(
     info: &crate::native::semantic::ClassInfo,
     name: &str,
 ) -> bool {
-    strict_subclass_has_accessor(ctx, info, name, false)
+    let r = strict_subclass_has_accessor(ctx, info, name, false);
+    if name == "IsGenericTypeDefinition" && info.name == "Type" {
+        eprintln!("[STRICT] {} on {} = {}", name, info.name, r);
+    }
+    r
 }
 
 /// Whether a STRICT subclass carries an effective explicit SETTER
@@ -1611,6 +1615,7 @@ fn eval_virtual_getter_inner(
     // that merely repeats the name HIDES the base member, so it is not
     // an arm.
     let mut arms: Vec<(&crate::native::semantic::ClassInfo, (u32, u32))> = Vec::new();
+    eprintln!("[VIRT] {} on {} subs={:?}", name, info.name, virtual_subclasses(ctx, info));
     for sub_name in virtual_subclasses(ctx, info) {
         let Some(sub) = ctx.table.class(&sub_name) else {
             continue;
