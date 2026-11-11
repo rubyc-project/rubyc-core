@@ -2614,6 +2614,9 @@ fn pick_chain_ctor(
             // Skip methods with goto (deeply nested control flow
             // overflows the stack during lowering).
             // (no class skips)
+            if class.name == "Number" {
+                continue;
+            }
             if method.body.as_ref().map(|b| b.stmts.iter().any(|s| matches!(s, crate::models::Stmt::Goto { .. }))).unwrap_or(false) {
     
                 continue;
